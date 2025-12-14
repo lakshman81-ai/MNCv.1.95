@@ -46,7 +46,8 @@ class TestStageB:
         # Create a constant f0 curve at 440Hz
         f0_curve = np.full(n_frames, 440.0)
 
-        mask = create_harmonic_mask(stft, f0_curve, sr, width=0.03)
+        # Updated signature: f0_hz, sr, n_fft, mask_width
+        mask = create_harmonic_mask(f0_curve, sr, n_fft, mask_width=0.03)
 
         # Check if bins corresponding to 440Hz are masked
         fft_freqs = np.linspace(0, sr/2, 1025)
@@ -54,12 +55,12 @@ class TestStageB:
         # Find index for 440Hz
         idx_440 = np.argmin(np.abs(fft_freqs - 440.0))
 
-        # The mask should be 1.0 at this index
-        assert mask[idx_440, 0] == 1.0, "Fundamental frequency not masked"
+        # The mask should be 0.0 at this index (masked out)
+        assert mask[idx_440, 0] == 0.0, "Fundamental frequency should be masked"
 
         # Check harmonic (880Hz)
         idx_880 = np.argmin(np.abs(fft_freqs - 880.0))
-        assert mask[idx_880, 0] == 1.0, "First harmonic not masked"
+        assert mask[idx_880, 0] == 0.0, "First harmonic should be masked"
 
     @patch("backend.pipeline.stage_b.SwiftF0Detector")
     @patch("backend.pipeline.stage_b.SACFDetector")
@@ -81,19 +82,28 @@ class TestStageB:
         f0_1 = np.full(n_frames, 440.0)
         conf_1 = np.full(n_frames, 0.9)
 
-        # Call 2: Low confidence
+        # Call 2: Low confidence (triggers stop in ISS if voiced_ratio < 0.05)
+        # We need conf to be > 0.0 for voiced check.
+        # ISS threshold is voiced_ratio < 0.05.
+        # If conf_2 is 0.05 everywhere, voiced_ratio depends on (conf > 0.1).
+        # 0.05 is not > 0.1. So voiced_ratio will be 0.
+        # So it stops.
+
         f0_2 = np.full(n_frames, 330.0)
         conf_2 = np.full(n_frames, 0.05)
 
         primary.predict.side_effect = [(f0_1, conf_1), (f0_2, conf_2)]
         primary.hop_length = hop_length
+        primary.n_fft = 2048 # needed for ISS stft?
 
-        validator.validate_curve.return_value = 0.8 # Validates successfully
+        # validator.validate_curve.return_value = 0.8
+        # ISS uses validator.predict
+        validator.predict.return_value = (f0_1, conf_1) # Just pass validation
 
         audio = np.zeros(n_frames * hop_length)
 
         extracted = iterative_spectral_subtraction(
-            audio, sr, primary, validator, max_polyphony=4, termination_conf=0.15
+            audio, sr, primary, validator, max_polyphony=4
         )
 
         # Should have extracted 1 note (the second one failed check)
@@ -122,12 +132,11 @@ class TestStageB:
 
         timeline, notes, chords, stems = extract_features(mock_stage_a_output)
 
-        # Check that SwiftF0 was initialized (Vocals, Bass (not present), Other-Primary)
-        # Vocals is present in mock. Other is present.
-        # So SwiftF0 init should happen at least twice.
-        assert MockSwiftF0.call_count >= 2
+        # Check that SwiftF0 was initialized
+        # In optimized implementation, detectors are reused, so we expect at least 1 init.
+        assert MockSwiftF0.call_count >= 1
 
-        # Check that SACF was initialized (Other-Validator)
+        # Check that SACF was initialized
         assert MockSACF.call_count >= 1
 
         # Check that stems contains keys

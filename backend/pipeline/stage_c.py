@@ -64,14 +64,16 @@ def _segment_monophonic(
     min_note_dur_s: float,
     gap_tolerance_s: float,
     semitone_stability: float = 0.60,
+    min_rms: float = 0.01,
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
 
     Strategy:
-      - active if midi present and confidence >= conf_thr
+      - active if midi present, confidence >= conf_thr, AND rms >= min_rms
       - keep segment through short gaps (<= gap_tolerance_s)
       - split if pitch jumps too much (in semitones)
+      - split if gap was caused by low RMS (energy drop -> repeated note)
     """
     if len(timeline) < 2:
         return []
@@ -79,13 +81,14 @@ def _segment_monophonic(
     times = np.array([fp.time for fp in timeline], dtype=np.float64)
     mids = np.array([fp.midi if fp.midi is not None else -1 for fp in timeline], dtype=np.int32)
     conf = np.array([fp.confidence for fp in timeline], dtype=np.float64)
+    rmss = np.array([fp.rms for fp in timeline], dtype=np.float64)
 
     # estimate hop
     dt = np.diff(times)
     hop_s = float(np.median(dt)) if dt.size else 0.01
     hop_s = max(1e-4, hop_s)
 
-    active = (mids > 0) & (conf >= float(conf_thr))
+    active = (mids > 0) & (conf >= float(conf_thr)) & (rmss >= min_rms)
 
     segs: List[Tuple[int, int]] = []
     i = 0
@@ -97,15 +100,41 @@ def _segment_monophonic(
         s = i
         e = i
         last_m = float(mids[i])
+        peak_rms = rmss[i]
         gap = 0.0
         i += 1
 
         while i < len(timeline):
             if active[i]:
                 m = float(mids[i])
-                # if pitch jumps too much, split
-                if abs(m - last_m) > semitone_stability * 12.0:  # very tolerant by default
+                r = rmss[i]
+                peak_rms = max(peak_rms, r)
+
+                # Check 1: Pitch jump
+                if abs(m - last_m) > semitone_stability * 12.0:
                     break
+
+                # Check 2: Gap analysis (Re-attack)
+                if gap > 0:
+                    gap_indices = range(e + 1, i)
+                    if gap_indices:
+                        gap_rms = rmss[gap_indices]
+                        if np.mean(gap_rms) < min_rms:
+                             break
+
+                # Check 3: Intra-note re-attack (Valley detection)
+                # If we are well inside the note (some frames passed)
+                # And we detect a rise from a valley
+                if i > s + 2:
+                    prev_r = rmss[i-1]
+                    # Valley: previous RMS significantly lower than peak
+                    is_valley = prev_r < peak_rms * 0.85
+                    # Attack: current RMS rising significantly
+                    is_rise = r > prev_r * 1.05
+
+                    if is_valley and is_rise:
+                        break
+
                 last_m = m
                 e = i
                 gap = 0.0
@@ -169,12 +198,19 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     except Exception:
         semitone_stability = 0.60  # fallback
 
+    # Calculate min_rms
+    min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
+    # RMS gate usually needs to be lower than min velocity threshold to allow decay?
+    # Use -40dB or slightly lower as gate.
+    min_rms = 10 ** (min_db / 20.0)
+
     segs = _segment_monophonic(
         timeline=timeline,
         conf_thr=conf_thr,
         min_note_dur_s=min_note_dur_s,
         gap_tolerance_s=gap_tolerance_s,
         semitone_stability=semitone_stability,
+        min_rms=min_rms
     )
 
     # hop estimate for end time
