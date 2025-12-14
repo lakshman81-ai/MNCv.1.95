@@ -130,7 +130,8 @@ class TestStageB:
         n_frames = int(mock_stage_a_output.meta.duration_sec * 22050 / 256) + 1
         mock_swift_instance.predict.return_value = (np.zeros(n_frames), np.zeros(n_frames))
 
-        timeline, notes, chords, stems = extract_features(mock_stage_a_output)
+        stage_b_out = extract_features(mock_stage_a_output)
+        stems = stage_b_out.stem_timelines
 
         # Check that SwiftF0 was initialized
         # In optimized implementation, detectors are reused, so we expect at least 1 init.

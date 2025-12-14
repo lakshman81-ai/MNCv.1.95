@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import List, Dict, Tuple, Any, Optional
 import numpy as np
 
-from .models import StageAOutput, FramePitch, AnalysisData, AudioType
+from .models import StageAOutput, FramePitch, AnalysisData, AudioType, StageBOutput
 from .config import PipelineConfig
 from .detectors import (
     SwiftF0Detector, SACFDetector, YinDetector,
@@ -62,7 +62,7 @@ def extract_features(
     min_duration_ms: float = 0.0,
     config: Optional[PipelineConfig] = None,
     **kwargs
-) -> Tuple[List[FramePitch], List[Any], List[Any], Dict[str, List[FramePitch]]]:
+) -> StageBOutput:
 
     sr = stage_a_out.meta.sample_rate
     hop_length = stage_a_out.meta.hop_length
@@ -83,9 +83,14 @@ def extract_features(
 
     stem_timelines: Dict[str, List[FramePitch]] = {}
 
+    # Keep track of f0 arrays for StageBOutput
+    per_detector: Dict[str, Any] = {}
+    f0_main: Optional[np.ndarray] = None
+
     # Process stems
     for stem_name, stem in stage_a_out.stems.items():
         audio = stem.audio
+        per_detector[stem_name] = {}
 
         f0, conf = None, None
 
@@ -138,15 +143,26 @@ def extract_features(
                 rms_vals = rms_vals[:len(f0)]
 
             stem_timelines[stem_name] = _arrays_to_timeline(f0, conf, rms_vals, sr, hop_length)
+            per_detector[stem_name]["primary"] = (f0, conf)
 
-    # Aggregate global timeline
-    # For now, prefer vocals, then mix, then other
-    timeline = []
-    if "vocals" in stem_timelines:
-        timeline = stem_timelines["vocals"]
-    elif "mix" in stem_timelines:
-        timeline = stem_timelines["mix"]
-    elif "other" in stem_timelines:
-        timeline = stem_timelines["other"]
+            if stem_name == "vocals" or (stem_name == "mix" and f0_main is None):
+                f0_main = f0
 
-    return timeline, [], [], stem_timelines
+    # Create empty fields for StageBOutput if needed
+    if f0_main is None:
+        # Should not happen if stems exist, but handle edge case
+        f0_main = np.array([])
+
+    # time_grid
+    time_grid = np.array([])
+    if len(f0_main) > 0:
+        time_grid = np.arange(len(f0_main)) * hop_length / sr
+
+    return StageBOutput(
+        time_grid=time_grid,
+        f0_main=f0_main,
+        f0_layers=[], # Populated if ISS or poly detectors are used extensively
+        per_detector=per_detector,
+        stem_timelines=stem_timelines,
+        meta=stage_a_out.meta
+    )

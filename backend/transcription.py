@@ -57,12 +57,31 @@ def transcribe_audio_pipeline(
     conf_thresh = kwargs.get("confidence_threshold", 0.5)
     min_dur = kwargs.get("min_duration_ms", 0.0)
 
-    timeline, notes, chords, stem_timelines = extract_features(
+    stage_b_out = extract_features(
         stage_a_out,
         use_crepe=use_crepe,
         confidence_threshold=conf_thresh,
         min_duration_ms=min_dur
     )
+
+    # Unpack from StageBOutput
+    timeline = [] # Global timeline computed from main f0?
+    # StageBOutput has f0_main, but timeline expects FramePitch objects.
+    # stem_timelines is available.
+    stem_timelines = stage_b_out.stem_timelines
+
+    # We need a global timeline for AnalysisData.
+    # In my previous implementation, I aggregated it.
+    # Now I should aggregate it again or use what's available.
+    if "vocals" in stem_timelines:
+        timeline = stem_timelines["vocals"]
+    elif "mix" in stem_timelines:
+        timeline = stem_timelines["mix"]
+    elif "other" in stem_timelines:
+        timeline = stem_timelines["other"]
+
+    notes = [] # Stage B doesn't produce notes yet (Stage C does)
+    chords = [] # Stage B doesn't produce chords yet
 
     tracker_name = "swiftf0+sacf"
     print(f"Notes extracted using: {tracker_name}")

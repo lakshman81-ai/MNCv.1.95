@@ -118,8 +118,8 @@ def run_song(song: str) -> Dict[str, Any]:
         audio_type=AudioType.MONOPHONIC,
     )
     analysis = AnalysisData(meta=meta)
-    timeline, _, _, stem_timelines = extract_features(stage_a_out, config=config)
-    analysis.stem_timelines = stem_timelines
+    stage_b_out = extract_features(stage_a_out, config=config)
+    analysis.stem_timelines = stage_b_out.stem_timelines
     notes_pred = apply_theory(analysis, config=config)
 
     # Convert predicted and ground truth to uniform tuples
