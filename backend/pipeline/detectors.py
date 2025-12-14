@@ -460,8 +460,8 @@ class SwiftF0Detector(BasePitchDetector):
         n = frames.shape[0]
 
         if torch is None:
-            self._warn_once("no_torch", "SwiftF0 disabled: torch not available.")
-            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
+            self._warn_once("no_torch", "SwiftF0 disabled: torch not available. Falling back to ACF.")
+            # Fall through to ACF fallback
 
         # If you later add real SwiftF0 inference, replace this block.
         # For now: stable fallback to ACF so pipeline still works deterministically.

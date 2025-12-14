@@ -1,0 +1,7 @@
+{
+  "note_f1": 0.9090909090909091,
+  "onset_mae_ms": 14.2834467120181,
+  "offset_mae_ms": 112.9002267573697,
+  "predicted_notes": 20,
+  "gt_notes": 24
+}

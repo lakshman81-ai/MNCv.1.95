@@ -30,8 +30,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from config import PipelineConfig
-from models import (
+from backend.pipeline.config import PipelineConfig
+from backend.pipeline.models import (
     StageAOutput,
     MetaData,
     Stem,
@@ -39,9 +39,9 @@ from models import (
     AudioType,
     AudioQuality,
 )
-from stage_b import extract_features
-from stage_c import apply_theory
-from .metrics import note_f1, onset_offset_mae
+from backend.pipeline.stage_b import extract_features
+from backend.pipeline.stage_c import apply_theory
+from backend.benchmarks.metrics import note_f1, onset_offset_mae
 
 
 def midi_to_freq(m: int) -> float:
@@ -65,7 +65,11 @@ def synthesize_audio(notes: List[Tuple[int, float]], sr: int = 44100) -> np.ndar
 
 
 def load_ground_truth(song: str) -> List[Dict[str, Any]]:
-    path = os.path.join('ground_truth', f'{song}_gt.json')
+    # Search in benchmarks folder first
+    path = os.path.join('benchmarks', f'{song}_gt.json')
+    if not os.path.exists(path):
+         # fallback to current dir or ground_truth
+         path = os.path.join('ground_truth', f'{song}_gt.json')
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)["notes"]
 
@@ -81,6 +85,8 @@ def run_song(song: str) -> Dict[str, Any]:
     config = PipelineConfig()
     # disable separation for synthetic audio
     config.stage_b.separation['enabled'] = False
+    # Tune Stage C for synthetic audio (tight segmentation)
+    config.stage_c.velocity_map['min_db'] = -15.0
     meta = MetaData(
         tuning_offset=0.0,
         detected_key="C",
