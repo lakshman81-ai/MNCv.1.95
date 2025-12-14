@@ -1,8 +1,0 @@
-{
-  "level": "L4",
-  "name": "happy_birthday",
-  "note_f1": 1.0,
-  "onset_mae_ms": 9.66742252456539,
-  "predicted_count": 6,
-  "gt_count": 6
-}

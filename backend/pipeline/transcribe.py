@@ -29,24 +29,7 @@ from .stage_a import load_and_preprocess
 from .stage_b import extract_features
 from .stage_c import apply_theory
 from .stage_d import quantize_and_render
-from .models import AnalysisData, StageAOutput
-
-
-@dataclass
-class TranscriptionResult:
-    """
-    Container for the full transcription output.
-
-    Attributes
-    ----------
-    musicxml : str
-        MusicXML string for the rendered score (Stage D output).
-    analysis_data : AnalysisData
-        Rich analysis object containing metadata, stem timelines,
-        and discrete NoteEvent list (Stages A–C outputs combined).
-    """
-    musicxml: str
-    analysis_data: AnalysisData
+from .models import AnalysisData, StageAOutput, TranscriptionResult
 
 
 def transcribe(
@@ -77,7 +60,7 @@ def transcribe(
     # --------------------------------------------------------
     stage_a_out: StageAOutput = load_and_preprocess(
         audio_path,
-        config=config.stage_a,
+        config=config,
     )
 
     # --------------------------------------------------------
@@ -105,7 +88,7 @@ def transcribe(
     # --------------------------------------------------------
     # Stage D: Quantization + MusicXML Rendering
     # --------------------------------------------------------
-    musicxml_str = quantize_and_render(
+    d_out = quantize_and_render(
         notes,
         analysis_data,
         config=config,
@@ -113,6 +96,7 @@ def transcribe(
 
     # At this point, analysis_data.notes should be populated by Stage C.
     return TranscriptionResult(
-        musicxml=musicxml_str,
+        musicxml=d_out.musicxml,
         analysis_data=analysis_data,
+        midi_bytes=d_out.midi_bytes
     )

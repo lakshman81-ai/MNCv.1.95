@@ -258,6 +258,9 @@ class AnalysisData:
 
 @dataclass
 class TranscriptionResult:
+    """
+    Result of the transcription pipeline.
+    """
     musicxml: str
     analysis_data: AnalysisData
     midi_bytes: bytes = b""

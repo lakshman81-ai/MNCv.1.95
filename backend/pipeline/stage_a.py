@@ -158,6 +158,17 @@ def load_and_preprocess(
     target_lufs = float(a_conf.loudness_normalization.get("target_lufs", TARGET_LUFS))
     trim_db = float(a_conf.silence_trimming.get("top_db", SILENCE_THRESHOLD_DB))
 
+    # Resolve window/hop from detectors if possible
+    # We look for 'yin' or 'swiftf0' as reference
+    hop_length = 512
+    window_size = 2048
+    if config.stage_b and config.stage_b.detectors:
+        # Prefer yin as baseline, or swiftf0
+        ref_det = config.stage_b.detectors.get('yin') or config.stage_b.detectors.get('swiftf0')
+        if ref_det:
+            hop_length = int(ref_det.get('hop_length', 512))
+            window_size = int(ref_det.get('n_fft', 2048))
+
     # 1. Load & Resample
     try:
         if librosa:
@@ -201,8 +212,8 @@ def load_and_preprocess(
         pipeline_version="2.0.0",
 
         # Defaults for downstream (can be updated by detectors)
-        hop_length=512,
-        window_size=2048,
+        hop_length=hop_length,
+        window_size=window_size,
         processing_mode="monophonic", # Default assumption, detector may refine
         audio_type=AudioType.MONOPHONIC
     )

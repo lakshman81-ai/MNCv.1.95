@@ -11,7 +11,7 @@ from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory
 from backend.pipeline.stage_d import quantize_and_render
 from backend.pipeline.models import StageAOutput, AnalysisData
-from backend.pipeline import transcribe
+from backend.pipeline.transcribe import transcribe
 
 
 def create_sine_wave(freq: float = 440.0, duration: float = 1.0, sr: int = 44100):
@@ -42,7 +42,7 @@ def test_full_pipeline_flow_low_level(tmp_path):
     print("Running Stage A...")
     stage_a_out = load_and_preprocess(
         str(audio_path),
-        config=PIANO_61KEY_CONFIG.stage_a,
+        config=PIANO_61KEY_CONFIG,
     )
     assert isinstance(stage_a_out, StageAOutput)
     assert stage_a_out.meta.sample_rate == sr_target
@@ -97,9 +97,9 @@ def test_full_pipeline_flow_low_level(tmp_path):
 
     # 5. Stage D
     print("Running Stage D...")
-    xml_str = quantize_and_render(notes, analysis_data, config=test_config)
-    assert "<?xml" in xml_str
-    assert "<score-partwise" in xml_str
+    result_d = quantize_and_render(notes, analysis_data, config=test_config)
+    assert "<?xml" in result_d.musicxml
+    assert "<score-partwise" in result_d.musicxml
 
     print("Low-level pipeline test passed!")
 

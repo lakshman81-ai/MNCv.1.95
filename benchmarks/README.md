@@ -2,6 +2,8 @@
 
 This directory holds reusable fixtures and notes for evaluating the transcription pipeline. Use the structure and checklists below to keep inputs, ground truths, and timing results consistent across scenarios.
 
+The actual benchmark runners are now located in `backend/benchmarks/`.
+
 ## Directory layout
 
 ```
@@ -24,16 +26,14 @@ Add new scenarios by creating additional numbered folders that follow the same p
 - Store mock-friendly XML/MIDI fixtures under `references/` so the mock pipeline can be exercised without audio dependencies.
 
 ## Running benchmarks
-1. Populate the scenario folder with at least one audio fixture and, when possible, a reference file.
-2. Run the mock pipeline for quick smoke checks:
+1. Use the unified benchmark runner:
    ```bash
-   python backend/benchmark_mock.py --iterations 5 --use-mock 1 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
+   python -m backend.benchmarks.benchmark_runner
    ```
-3. Once audio dependencies are available, run the full pipeline for the same fixture:
+2. Or run specific real song benchmarks:
    ```bash
-   python backend/benchmark_mock.py --iterations 5 --use-mock 0 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
+   python -m backend.benchmarks.run_real_songs --song happy_birthday
    ```
-4. Record timing, environment details, and qualitative notes in the scenario's `results.md` using the template below.
 
 ## Results template
 Copy this template into each scenario's `results.md` (already seeded in the starter files):
