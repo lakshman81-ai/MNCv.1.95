@@ -177,7 +177,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         return []
 
     # Thresholds (read from config if available)
-    conf_thr = float(_get(config, "stage_c.confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
+    base_conf = float(_get(config, "stage_c.confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
+    poly_conf = float(_get(config, "stage_c.polyphonic_confidence.melody", base_conf))
+    conf_thr = base_conf
     min_note_dur_s = float(_get(config, "stage_c.min_note_duration_s", 0.05))
     min_note_dur_ms = _get(config, "stage_c.min_note_duration_ms", None)
     if min_note_dur_ms is not None:
@@ -185,6 +187,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             min_note_dur_s = float(min_note_dur_ms) / 1000.0
         except Exception:
             pass
+    min_note_dur_ms_poly = _get(config, "stage_c.min_note_duration_ms_poly", None)
     gap_tolerance_s = float(_get(config, "stage_c.gap_tolerance_s", 0.03))
 
     # Derive semitone stability from configuration.  The config may specify
@@ -203,6 +206,16 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # RMS gate usually needs to be lower than min velocity threshold to allow decay?
     # Use -40dB or slightly lower as gate.
     min_rms = 10 ** (min_db / 20.0)
+
+    # Detect polyphonic context based on active pitch annotations
+    poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
+    if poly_frames:
+        conf_thr = poly_conf
+        try:
+            if min_note_dur_ms_poly is not None:
+                min_note_dur_s = max(min_note_dur_s, float(min_note_dur_ms_poly) / 1000.0)
+        except Exception:
+            pass
 
     segs = _segment_monophonic(
         timeline=timeline,
