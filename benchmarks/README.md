@@ -2,6 +2,8 @@
 
 This directory holds reusable fixtures and notes for evaluating the transcription pipeline. Use the structure and checklists below to keep inputs, ground truths, and timing results consistent across scenarios.
 
+The unified benchmark runner and logic now reside in `backend/benchmarks/benchmark_runner.py`.
+
 ## Directory layout
 
 ```
@@ -24,16 +26,21 @@ Add new scenarios by creating additional numbered folders that follow the same p
 - Store mock-friendly XML/MIDI fixtures under `references/` so the mock pipeline can be exercised without audio dependencies.
 
 ## Running benchmarks
-1. Populate the scenario folder with at least one audio fixture and, when possible, a reference file.
-2. Run the mock pipeline for quick smoke checks:
+
+Benchmarks are now run using the unified runner in `backend.benchmarks`.
+
+1. **Synthesize & Run L0-L2 benchmarks (synthetic)**:
    ```bash
-   python backend/benchmark_mock.py --iterations 5 --use-mock 1 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
+   python -m backend.benchmarks.benchmark_runner --level L0 --output results
+   python -m backend.benchmarks.benchmark_runner --level L1 --output results
    ```
-3. Once audio dependencies are available, run the full pipeline for the same fixture:
+
+2. **Run L4 benchmarks (Real Songs)**:
+   This runs against the known "Real Songs" dataset (Happy Birthday, Old Macdonald).
    ```bash
-   python backend/benchmark_mock.py --iterations 5 --use-mock 0 --input benchmarks/01_scales/audio/c_major_scale_100bpm.wav
+   python -m backend.benchmarks.benchmark_runner --level L4 --output results
    ```
-4. Record timing, environment details, and qualitative notes in the scenario's `results.md` using the template below.
+   (Ensure you have the ground truth JSONs in `backend/benchmarks/` or `benchmarks/`).
 
 ## Results template
 Copy this template into each scenario's `results.md` (already seeded in the starter files):
@@ -43,7 +50,6 @@ Copy this template into each scenario's `results.md` (already seeded in the star
 
 | Date       | Environment (commit, OS, deps) | Fixture                          | Mode  | Iterations | Min (s) | Avg (s) | Max (s) | Notes |
 |------------|--------------------------------|----------------------------------|-------|------------|---------|---------|---------|-------|
-| 2025-02-15 | abc1234, Ubuntu, mock pipeline | c_major_scale_100bpm.wav         | mock  | 5          | 0.012   | 0.015   | 0.021   | Baseline sanity check |
 | 2025-02-15 | abc1234, Ubuntu, full pipeline | c_major_scale_100bpm.wav         | full  | 5          | 0.480   | 0.525   | 0.610   | Initial full run |
 ```
 
