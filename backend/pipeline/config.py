@@ -72,17 +72,23 @@ class StageBConfig:
             "synthetic_model": False,
             "overlap": 0.25,  # Demucs overlap
             "shifts": 1,      # number of shifts (test-time augmentation)
+            # Optional harmonic masking guided by a fast F0 prior
+            "harmonic_masking": {
+                "enabled": False,
+                "mask_width": 0.025,
+                "n_harmonics": 8,
+            },
         }
     )
 
     # Global voicing threshold for ensemble F0
-    confidence_voicing_threshold: float = 0.75
+    confidence_voicing_threshold: float = 0.65
 
     # SwiftF0 priority floor
     confidence_priority_floor: float = 0.5
 
     # Cross-detector disagreement tolerance (cents)
-    pitch_disagreement_cents: float = 70.0
+    pitch_disagreement_cents: float = 45.0
 
     # Ensemble weights (WI-aligned core)
     #   Piano: SwiftF0 dominates, SACF/CQT support.
@@ -102,6 +108,7 @@ class StageBConfig:
         default_factory=lambda: {
             "max_layers": 8,
             "mask_width": 0.03,  # Fractional bandwidth around harmonics
+            "force_on_mix": True,
         }
     )
 
@@ -148,6 +155,9 @@ class StageCConfig:
     # WI: 30 ms for piano/guitar; captures fast grace notes/trills.
     min_note_duration_ms: float = 30.0
 
+    # Polyphonic-specific minimum duration to suppress bass-induced flutter
+    min_note_duration_ms_poly: float = 60.0
+
     # HMM frame stability (used in HMMProcessor)
     frame_stability: Dict[str, Any] = field(
         default_factory=lambda: {"stable_frames_required": 2}
@@ -159,6 +169,11 @@ class StageCConfig:
     # Gap filling (legato) in ms
     gap_filling: Dict[str, Any] = field(
         default_factory=lambda: {"max_gap_ms": 100.0}
+    )
+
+    # Confidence gates for polyphonic timelines (melody vs accompaniment)
+    polyphonic_confidence: Dict[str, float] = field(
+        default_factory=lambda: {"melody": 0.2, "accompaniment": 0.45}
     )
 
     # RMS → MIDI velocity mapping
