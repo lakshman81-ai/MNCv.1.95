@@ -14,8 +14,14 @@ from music21 import (
     clef,
 )
 
-from .models import NoteEvent, AnalysisData
-from .config import PIANO_61KEY_CONFIG, PipelineConfig
+# Import models and config from the package or the top level.  This makes stage_d
+# usable both as ``backend.pipeline.stage_d`` and as a top‑level module ``stage_d``.
+try:
+    from .models import NoteEvent, AnalysisData  # type: ignore
+    from .config import PIANO_61KEY_CONFIG, PipelineConfig  # type: ignore
+except Exception:
+    from models import NoteEvent, AnalysisData  # type: ignore
+    from config import PIANO_61KEY_CONFIG, PipelineConfig  # type: ignore
 
 
 def quantize_and_render(
@@ -98,9 +104,10 @@ def quantize_and_render(
         dur_beats = getattr(e, "duration_beats", None)
         if dur_beats is None:
             dur_beats = (e.end_sec - e.start_sec) / quarter_dur
-
         # start_beats (from Stage C) if present
         start_beats = getattr(e, "start_beats", None)
+        if start_beats is None:
+            start_beats = getattr(e, "beat", None)
         if start_beats is None:
             start_beats = e.start_sec / quarter_dur
 
@@ -168,7 +175,7 @@ def quantize_and_render(
             m21_obj = note.Note(midi_pitches[0])
 
         # Duration: quarterLength is beats (1 beat = quarter note)
-        q_len = float(dur_beats)
+        q_len = _snap_ql(float(dur_beats))
         try:
             m21_obj.duration = music21.duration.Duration(q_len)
         except Exception:
@@ -206,8 +213,8 @@ def quantize_and_render(
 
     # Insert groups into parts
     for (staff_name, start_key), group in sorted(staff_groups.items(), key=lambda x: x[0]):
-        m21_obj, start_beats = build_m21_from_group(group)
-        offset = float(start_beats)  # beats; music21 uses quarterLength offsets
+        m21_obj, _start_beats = build_m21_from_group(group)
+        offset = float(start_key)  # beats; music21 uses quarterLength offsets
 
         if staff_name == "bass":
             part_bass.insert(offset, m21_obj)
@@ -252,3 +259,28 @@ def quantize_and_render(
     musicxml_str = musicxml_bytes.decode("utf-8")
 
     return musicxml_str
+
+
+def _snap_ql(x: float, eps: float = 0.02) -> float:
+    """Snap a quarterLength to MusicXML-friendly values.
+
+    Tries denominators 1..32 (whole..32nd). Falls back to nearest among
+    common note lengths to avoid music21 'inexpressible' durations.
+    """
+    if x is None or not np.isfinite(x):
+        return 0.0
+    x = float(x)
+    for denom in (1, 2, 4, 8, 16, 32):
+        y = round(x * denom) / denom
+        if abs(x - y) <= eps:
+            return float(y)
+    y = float(round(x * 32) / 32)
+    common = [4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125]
+    best = min(common, key=lambda v: abs(y - v))
+    # If reasonably close, snap to a common value
+    if abs(best - y) <= 0.15:
+        return float(best)
+    return y
+
+
+

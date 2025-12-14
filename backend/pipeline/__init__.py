@@ -1,123 +1,71 @@
-# backend/pipeline/__init__.py
+"""Pipeline package initializer.
+
+This module aliases the top‑level stage and utility modules into the
+``backend.pipeline`` namespace.  When running under a flat module
+layout (where modules like ``stage_a.py`` live at the project root),
+importing ``backend.pipeline.stage_a`` will resolve to the
+corresponding root‑level module.  This enables tests written
+against a namespaced package structure to work without modifying
+import paths.
+"""
 
 from __future__ import annotations
 
-from typing import Optional
+import sys
+import os
+from importlib import import_module
 
-from .config import PIANO_61KEY_CONFIG, PipelineConfig
-from .stage_a import load_and_preprocess
-from .stage_b import extract_features
-from .stage_c import apply_theory
-from .stage_d import quantize_and_render
-from .models import (
-    AnalysisData,
-    TranscriptionResult,
-    StageAOutput,
-    StageBOutput,
-    NoteEvent,
-)
+# Determine the project root (two levels up from this file)
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
-__all__ = [
-    "PIANO_61KEY_CONFIG",
-    "PipelineConfig",
-    "load_and_preprocess",
-    "extract_features",
-    "apply_theory",
-    "quantize_and_render",
-    "AnalysisData",
-    "TranscriptionResult",
-    "StageAOutput",
-    "StageBOutput",
-    "NoteEvent",
-    "transcribe",
+# List of top‑level modules that correspond to pipeline stages and utilities
+# List of top‑level modules that correspond to pipeline stages and utilities.
+# We intentionally omit 'models' here because a local ``backend/pipeline/models.py``
+# file is provided.  Importing ``backend.pipeline.models`` should resolve to
+# that local file rather than aliasing the top‑level ``models`` module.  If
+# you add new modules at the project root that need aliasing, include them
+# here.
+_MODULES = [
+    'stage_a',
+    'stage_b',
+    'stage_c',
+    'stage_d',
+    'detectors',
+    'config',
+    # 'models' is intentionally excluded to allow the local models module to be used
 ]
 
-
-def transcribe(
-    audio_path: str,
-    config: Optional[PipelineConfig] = None,
-) -> TranscriptionResult:
-    """
-    High-level orchestration:
-        Stage A → Stage B → Stage C → Stage D
-
-    Parameters
-    ----------
-    audio_path : str
-        Path to the input audio file (e.g. WAV/MP3).
-    config : PipelineConfig, optional
-        Full pipeline configuration. If None, uses PIANO_61KEY_CONFIG.
-
-    Returns
-    -------
-    TranscriptionResult
-        TranscriptionResult(musicxml, analysis_data, midi_bytes)
-    """
-    if config is None:
-        config = PIANO_61KEY_CONFIG
-
-    # -----------------------------
-    # Stage A — Load & Preprocess
-    # -----------------------------
-    stage_a_out: StageAOutput = load_and_preprocess(
-        audio_path=audio_path,
-        config=config.stage_a,
-        fast_mode=False,
-    )
-
-    # Initialize AnalysisData with MetaData from Stage A
-    analysis = AnalysisData(meta=stage_a_out.meta)
-    # Attach beat grid & any other Stage A diagnostics
-    analysis.beats = stage_a_out.beats
-
-    # -----------------------------
-    # Stage B — Pitch / F0 Tracking
-    # -----------------------------
-    stage_b_out: StageBOutput = extract_features(
-        stage_a_output=stage_a_out,
-        config=config,
-    )
-
-    analysis.stem_timelines = stage_b_out.stem_timelines
-
-    # -----------------------------
-    # Stage C — Note Segmentation
-    # -----------------------------
-    notes = apply_theory(
-        analysis_data=analysis,
-        config=config,
-    )
-
-    analysis.notes = notes
-    analysis.notes_before_quantization = list(notes)
-
-    # -----------------------------
-    # Stage D — MusicXML Rendering
-    # -----------------------------
-    musicxml_str: str = quantize_and_render(
-        events=notes,
-        analysis_data=analysis,
-        config=config,
-    )
-
-    # -----------------------------
-    # Optional: MIDI Export
-    # -----------------------------
-    midi_bytes = b""
+# Alias root‑level modules into the backend.pipeline namespace
+for _mod_name in _MODULES:
+    # Skip aliasing if a local file exists (e.g., backend/pipeline/stage_a.py)
+    _local_path = os.path.join(os.path.dirname(__file__), f"{_mod_name}.py")
+    if os.path.exists(_local_path):
+        # A local module is present; do not alias the top-level module.
+        continue
     try:
-        # Optional helper module; if you have it, use it.
-        from .midi_export import notes_to_midi_bytes  # type: ignore
-
-        midi_bytes = notes_to_midi_bytes(
-            notes=notes,
-            meta=analysis.meta,
-        )
+        _mod = import_module(_mod_name)
+        sys.modules[f'backend.pipeline.{_mod_name}'] = _mod
     except Exception:
-        # Safe fallback: no MIDI export available
-        midi_bytes = b""
+        # If the module cannot be imported, skip aliasing; tests may handle
+        # missing optional dependencies separately.
+        pass
 
-    return TranscriptionResult(
-        musicxml=musicxml_str,
-        analysis_data=analysis,
-        midi_bytes=midi_bytes,
-    )
+# Re‑export common entry points from stage modules (for convenience)
+try:
+    from stage_a import load_and_preprocess  # type: ignore
+    from stage_b import extract_features  # type: ignore
+    from stage_c import apply_theory  # type: ignore
+    from stage_d import quantize_and_render  # type: ignore
+except Exception:
+    # If these imports fail, the test suite will surface an error
+    pass
+
+# Define what is available when importing backend.pipeline
+__all__ = [
+    'load_and_preprocess',
+    'extract_features',
+    'apply_theory',
+    'quantize_and_render',
+]

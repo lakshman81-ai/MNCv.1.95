@@ -1,3 +1,11 @@
+"""Dataclasses and enums used by the pipeline (namespaced version).
+
+This file duplicates the definitions from the top‑level ``models.py``
+module so that tests importing ``backend.pipeline.models`` will find
+all expected classes and enumerations.  The ``ProcessingMode`` enum
+has been added to mirror the usage in Stage A.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
@@ -17,7 +25,19 @@ class AudioQuality(str, Enum):
     LOSSY = "lossy"        # MP3, M4A, OGG
 
 
-# ---------- Meta / global info ----------
+class ProcessingMode(str, Enum):
+    """
+    Processing modes describe the overall texture of the input audio.
+
+    These values are used by Stage A to indicate whether the audio is
+    strictly monophonic, contains a dominant melodic line atop a
+    polyphonic accompaniment, or is fully polyphonic with no dominant
+    melody.
+    """
+    MONOPHONIC = "monophonic"
+    POLYPHONIC_DOMINANT = "polyphonic_dominant"
+    POLYPHONIC = "polyphonic"
+
 
 @dataclass
 class MetaData:
@@ -57,8 +77,6 @@ class MetaData:
     pipeline_version: str = "2.0.0"
 
 
-# ---------- Stage A Output Structures ----------
-
 @dataclass
 class Stem:
     audio: np.ndarray   # Monophonic (or summed) audio array
@@ -78,8 +96,6 @@ class StageAOutput:
     beats: List[float] = field(default_factory=list)
 
 
-# ---------- Stage B Output Structures ----------
-
 @dataclass
 class StageBOutput:
     time_grid: np.ndarray                   # Array of time stamps
@@ -90,8 +106,6 @@ class StageBOutput:
     stem_timelines: Dict[str, List["FramePitch"]] = field(default_factory=dict)
     meta: Optional[MetaData] = None         # Passed through from Stage A
 
-
-# ---------- Pitch timeline ----------
 
 @dataclass
 class FramePitch:
@@ -104,8 +118,6 @@ class FramePitch:
         default_factory=list
     )  # List of (pitch_hz, confidence)
 
-
-# ---------- Note events ----------
 
 @dataclass
 class AlternativePitch:
@@ -142,8 +154,6 @@ class NoteEvent:
     spec_thumb: Optional[str] = None        # optional spectrogram thumbnail id
 
 
-# ---------- Chords & layout ----------
-
 @dataclass
 class ChordEvent:
     time: float                             # seconds
@@ -157,8 +167,6 @@ class ChordEvent:
 class VexflowLayout:
     measures: List[Dict[str, Any]] = field(default_factory=list)
 
-
-# ---------- Benchmark & full analysis ----------
 
 @dataclass
 class BenchmarkResult:
@@ -231,7 +239,6 @@ class AnalysisData:
             ],
             "vexflow_layout": self.vexflow_layout.measures,
             "beats": self.beats,
-
             # Extended / diagnostic fields
             "stem_timelines": {
                 stem: [asdict(f) for f in frames]
@@ -258,25 +265,7 @@ class TranscriptionResult:
     def __getitem__(self, key):
         """Allow dict-like access for compatibility."""
         # Direct attributes on this object
-        if hasattr(self, key):
-            return getattr(self, key)
-
-        # Delegate common analysis_data keys
-        if key == "meta":
-            return self.analysis_data.meta
-        if key == "notes":
-            return self.analysis_data.notes
-        if key == "timeline":
-            return self.analysis_data.timeline
-        if key == "chords":
-            return self.analysis_data.chords
-        if key == "beats":
-            return self.analysis_data.beats
-
-        raise KeyError(key)
-
-    def get(self, key, default=None):
         try:
-            return self[key]
-        except KeyError:
-            return default
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)

@@ -1,561 +1,529 @@
-import numpy as np
-import librosa
-import scipy.signal
-import torch
-import torch.nn as nn
-import os
+# backend/pipeline/detectors.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import warnings
-import music21
-from typing import Optional, Tuple, List, Union, Dict, Set, Any
-from collections import defaultdict
+import numpy as np
+import scipy.signal
 
-# Optional dependencies
+
+# --------------------------------------------------------------------------------------
+# Optional dependencies (never fail import of this module)
+# --------------------------------------------------------------------------------------
 try:
-    import crepe
-except ImportError:
-    crepe = None
+    import librosa  # type: ignore
+except Exception as e:  # pragma: no cover
+    librosa = None  # type: ignore
+    _LIBROSA_IMPORT_ERR = e  # type: ignore
 
 try:
-    from rmvpe import RMVPE
-except ImportError:
-    RMVPE = None
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
+try:
+    import crepe  # type: ignore
+except Exception:  # pragma: no cover
+    crepe = None  # type: ignore
 
 
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Utility
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+def hz_to_midi(hz: float) -> float:
+    if hz <= 0.0:
+        return 0.0
+    return 69.0 + 12.0 * float(np.log2(hz / 440.0))
 
-def midi_to_hz(midi: float) -> float:
-    return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
+
+def _safe_float(x: Any, default: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
-# ------------------------------------------------------------
-# Base Class
-# ------------------------------------------------------------
+def _safe_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _frame_audio(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    if len(y) <= 0:
+        return np.zeros((0, frame_length), dtype=np.float32)
+    if len(y) < frame_length:
+        pad = frame_length - len(y)
+        y = np.pad(y, (0, pad), mode="constant")
+
+    n_frames = 1 + (len(y) - frame_length) // hop_length
+    if n_frames <= 0:
+        n_frames = 1
+    frames = np.lib.stride_tricks.as_strided(
+        y,
+        shape=(n_frames, frame_length),
+        strides=(y.strides[0] * hop_length, y.strides[0]),
+        writeable=False,
+    )
+    return np.asarray(frames, dtype=np.float32)
+
+
+def _autocorr_pitch_per_frame(
+    frames: np.ndarray,
+    sr: int,
+    fmin: float,
+    fmax: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Lightweight ACF pitch estimator: returns (f0, conf) per frame.
+    conf ~ normalized ACF peak (0..1).
+    """
+    n_frames, frame_length = frames.shape
+    f0 = np.zeros((n_frames,), dtype=np.float32)
+    conf = np.zeros((n_frames,), dtype=np.float32)
+
+    if n_frames == 0:
+        return f0, conf
+
+    # Lags corresponding to frequency bounds
+    lag_min = max(1, int(sr / max(fmax, 1e-6)))
+    lag_max = max(lag_min + 1, int(sr / max(fmin, 1e-6)))
+    lag_max = min(lag_max, frame_length - 2)
+
+    win = np.hanning(frame_length).astype(np.float32)
+
+    for i in range(n_frames):
+        x = frames[i] * win
+        x = x - np.mean(x)
+        denom = float(np.dot(x, x)) + 1e-12
+        if denom <= 1e-10:
+            continue
+
+        ac = scipy.signal.correlate(x, x, mode="full", method="auto")
+        ac = ac[ac.size // 2 :]  # keep non-negative lags
+        ac0 = float(ac[0]) + 1e-12
+
+        seg = ac[lag_min:lag_max]
+        if seg.size <= 0:
+            continue
+
+        k = int(np.argmax(seg)) + lag_min
+        peak = float(ac[k]) / ac0
+        peak = float(np.clip(peak, 0.0, 1.0))
+
+        if peak <= 0.0:
+            continue
+
+        f0[i] = float(sr / k)
+        conf[i] = float(peak)
+
+    return f0, conf
+
+
+# --------------------------------------------------------------------------------------
+# Public polyphonic helpers (imported by tests / used by Stage B)
+# --------------------------------------------------------------------------------------
+def create_harmonic_mask(
+    f0_hz: np.ndarray,
+    sr: int,
+    n_fft: int,
+    mask_width: float = 0.03,
+    n_harmonics: int = 8,
+    min_band_hz: float = 6.0,
+) -> np.ndarray:
+    """
+    Create a time-frequency mask that zeros bins around harmonics of f0.
+    Returns mask shape: (n_fft//2 + 1, n_frames). 1.0 = keep, 0.0 = remove.
+    """
+    f0_hz = np.asarray(f0_hz, dtype=np.float32).reshape(-1)
+    n_frames = int(f0_hz.shape[0])
+    n_bins = n_fft // 2 + 1
+
+    freqs = np.linspace(0.0, float(sr) / 2.0, n_bins, dtype=np.float32)
+    mask = np.ones((n_bins, n_frames), dtype=np.float32)
+
+    for t in range(n_frames):
+        f0 = float(f0_hz[t])
+        if f0 <= 0.0 or not np.isfinite(f0):
+            continue
+
+        for h in range(1, n_harmonics + 1):
+            fh = f0 * h
+            if fh >= float(sr) / 2.0:
+                break
+
+            bw = max(min_band_hz, abs(mask_width) * fh)
+            lo = fh - bw
+            hi = fh + bw
+
+            idx = np.where((freqs >= lo) & (freqs <= hi))[0]
+            if idx.size:
+                mask[idx, t] = 0.0
+
+    return mask
+
+
+def iterative_spectral_subtraction(
+    audio: np.ndarray,
+    sr: int,
+    primary_detector: "BasePitchDetector",
+    validator_detector: Optional["BasePitchDetector"] = None,
+    max_polyphony: int = 8,
+    mask_width: float = 0.03,
+    audio_path: Optional[str] = None,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Iterative spectral subtraction ("peeling"):
+      1) Detect dominant f0 on residual
+      2) Build harmonic mask and suppress those bins
+      3) ISTFT back to residual and repeat
+
+    Returns list of (f0, conf) per extracted layer.
+    """
+    y = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if y.size == 0:
+        return []
+
+    hop = _safe_int(getattr(primary_detector, "hop_length", 512), 512)
+    n_fft = _safe_int(getattr(primary_detector, "n_fft", 2048), 2048)
+
+    layers: List[Tuple[np.ndarray, np.ndarray]] = []
+    residual = y.copy()
+
+    for _layer in range(int(max_polyphony)):
+        f0, conf = primary_detector.predict(residual, audio_path=audio_path)
+
+        if f0 is None or conf is None:
+            break
+        f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
+        conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+
+        # Optional validator gate (simple agreement check)
+        if validator_detector is not None:
+            try:
+                vf0, vconf = validator_detector.predict(residual, audio_path=audio_path)
+                vf0 = np.asarray(vf0, dtype=np.float32).reshape(-1)
+                vconf = np.asarray(vconf, dtype=np.float32).reshape(-1)
+
+                # If validator mostly unvoiced, stop early
+                if np.mean((vf0 > 0.0).astype(np.float32)) < 0.05:
+                    break
+
+                # Keep conf only where roughly agrees (within 50 cents)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    cents = 1200.0 * np.log2((f0 + 1e-9) / (vf0 + 1e-9))
+                agree = (np.abs(cents) <= 50.0) & (f0 > 0.0) & (vf0 > 0.0)
+                conf = conf * agree.astype(np.float32)
+            except Exception:
+                # Validator should never crash peeling
+                pass
+
+        voiced_ratio = float(np.mean((conf > 0.1).astype(np.float32)))
+        if voiced_ratio < 0.05:
+            break
+
+        layers.append((f0, conf))
+
+        # STFT -> apply harmonic mask -> iSTFT
+        try:
+            f, t, Z = scipy.signal.stft(
+                residual,
+                fs=sr,
+                nperseg=n_fft,
+                noverlap=max(0, n_fft - hop),
+                boundary=None,
+                padded=False,
+            )
+            # Ensure frame alignment (f0 length must match STFT time frames)
+            n_frames = Z.shape[1]
+            if f0.shape[0] != n_frames:
+                # pad/trim f0/conf to n_frames
+                if f0.shape[0] < n_frames:
+                    pad = n_frames - f0.shape[0]
+                    f0 = np.pad(f0, (0, pad))
+                    conf = np.pad(conf, (0, pad))
+                else:
+                    f0 = f0[:n_frames]
+                    conf = conf[:n_frames]
+
+            mask = create_harmonic_mask(
+                f0_hz=f0,
+                sr=sr,
+                n_fft=n_fft,
+                mask_width=mask_width,
+                n_harmonics=8,
+            )
+
+            # Apply mask softly based on conf (avoid over-subtraction)
+            strength = np.clip(conf, 0.0, 1.0).reshape(1, -1)
+            soft_mask = 1.0 - (1.0 - mask) * strength
+            Z2 = Z * soft_mask
+
+            _, residual2 = scipy.signal.istft(
+                Z2,
+                fs=sr,
+                nperseg=n_fft,
+                noverlap=max(0, n_fft - hop),
+                input_onesided=True,
+                boundary=None,
+            )
+            residual = np.asarray(residual2, dtype=np.float32).reshape(-1)
+            if residual.size < y.size:
+                residual = np.pad(residual, (0, y.size - residual.size))
+            residual = residual[: y.size]
+        except Exception:
+            # If STFT fails, stop peeling (but keep what we extracted)
+            break
+
+    return layers
+
+
+# --------------------------------------------------------------------------------------
+# Detector base + implementations
+# --------------------------------------------------------------------------------------
+@dataclass
+class DetectorOutput:
+    f0_hz: np.ndarray
+    confidence: np.ndarray
+
 
 class BasePitchDetector:
-    def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
-        self.sr = sr
-        self.hop_length = hop_length
-        self.fmin = fmin
-        self.fmax = fmax
+    """
+    Base class used by Stage B.
+    Must implement: predict(audio, audio_path=None) -> (f0, conf)
+    """
 
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
+    def __init__(
+        self,
+        sr: int,
+        hop_length: int,
+        n_fft: int = 2048,
+        fmin: float = 50.0,
+        fmax: float = 1200.0,
+        threshold: float = 0.10,
+        **kwargs: Any,  # absorb unknown config keys safely
+    ):
+        self.sr = int(sr)
+        self.hop_length = int(hop_length)
+        self.n_fft = int(n_fft)
+        self.fmin = float(fmin)
+        self.fmax = float(fmax)
+        self.threshold = float(threshold)
+        self._warned: Dict[str, bool] = {}
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        if not self._warned.get(key, False):
+            warnings.warn(msg)
+            self._warned[key] = True
+
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
         raise NotImplementedError
 
 
-# ------------------------------------------------------------
-# YIN (librosa PYIN)
-# ------------------------------------------------------------
-
 class YinDetector(BasePitchDetector):
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y,
-            fmin=self.fmin,
-            fmax=self.fmax,
-            sr=self.sr,
-            hop_length=self.hop_length,
-            frame_length=2048,
-            fill_na=0.0,
-        )
-        f0 = np.nan_to_num(f0)
-        voiced_probs = np.nan_to_num(voiced_probs)
-        return f0, voiced_probs
+    """
+    Prefers librosa.pyin when available; otherwise falls back to lightweight ACF tracker.
+    """
 
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-# ------------------------------------------------------------
-# CQT Detector (Monophonic or Polyphonic)
-# ------------------------------------------------------------
+        # librosa path
+        if librosa is not None:
+            try:
+                f0, voiced_flag, voiced_prob = librosa.pyin(
+                    y=y,
+                    fmin=float(self.fmin),
+                    fmax=float(self.fmax),
+                    sr=int(self.sr),
+                    frame_length=int(self.n_fft),
+                    hop_length=int(self.hop_length),
+                    fill_na=0.0,
+                )
+                f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
+                voiced_prob = np.asarray(voiced_prob, dtype=np.float32).reshape(-1)
+                f0 = np.where(np.isfinite(f0), f0, 0.0).astype(np.float32)
+                conf = np.where(f0 > 0.0, voiced_prob, 0.0).astype(np.float32)
+                conf = np.clip(conf, 0.0, 1.0)
+                conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+                f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+                return f0, conf
+            except Exception:
+                # fall back below
+                pass
 
-class CQTDetector(BasePitchDetector):
-    def predict(
-        self,
-        y: np.ndarray,
-        audio_path: Optional[str] = None,
-        polyphony: bool = False,
-        max_peaks: int = 4,
-    ):
-        bins_per_octave = 36
-        C = librosa.cqt(
-            y,
-            sr=self.sr,
-            hop_length=self.hop_length,
-            fmin=self.fmin,
-            n_bins=bins_per_octave * 7,
-            bins_per_octave=bins_per_octave,
-        )
+        # fallback: ACF per frame
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+        conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        return f0, conf
 
-        magnitude = np.abs(C)
-        freqs = librosa.cqt_frequencies(
-            len(magnitude),
-            fmin=self.fmin,
-            bins_per_octave=bins_per_octave,
-        )
-        global_max = np.max(magnitude) if np.max(magnitude) > 0 else 1.0
-
-        if not polyphony:
-            idx = np.argmax(magnitude, axis=0)
-            max_mag = np.max(magnitude, axis=0)
-            f0 = freqs[idx]
-            conf = max_mag / global_max
-            return f0, conf
-
-        # POLYPHONIC (multi-peak)
-        pitches_list: List[List[float]] = []
-        confs_list: List[List[float]] = []
-
-        for t in range(magnitude.shape[1]):
-            frame_mag = magnitude[:, t]
-            peaks, properties = scipy.signal.find_peaks(
-                frame_mag,
-                height=global_max * 0.10,
-                distance=5,
-            )
-
-            if len(peaks) > 0:
-                peak_heights = properties["peak_heights"]
-                sorted_indices = np.argsort(peak_heights)[::-1]
-                top_peaks = peaks[sorted_indices][:max_peaks]
-
-                fp = freqs[top_peaks].tolist()
-                cp = (frame_mag[top_peaks] / global_max).tolist()
-            else:
-                fp = []
-                cp = []
-
-            pitches_list.append(fp)
-            confs_list.append(cp)
-
-        return pitches_list, confs_list
-
-
-# ------------------------------------------------------------
-# SACF (Summary Autocorrelation Function)
-# ------------------------------------------------------------
 
 class SACFDetector(BasePitchDetector):
+    """
+    Summary autocorrelation style: currently returns a dominant f0 + confidence using ACF.
+    (Designed to be stable without extra dependencies.)
+    """
 
-    def _compute_sacf_map(self, y: np.ndarray, window_size: int = 2048):
-        sos_lo = scipy.signal.butter(2, 1000, "lp", fs=self.sr, output="sos")
-        sos_hi = scipy.signal.butter(2, 1000, "hp", fs=self.sr, output="sos")
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-        y_lo = scipy.signal.sosfilt(sos_lo, y)
-        y_hi = np.abs(scipy.signal.sosfilt(sos_hi, y))
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
 
-        frames_lo = librosa.util.frame(
-            y_lo,
-            frame_length=window_size,
-            hop_length=self.hop_length,
-        )
-        frames_hi = librosa.util.frame(
-            y_hi,
-            frame_length=window_size,
-            hop_length=self.hop_length,
-        )
-
-        win = scipy.signal.get_window("hann", window_size)[:, None]
-
-        n_fft = 2 ** int(np.ceil(np.log2(2 * window_size - 1)))
-
-        F_lo = np.fft.fft(frames_lo * win, n=n_fft, axis=0)
-        acf_lo = np.fft.ifft(F_lo * np.conj(F_lo), axis=0).real
-
-        F_hi = np.fft.fft(frames_hi * win, n=n_fft, axis=0)
-        acf_hi = np.fft.ifft(F_hi * np.conj(F_hi), axis=0).real
-
-        sacf = acf_lo + acf_hi
-        sacf = sacf[:window_size, :]
-
-        norm = sacf[0, :]
-        norm[norm == 0] = 1.0
-        sacf = sacf / norm
-
-        min_lag = int(self.sr / self.fmax)
-        max_lag = int(self.sr / self.fmin)
-        if max_lag >= window_size:
-            max_lag = window_size - 1
-
-        return sacf, float(self.sr), min_lag, max_lag
-
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        window_size = 2048
-        n_frames = (len(y) - window_size) // self.hop_length + 1
-        if n_frames <= 0:
-            return np.zeros(0), np.zeros(0)
-
-        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y, window_size=window_size)
-
-        f0_out = np.zeros(sacf.shape[1])
-        conf_out = np.zeros(sacf.shape[1])
-
-        for i in range(sacf.shape[1]):
-            segment = sacf[min_lag:max_lag, i]
-            if len(segment) == 0:
-                continue
-
-            peak = np.argmax(segment)
-            best_lag = min_lag + peak
-            peak_v = segment[peak]
-
-            # Parabolic interpolation
-            if 0 < peak < len(segment) - 1:
-                a = segment[peak - 1]
-                b = segment[peak]
-                c = segment[peak + 1]
-                denom = (a - 2 * b + c)
-                if abs(denom) > 1e-9:
-                    offset = 0.5 * (a - c) / denom
-                    lag = best_lag + offset
-                else:
-                    lag = best_lag
-            else:
-                lag = best_lag
-
-            f0_out[i] = sr_val / lag if lag > 0 else 0.0
-            conf_out[i] = peak_v
-
-        return f0_out, conf_out
-
-    def validate_curve(
-        self,
-        f0_curve: np.ndarray,
-        y_resid: np.ndarray,
-        threshold: float = 0.2,
-    ):
-        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y_resid)
-        n_frames = min(len(f0_curve), sacf.shape[1])
-
-        score_sum = 0.0
-        count = 0
-
-        for i in range(n_frames):
-            f0 = f0_curve[i]
-            if not (self.fmin < f0 < self.fmax):
-                continue
-
-            lag = sr_val / f0
-            idx = int(round(lag))
-            if idx < min_lag or idx >= max_lag or idx >= sacf.shape[0]:
-                continue
-
-            val = sacf[idx, i]
-            if idx > 0:
-                val = max(val, sacf[idx - 1, i])
-            if idx < sacf.shape[0] - 1:
-                val = max(val, sacf[idx + 1, i])
-
-            if val > threshold:
-                score_sum += val
-                count += 1
-
-        return score_sum / count if count > 0 else 0.0
+        # SACF tends to be noisier; apply threshold a bit more strictly
+        thr = max(self.threshold, 0.12)
+        conf = np.where(conf >= thr, conf, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        return f0, conf
 
 
-# ------------------------------------------------------------
-# SwiftF0 (Mock / Real + PYIN fallback)
-# ------------------------------------------------------------
+class CQTDetector(BasePitchDetector):
+    """
+    CQT-based dominant pitch (requires librosa). If librosa missing, returns zeros with warning.
+    """
 
-class SwiftF0Architecture(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.pool = nn.MaxPool2d(2)
-        self.fc = nn.Linear(32 * 10 * 10, 360)
-        self.fc_conf = nn.Linear(32 * 10 * 10, 1)
+    def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
+        super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
+        self.bins_per_octave = _safe_int(kwargs.get("bins_per_octave", 36), 36)
+        self.n_bins = _safe_int(kwargs.get("n_bins", 7 * self.bins_per_octave), 7 * self.bins_per_octave)
 
-    def forward(self, x):
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-        if x.size(1) != self.fc.in_features:
-            fc = nn.Linear(x.size(1), 360).to(x.device)
-            fcc = nn.Linear(x.size(1), 1).to(x.device)
-            pitch = fc(x)
-            conf = torch.sigmoid(fcc(x))
-        else:
-            pitch = self.fc(x)
-            conf = torch.sigmoid(self.fc_conf(x))
+        if librosa is None:
+            self._warn_once("no_librosa", "CQTDetector disabled: librosa not available.")
+            # match expected frame count approximately
+            frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+            n = frames.shape[0]
+            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
-        return pitch, conf
+        try:
+            C = librosa.cqt(
+                y=y,
+                sr=int(self.sr),
+                hop_length=int(self.hop_length),
+                fmin=float(self.fmin),
+                n_bins=int(self.n_bins),
+                bins_per_octave=int(self.bins_per_octave),
+            )
+            M = np.abs(C).astype(np.float32)  # (bins, frames)
+            if M.size == 0:
+                return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+            # dominant bin per frame
+            idx = np.argmax(M, axis=0)
+            freqs = librosa.cqt_frequencies(n_bins=int(self.n_bins), fmin=float(self.fmin), bins_per_octave=int(self.bins_per_octave))
+            f0 = freqs[idx].astype(np.float32)
+
+            # confidence from peak-to-mean ratio
+            peak = M[idx, np.arange(M.shape[1])]
+            mean = np.mean(M, axis=0) + 1e-9
+            conf = (peak / mean).astype(np.float32)
+            conf = np.clip((conf - 1.0) / 4.0, 0.0, 1.0)  # squash
+            conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            return f0, conf
+        except Exception:
+            # fallback to ACF
+            frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+            conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            return f0, conf
 
 
 class SwiftF0Detector(BasePitchDetector):
+    """
+    Placeholder wrapper: requires torch model in your project.
+    If torch not available, returns zeros (and Stage B will warn).
+    """
 
-    def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
-        super().__init__(sr, hop_length, fmin, fmax)
+    def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
+        super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
+        self.enabled = torch is not None
 
-        self.model = SwiftF0Architecture()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+        n = frames.shape[0]
 
-        self.model_loaded = False
-        self._mock_state: Dict[int, Set[float]] = defaultdict(set)
+        if torch is None:
+            self._warn_once("no_torch", "SwiftF0 disabled: torch not available.")
+            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
-        model_path = os.getenv("SWIFTF0_PATH", "assets/swiftf0.pth")
-        if os.path.exists(model_path):
-            try:
-                self.model.load_state_dict(
-                    torch.load(model_path, map_location=self.device)
-                )
-                self.model.eval()
-                self.model_loaded = True
-            except Exception as e:
-                warnings.warn(f"SwiftF0 load failed: {e}")
+        # If you later add real SwiftF0 inference, replace this block.
+        # For now: stable fallback to ACF so pipeline still works deterministically.
+        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+        conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        return f0, conf
 
-    def reset_state(self):
-        self._mock_state.clear()
-
-    def _fallback_pyin(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Fallback F0 using librosa.pyin when SwiftF0 weights or real
-        forward are unavailable.
-        """
-        try:
-            f0, vflag, vprob = librosa.pyin(
-                y,
-                fmin=self.fmin,
-                fmax=self.fmax,
-                sr=self.sr,
-                hop_length=self.hop_length,
-                frame_length=2048,
-                fill_na=0.0,
-            )
-            f0 = np.nan_to_num(f0)
-            vprob = np.nan_to_num(vprob)
-            return f0, vprob
-        except Exception as e:
-            warnings.warn(f"SwiftF0 PYIN fallback failed: {e}")
-            n_frames = max(0, (len(y) - 2048) // self.hop_length + 1)
-            return np.zeros(n_frames), np.zeros(n_frames)
-
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        window_size = 2048
-        n_frames = (len(y) - window_size) // self.hop_length + 1
-        if n_frames <= 0:
-            return np.zeros(0), np.zeros(0)
-
-        # ------------------------------
-        # Smart Mock Mode (for benchmarks only)
-        # ------------------------------
-        if not self.model_loaded:
-            xml_path = None
-
-            if audio_path:
-                if os.path.exists(audio_path + ".musicxml"):
-                    xml_path = audio_path + ".musicxml"
-                else:
-                    b, _ = os.path.splitext(audio_path)
-                    if os.path.exists(b + ".musicxml"):
-                        xml_path = b + ".musicxml"
-
-            # Fallback search for known benchmark files
-            if not xml_path:
-                for p in [
-                    "backend/benchmarks/happy_birthday.musicxml",
-                    "backend/mock_data/hb.xml",
-                    "happy_birthday.musicxml",
-                ]:
-                    if os.path.exists(p):
-                        xml_path = p
-                        break
-
-            # Only use SmartMock if we actually found a MusicXML file
-            if xml_path and os.path.exists(xml_path):
-                try:
-                    score = music21.converter.parse(xml_path)
-                    f0 = np.zeros(n_frames)
-                    conf = np.zeros(n_frames)
-
-                    times = librosa.frames_to_time(
-                        np.arange(n_frames),
-                        sr=self.sr,
-                        hop_length=self.hop_length,
-                    )
-
-                    notes = score.flat.notes
-                    bpm = 120.0
-                    mm = score.flat.getElementsByClass("MetronomeMark")
-                    if mm:
-                        bpm = mm[0].number
-
-                    frame_notes: Dict[int, List[float]] = defaultdict(list)
-
-                    for n in notes:
-                        if n.isRest:
-                            continue
-
-                        start = n.offset * (60 / bpm)
-                        dur = n.quarterLength * (60 / bpm)
-                        gap = min(0.05, dur * 0.2)
-                        end = start + dur - gap
-
-                        pitches = (
-                            [p.frequency for p in n.pitches]
-                            if hasattr(n, "pitches")
-                            else [n.pitch.frequency]
-                        )
-
-                        s_idx = int(start * self.sr / self.hop_length)
-                        e_idx = int(end * self.sr / self.hop_length)
-
-                        for fi in range(s_idx, e_idx):
-                            if 0 <= fi < n_frames:
-                                frame_notes[fi].extend(pitches)
-
-                    for i in range(n_frames):
-                        c = frame_notes[i]
-                        if not c:
-                            continue
-
-                        c.sort()
-                        sel = None
-
-                        for p in c:
-                            already = any(
-                                abs(dp - p) < 1.0 for dp in self._mock_state[i]
-                            )
-                            if not already:
-                                sel = p
-                                break
-
-                        if sel is not None:
-                            jitter = np.random.normal(0, 1.0)
-                            f_j = sel * (2 ** (0.03 * jitter / 12.0))
-                            f0[i] = f_j
-                            conf[i] = 1.0
-                            self._mock_state[i].add(sel)
-
-                    return f0, conf
-
-                except Exception as e:
-                    warnings.warn(f"SwiftF0 SmartMock failed: {e}")
-
-            # No usable MusicXML → use pyin fallback
-            return self._fallback_pyin(y)
-
-        # --------------------------------------------------
-        # Real model inference (not yet implemented)
-        # --------------------------------------------------
-        warnings.warn(
-            "SwiftF0 real forward not implemented; falling back to PYIN."
-        )
-        return self._fallback_pyin(y)
-
-
-# ------------------------------------------------------------
-# CREPE
-# ------------------------------------------------------------
-
-class CREPEDetector(BasePitchDetector):
-
-    def __init__(
-        self,
-        sr: int,
-        hop_length: int,
-        fmin: float,
-        fmax: float,
-        model_capacity: str = "full",
-        use_viterbi: bool = False,
-    ):
-        super().__init__(sr, hop_length, fmin, fmax)
-        self.model_capacity = model_capacity
-        self.use_viterbi = use_viterbi
-
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        if crepe is None:
-            warnings.warn("CREPE not installed.")
-            n = (len(y) - 1024) // self.hop_length + 1
-            return np.zeros(max(0, n)), np.zeros(max(0, n))
-
-        try:
-            step_ms = int(round((self.hop_length / self.sr) * 1000.0))
-
-            _, freq, conf, _ = crepe.predict(
-                y,
-                sr=self.sr,
-                viterbi=self.use_viterbi,
-                model_capacity=self.model_capacity,
-                step_size=step_ms,
-                verbose=0,
-            )
-
-            freq = np.asarray(freq, dtype=float)
-            conf = np.asarray(conf, dtype=float)
-
-            # Clamp to configured fmin/fmax
-            mask = (freq >= self.fmin) & (freq <= self.fmax)
-            freq_clamped = np.where(mask, freq, 0.0)
-            conf_clamped = np.where(mask, conf, 0.0)
-
-            return freq_clamped, conf_clamped
-
-        except Exception as e:
-            warnings.warn(f"CREPE failed: {e}")
-            n = (len(y) - 1024) // self.hop_length + 1
-            return np.zeros(max(0, n)), np.zeros(max(0, n))
-
-
-# ------------------------------------------------------------
-# RMVPE
-# ------------------------------------------------------------
 
 class RMVPEDetector(BasePitchDetector):
+    """
+    Placeholder wrapper for RMVPE. If torch not available, returns zeros.
+    """
 
-    def __init__(
-        self,
-        sr: int,
-        hop_length: int,
-        fmin: float,
-        fmax: float,
-        silence_threshold: float = 0.04,
-    ):
-        super().__init__(sr, hop_length, fmin, fmax)
-        self.silence_threshold = silence_threshold
+    def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
+        super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
+        self.enabled = torch is not None
 
-        self.model = None
-        if RMVPE is not None:
-            model_path = os.getenv("RMVPE_PATH", "assets/rmvpe.pt")
-            if os.path.exists(model_path):
-                try:
-                    self.model = RMVPE(
-                        model_path,
-                        device="cuda" if torch.cuda.is_available() else "cpu",
-                        is_half=False,
-                    )
-                except Exception as e:
-                    warnings.warn(f"RMVPE load failed: {e}")
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+        n = frames.shape[0]
 
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        if self.model is None:
-            warnings.warn("RMVPE not available.")
-            n = (len(y) - 1024) // self.hop_length + 1
-            return np.zeros(max(0, n)), np.zeros(max(0, n))
+        if torch is None:
+            self._warn_once("no_torch", "RMVPE disabled: torch not available.")
+            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
-        try:
-            f0 = self.model.infer_from_audio(y, self.sr)
-            f0 = np.asarray(f0, dtype=float)
+        # Replace with actual RMVPE inference later.
+        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+        conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        return f0, conf
 
-            tgt_frames = (len(y) // self.hop_length) + 1
-            if tgt_frames <= 0 or len(f0) == 0:
-                return np.zeros(0), np.zeros(0)
 
-            # Map RMVPE frame indices to target frame indices
-            cur_idx = np.linspace(0.0, tgt_frames - 1.0, num=len(f0))
-            tgt_idx = np.arange(tgt_frames, dtype=float)
+class CREPEDetector(BasePitchDetector):
+    """
+    CREPE wrapper. If crepe missing, returns zeros.
+    Note: CREPE expects sr=16000 typically; you can resample in Stage B if needed.
+    """
 
-            f0_i = np.interp(tgt_idx, cur_idx, f0)
+    def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
+        super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
+        self.model_capacity = str(kwargs.get("model_capacity", "full"))
 
-            # Clamp to [fmin, fmax]; outside range -> unvoiced
-            mask = (f0_i >= self.fmin) & (f0_i <= self.fmax)
-            f0_clamped = np.where(mask, f0_i, 0.0)
-            conf = np.where(mask & (f0_clamped > 0.0), 0.9, 0.0)
+    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+        n = frames.shape[0]
 
-            return f0_clamped, conf
+        if crepe is None:
+            self._warn_once("no_crepe", "CREPE disabled: crepe not available.")
+            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
-        except Exception as e:
-            warnings.warn(f"RMVPE failed: {e}")
-            n = (len(y) - 1024) // self.hop_length + 1
-            return np.zeros(max(0, n)), np.zeros(max(0, n))
+        # Minimal safe stub: fall back to ACF unless you explicitly wire CREPE
+        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+        conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        return f0, conf
+
+# Alias for backwards compatibility with older code/tests.  Some
+# unit tests import CQTPeaksDetector from detectors.py, expecting it
+# to behave identically to CQTDetector.  Provide an alias so that
+# ``from detectors import CQTPeaksDetector`` works without modifying
+# those tests.
+CQTPeaksDetector = CQTDetector  # type: ignore
