@@ -6,7 +6,7 @@ and loudness normalization.
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Union
 import numpy as np
 import math
 import warnings
@@ -29,7 +29,7 @@ except ImportError:
     pass
 
 from .models import StageAOutput, MetaData, Stem, AudioType, AudioQuality
-from .config import PipelineConfig
+from .config import PipelineConfig, StageAConfig
 
 # Public constants (exported for tests)
 TARGET_LUFS = -23.0
@@ -139,7 +139,7 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
 
 def load_and_preprocess(
     audio_path: str,
-    config: Optional[PipelineConfig] = None
+    config: Optional[Union[PipelineConfig, StageAConfig]] = None
 ) -> StageAOutput:
     """
     Stage A main entry point.
@@ -151,12 +151,41 @@ def load_and_preprocess(
     5. Estimate noise floor.
     """
     if config is None:
-        config = PipelineConfig()
+        # Default empty PipelineConfig which has a default StageAConfig
+        full_conf = PipelineConfig()
+        a_conf = full_conf.stage_a
+    elif isinstance(config, StageAConfig):
+        full_conf = None
+        a_conf = config
+    else:
+        # It's a PipelineConfig
+        full_conf = config
+        a_conf = config.stage_a
 
-    a_conf = config.stage_a
     target_sr = a_conf.target_sample_rate
     target_lufs = float(a_conf.loudness_normalization.get("target_lufs", TARGET_LUFS))
     trim_db = float(a_conf.silence_trimming.get("top_db", SILENCE_THRESHOLD_DB))
+
+    # Resolve hop_length / window_size
+    hop_length = 512
+    window_size = 2048
+
+    if full_conf:
+        # Check Stage B detectors for 'yin' or 'swiftf0' preference
+        # We use .get() safely
+        detectors = full_conf.stage_b.detectors
+        yin_conf = detectors.get("yin")
+        swift_conf = detectors.get("swiftf0")
+
+        # Priority: YIN > SwiftF0 (if enabled)
+        # Note: configs might not have explicit hop_length keys, so we check existence
+        if yin_conf and yin_conf.get("enabled", False):
+            hop_length = int(yin_conf.get("hop_length", 512))
+            window_size = int(yin_conf.get("frame_length", 2048)) # YIN usually calls it frame_length
+        elif swift_conf and swift_conf.get("enabled", False):
+            hop_length = int(swift_conf.get("hop_length", 512))
+            # SwiftF0 might not specify window size same way, default to 2048
+            window_size = int(swift_conf.get("n_fft", 2048))
 
     # 1. Load & Resample
     try:
@@ -175,7 +204,7 @@ def load_and_preprocess(
 
     # 2. Trim Silence
     if a_conf.silence_trimming.get("enabled", True):
-        audio = _trim_silence(audio, top_db=trim_db)
+        audio = _trim_silence(audio, top_db=trim_db, frame_length=window_size, hop_length=hop_length)
 
     # 3. Loudness Normalization
     gain_db = 0.0
@@ -183,7 +212,7 @@ def load_and_preprocess(
         audio, gain_db = _normalize_loudness(audio, sr, target_lufs)
 
     # 4. Noise Floor
-    nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30))
+    nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
 
     # 5. Populate Metadata & Output
     # Basic MetaData
@@ -200,9 +229,10 @@ def load_and_preprocess(
         noise_floor_db=nf_db,
         pipeline_version="2.0.0",
 
-        # Defaults for downstream (can be updated by detectors)
-        hop_length=512,
-        window_size=2048,
+        # Resolved values
+        hop_length=hop_length,
+        window_size=window_size,
+
         processing_mode="monophonic", # Default assumption, detector may refine
         audio_type=AudioType.MONOPHONIC
     )

@@ -10,8 +10,9 @@ from backend.pipeline.stage_a import load_and_preprocess
 from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory
 from backend.pipeline.stage_d import quantize_and_render
-from backend.pipeline.models import StageAOutput, AnalysisData
-from backend.pipeline import transcribe
+from backend.pipeline.models import StageAOutput, AnalysisData, TranscriptionResult
+# Updated: import transcribe from its specific module to avoid confusing it with the package
+from backend.pipeline.transcribe import transcribe
 
 
 def create_sine_wave(freq: float = 440.0, duration: float = 1.0, sr: int = 44100):
@@ -40,9 +41,10 @@ def test_full_pipeline_flow_low_level(tmp_path):
 
     # 2. Stage A
     print("Running Stage A...")
+    # Updated: Pass FULL config so Stage A can resolve hop/window from Stage B defaults
     stage_a_out = load_and_preprocess(
         str(audio_path),
-        config=PIANO_61KEY_CONFIG.stage_a,
+        config=PIANO_61KEY_CONFIG,
     )
     assert isinstance(stage_a_out, StageAOutput)
     assert stage_a_out.meta.sample_rate == sr_target
@@ -97,9 +99,12 @@ def test_full_pipeline_flow_low_level(tmp_path):
 
     # 5. Stage D
     print("Running Stage D...")
-    xml_str = quantize_and_render(notes, analysis_data, config=test_config)
-    assert "<?xml" in xml_str
-    assert "<score-partwise" in xml_str
+    result_d = quantize_and_render(notes, analysis_data, config=test_config)
+
+    # Updated: quantize_and_render returns TranscriptionResult
+    assert isinstance(result_d, TranscriptionResult)
+    assert "<?xml" in result_d.musicxml
+    assert "<score-partwise" in result_d.musicxml
 
     print("Low-level pipeline test passed!")
 
@@ -123,9 +128,12 @@ def test_transcribe_orchestrator(tmp_path):
     result = transcribe(str(audio_path), config=PIANO_61KEY_CONFIG)
 
     # 3. Basic checks
+    # Updated: result is TranscriptionResult
+    assert isinstance(result, TranscriptionResult)
     assert isinstance(result.musicxml, str)
     assert "<?xml" in result.musicxml
     assert "<score-partwise" in result.musicxml
+    assert isinstance(result.midi_bytes, bytes)
 
     analysis = result.analysis_data
     assert analysis.meta.sample_rate == sr_target
