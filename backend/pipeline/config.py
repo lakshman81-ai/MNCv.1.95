@@ -66,6 +66,10 @@ class StageBConfig:
         default_factory=lambda: {
             "enabled": True,
             "model": "htdemucs",
+            # If True, prefer the synthetic model fine-tuned on procedurally
+            # generated L2 sine/saw/square/FM stems. Falls back to the
+            # configured "model" when unavailable.
+            "synthetic_model": False,
             "overlap": 0.25,  # Demucs overlap
             "shifts": 1,      # number of shifts (test-time augmentation)
             # Optional harmonic masking guided by a fast F0 prior
