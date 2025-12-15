@@ -43,6 +43,86 @@ from backend.benchmarks.ladder.synth import midi_to_wav_synth
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("benchmark_runner")
 
+
+def accuracy_benchmark_plan() -> Dict[str, Any]:
+    """Structured description of the accuracy-focused benchmark plan.
+
+    The returned payload groups scenarios, toggles, and expected metrics so tests and
+    dashboards can validate coverage without depending on markdown prose alone.
+    """
+
+    return {
+        "end_to_end": {
+            "scenarios": [
+                "clean_piano",
+                "dense_chords",
+                "percussive_passages",
+                "noisy_inputs",
+            ],
+            "outputs": ["musicxml", "midi_bytes", "analysis_timelines"],
+            "goals": ["stage_A_to_D_flow", "aggregate_outputs"],
+        },
+        "stage_a": {
+            "toggles": [
+                "sample_rate_targets",
+                "channel_handling",
+                "trimming",
+                "loudness_normalization",
+            ],
+            "fixtures": ["silence", "dc_offset_tones", "clipped_signals"],
+            "metrics": ["snr_change", "loudness_change", "latency_s"],
+        },
+        "stage_b": {
+            "detectors": ["yin", "swiftf0", "crepe", "rmvpe"],
+            "ensemble_settings": [
+                "confidence_voicing_threshold",
+                "pitch_disagreement_cents",
+                "per_detector_flags",
+                "source_separation",
+                "harmonic_masking",
+            ],
+            "metrics": ["f0_precision", "f0_recall", "voicing_error", "latency_s"],
+            "fixtures": ["annotated_monophonic", "annotated_polyphonic"],
+        },
+        "stage_c": {
+            "segmentation_modes": ["hmm", "threshold"],
+            "parameters": ["minimum_duration", "pitch_merge_tolerance", "gap_filling"],
+            "fixtures": ["staccato", "legato", "varied_tempos"],
+            "metrics": ["note_f_measure", "fragmentation_rate", "merging_rate"],
+        },
+        "stage_d": {
+            "scenarios": ["tempo_grids", "swing", "rubato"],
+            "metrics": [
+                "beat_alignment_error",
+                "barline_placement",
+                "notation_cleanliness",
+            ],
+            "ground_truth": "synthetic_midi_round_trip",
+        },
+        "ablation": {
+            "sweeps": [
+                "source_separation",
+                "ensemble_weights",
+                "segmentation_method",
+            ],
+            "reports": ["f_measure_impact", "runtime_impact", "interaction_notes"],
+        },
+        "regression": {
+            "corpus": "fixed_benchmark_corpus",
+            "thresholds": ["accuracy_delta", "timing_delta"],
+            "alerts": True,
+        },
+        "profiling": {
+            "hooks": [
+                "stage_timings",
+                "noise_floor",
+                "detector_confidences",
+                "hmm_state_durations",
+            ],
+            "purpose": "contextualize_benchmark_results",
+        },
+    }
+
 def midi_to_freq(m: int) -> float:
     return 440.0 * 2 ** ((m - 69) / 12.0)
 
