@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--output_midi", default="output.mid", help="Output MIDI path")
     parser.add_argument("--output_png", default="output.png", help="Output PNG path")
     parser.add_argument("--output_log", default="transcription_log.json", help="Output log path")
+    parser.add_argument(
+        "--quantization_strategy",
+        choices=["nearest", "classifier"],
+        default="nearest",
+        help="Quantization strategy: snap to nearest denominator or use a learned classifier",
+    )
     return parser.parse_args()
 
 def freq_to_midi(freq):
@@ -37,15 +43,70 @@ def freq_to_midi(freq):
         return None
     return int(round(69 + 12 * np.log2(freq / 440.0)))
 
-def quantize_duration(seconds, bpm, denominators=[4.0, 2.0, 1.0, 0.5, 0.25, 0.125]):
-    # beats = seconds * (bpm / 60)
-    beats = seconds * (bpm / 60.0)
+class DurationClassifier:
+    """
+    Lightweight probabilistic classifier that maps continuous beat durations to
+    the most likely rhythmic category. The class stores Gaussian prototypes in
+    log-beat space that can be refined offline and shipped as parameters.
+    """
 
-    # Find nearest denominator
-    closest = min(denominators, key=lambda x: abs(x - beats))
+    def __init__(self, categories, mus=None, sigmas=None):
+        self.categories = np.array(categories, dtype=float)
+        # Default prototypes center around the provided categories in log space
+        self.mus = np.array(mus) if mus is not None else np.log(self.categories)
+        # Default spread loosely models human timing variability
+        self.sigmas = (
+            np.array(sigmas)
+            if sigmas is not None
+            else np.full_like(self.mus, 0.20, dtype=float)
+        )
 
-    # Simple quantization
-    return closest, beats
+    def predict(self, beat_duration):
+        beat_duration = max(beat_duration, 1e-6)
+        log_val = np.log(beat_duration)
+        log_probs = -0.5 * ((log_val - self.mus) / self.sigmas) ** 2
+        idx = int(np.argmax(log_probs))
+        return float(self.categories[idx])
+
+
+def quantize_duration(
+    seconds,
+    start_time,
+    tempo_times,
+    tempo_curve,
+    denominators,
+    classifier=None,
+):
+    local_bpm = float(np.interp(start_time, tempo_times, tempo_curve))
+    beats = seconds * (local_bpm / 60.0)
+
+    if classifier is not None:
+        quantized = classifier.predict(beats)
+    else:
+        quantized = min(denominators, key=lambda x: abs(x - beats))
+
+    return quantized, beats, local_bpm
+
+
+def compute_tempo_curve(y, sr, hop_length):
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    tempo_curve = librosa.beat.tempo(
+        onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None
+    )
+    tempo_times = librosa.times_like(onset_env, sr=sr, hop_length=hop_length)
+
+    return tempo_times, tempo_curve
+
+
+def cumulative_beats(tempo_times, tempo_curve):
+    if len(tempo_times) == 0:
+        return np.array([])
+
+    beats = [0.0]
+    for i in range(1, len(tempo_times)):
+        dt = tempo_times[i] - tempo_times[i - 1]
+        beats.append(beats[-1] + (tempo_curve[i - 1] / 60.0) * dt)
+    return np.array(beats)
 
 
 class NeuralF0Estimator:
@@ -316,7 +377,20 @@ def main():
         "min_note_duration_sec": 0.06,
         "merge_gap_threshold_sec": 0.15,
         "quantization_tolerance": 0.20,
-        "rhythmic_denominators": [4.0, 2.0, 1.0, 0.5, 0.25, 0.125],
+        "rhythmic_denominators": [
+            4.0,
+            3.0,
+            2.0,
+            1.5,
+            1.0,
+            0.75,
+            0.6666666667,
+            0.5,
+            0.3333333333,
+            0.25,
+            0.1666666667,
+            0.125,
+        ],
         "split_midi_threshold": 60
     }
 
@@ -339,14 +413,18 @@ def main():
     y = librosa.util.normalize(y)
 
     # 3. Tempo and Beats
-    logger.info("Step 3: Estimating Tempo...")
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    if isinstance(tempo, np.ndarray):
-        tempo = float(tempo[0])
-    else:
-        tempo = float(tempo)
+    logger.info("Step 3: Estimating Tempo Curve...")
+    tempo_times, tempo_curve = compute_tempo_curve(y, sr, params["hop_length"])
+    if tempo_curve.size == 0:
+        logger.error("Failed to compute tempo curve")
+        sys.exit(1)
 
-    logger.info(f"Detected tempo: {tempo} BPM")
+    global_tempo = float(np.median(tempo_curve))
+    logger.info(
+        f"Detected tempo curve with median tempo {global_tempo:.2f} BPM and {len(tempo_curve)} windows"
+    )
+
+    beat_positions = cumulative_beats(tempo_times, tempo_curve)
 
     beat_period_sec = 60.0 / tempo if tempo > 0 else 0.5
 
@@ -469,7 +547,57 @@ def main():
     logger.info("Step 9-14: Building Score...")
 
     s = music21.stream.Score()
-    p_treble, p_bass, log_entries = assign_to_voices(note_events, tempo, params)
+    p_treble = music21.stream.Part()
+    p_bass = music21.stream.Part()
+
+    p_treble.insert(0, music21.clef.TrebleClef())
+    p_bass.insert(0, music21.clef.BassClef())
+
+    # Tempo
+    mm = music21.tempo.MetronomeMark(number=global_tempo)
+    p_treble.insert(0, mm)
+
+    duration_classifier = None
+    if args.quantization_strategy == "classifier":
+        duration_classifier = DurationClassifier(params["rhythmic_denominators"])
+
+    log_entries = []
+
+    for n in merged_notes:
+        dur_sec = n["end_sec"] - n["start_sec"]
+        q_dur, raw_beats, local_bpm = quantize_duration(
+            dur_sec,
+            n["start_sec"],
+            tempo_times,
+            tempo_curve,
+            params["rhythmic_denominators"],
+            classifier=duration_classifier,
+        )
+
+        m21_note = music21.note.Note(n["midi"])
+        # Snap written duration to the quantized value instead of the raw beat length
+        m21_note.quarterLength = q_dur
+
+        # Calculate start beat using integrated tempo curve
+        start_beat = float(np.interp(n["start_sec"], tempo_times, beat_positions))
+
+        # Determine staff
+        if n["midi"] >= params["split_midi_threshold"]:
+            p_treble.insert(start_beat, m21_note)
+            staff = "treble"
+        else:
+            p_bass.insert(start_beat, m21_note)
+            staff = "bass"
+
+        log_entries.append({
+            "start_sec": n["start_sec"],
+            "end_sec": n["end_sec"],
+            "midi": n["midi"],
+            "quantized_rhythm": q_dur,
+            "start_beat": start_beat,
+            "local_bpm": local_bpm,
+            "staff": staff
+        })
 
     s.insert(0, p_treble)
     s.insert(0, p_bass)
