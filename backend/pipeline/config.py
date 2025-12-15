@@ -74,15 +74,18 @@ class StageBConfig:
             "shifts": 1,      # number of shifts (test-time augmentation)
             # Optional harmonic masking guided by a fast F0 prior
             "harmonic_masking": {
-                "enabled": False,
-                "mask_width": 0.025,
-                "n_harmonics": 8,
+                "enabled": True,
+                "mask_width": 0.02,
+                "n_harmonics": 12,
             },
         }
     )
 
     # Global voicing threshold for ensemble F0
-    confidence_voicing_threshold: float = 0.65
+    confidence_voicing_threshold: float = 0.58
+
+    # Additional relaxation applied when polyphonic context is detected
+    polyphonic_voicing_relaxation: float = 0.07
 
     # SwiftF0 priority floor
     confidence_priority_floor: float = 0.5
@@ -156,7 +159,7 @@ class StageCConfig:
     min_note_duration_ms: float = 30.0
 
     # Polyphonic-specific minimum duration to suppress bass-induced flutter
-    min_note_duration_ms_poly: float = 60.0
+    min_note_duration_ms_poly: float = 55.0
 
     # HMM frame stability (used in HMMProcessor)
     frame_stability: Dict[str, Any] = field(
@@ -173,7 +176,7 @@ class StageCConfig:
 
     # Confidence gates for polyphonic timelines (melody vs accompaniment)
     polyphonic_confidence: Dict[str, float] = field(
-        default_factory=lambda: {"melody": 0.2, "accompaniment": 0.45}
+        default_factory=lambda: {"melody": 0.35, "accompaniment": 0.48}
     )
 
     # RMS → MIDI velocity mapping

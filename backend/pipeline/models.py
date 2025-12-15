@@ -105,6 +105,7 @@ class StageBOutput:
     per_detector: Dict[str, Any]
     stem_timelines: Dict[str, List["FramePitch"]] = field(default_factory=dict)
     meta: Optional[MetaData] = None         # Passed through from Stage A
+    diagnostics: Dict[str, Any] = field(default_factory=dict)  # Separation/masking/ISS flags
 
 
 @dataclass
