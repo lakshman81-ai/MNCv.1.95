@@ -111,7 +111,31 @@ class StageBConfig:
         default_factory=lambda: {
             "max_layers": 8,
             "mask_width": 0.03,  # Fractional bandwidth around harmonics
+            "min_mask_width": 0.02,
+            "max_mask_width": 0.08,
+            "mask_growth": 1.1,
+            "mask_shrink": 0.9,
+            "harmonic_snr_stop_db": 3.0,
+            "residual_rms_stop_ratio": 0.08,
+            "residual_flatness_stop": 0.45,
+            "validator_cents_tolerance": 50.0,
+            "validator_agree_window": 5,
+            "validator_disagree_decay": 0.6,
+            "validator_min_agree_frames": 2,
+            "validator_min_disagree_frames": 2,
+            "max_harmonics": 12,
             "force_on_mix": True,
+        }
+    )
+
+    # Voice tracking / skyline settings
+    voice_tracking: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "max_alt_voices": 4,
+            "max_jump_cents": 150.0,
+            "hangover_frames": 2,
+            "smoothing": 0.35,
+            "confidence_bias": 5.0,
         }
     )
 

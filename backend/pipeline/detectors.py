@@ -174,6 +174,19 @@ def iterative_spectral_subtraction(
     validator_detector: Optional["BasePitchDetector"] = None,
     max_polyphony: int = 8,
     mask_width: float = 0.03,
+    min_mask_width: float = 0.02,
+    max_mask_width: float = 0.08,
+    mask_growth: float = 1.1,
+    mask_shrink: float = 0.9,
+    harmonic_snr_stop_db: float = 3.0,
+    residual_rms_stop_ratio: float = 0.08,
+    residual_flatness_stop: float = 0.45,
+    validator_cents_tolerance: float = 50.0,
+    validator_agree_window: int = 5,
+    validator_disagree_decay: float = 0.6,
+    validator_min_agree_frames: int = 2,
+    validator_min_disagree_frames: int = 2,
+    max_harmonics: int = 12,
     audio_path: Optional[str] = None,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
@@ -190,9 +203,36 @@ def iterative_spectral_subtraction(
 
     hop = _safe_int(getattr(primary_detector, "hop_length", 512), 512)
     n_fft = _safe_int(getattr(primary_detector, "n_fft", 2048), 2048)
+    bin_hz = float(sr) / float(n_fft)
 
     layers: List[Tuple[np.ndarray, np.ndarray]] = []
     residual = y.copy()
+    base_rms = float(np.sqrt(np.mean(residual**2)) + 1e-9)
+    current_mask_width = float(mask_width)
+
+    def _spectral_flatness(magnitude: np.ndarray) -> float:
+        mag = np.asarray(magnitude, dtype=np.float32)
+        if mag.size == 0:
+            return 0.0
+        mag = np.maximum(mag, 1e-9)
+        log_mean = float(np.mean(np.log(mag)))
+        geo = float(np.exp(log_mean))
+        arith = float(np.mean(mag)) + 1e-12
+        return float(geo / arith)
+
+    def _rolling_mean(arr: np.ndarray, win: int) -> np.ndarray:
+        if win <= 1:
+            return arr.astype(np.float32)
+        kernel = np.ones(win, dtype=np.float32) / float(win)
+        return np.convolve(arr.astype(np.float32), kernel, mode="same")
+
+    def _consecutive_lengths(flags: np.ndarray) -> np.ndarray:
+        lengths = np.zeros_like(flags, dtype=np.int32)
+        run = 0
+        for i, v in enumerate(flags):
+            run = run + 1 if v else 0
+            lengths[i] = run
+        return lengths
 
     for _layer in range(int(max_polyphony)):
         f0, conf = primary_detector.predict(residual, audio_path=audio_path)
@@ -202,7 +242,7 @@ def iterative_spectral_subtraction(
         f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
         conf = np.asarray(conf, dtype=np.float32).reshape(-1)
 
-        # Optional validator gate (simple agreement check)
+        # Optional validator gate with temporal smoothing
         if validator_detector is not None:
             try:
                 vf0, vconf = validator_detector.predict(residual, audio_path=audio_path)
@@ -213,11 +253,25 @@ def iterative_spectral_subtraction(
                 if np.mean((vf0 > 0.0).astype(np.float32)) < 0.05:
                     break
 
-                # Keep conf only where roughly agrees (within 50 cents)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     cents = 1200.0 * np.log2((f0 + 1e-9) / (vf0 + 1e-9))
-                agree = (np.abs(cents) <= 50.0) & (f0 > 0.0) & (vf0 > 0.0)
-                conf = conf * agree.astype(np.float32)
+                agree_raw = (np.abs(cents) <= float(validator_cents_tolerance)) & (f0 > 0.0) & (vf0 > 0.0)
+
+                agree_smooth = _rolling_mean(agree_raw.astype(np.float32), int(max(1, validator_agree_window)))
+                agree_runs = _consecutive_lengths(agree_raw)
+                disagree_runs = _consecutive_lengths(~agree_raw & (f0 > 0.0) & (vf0 > 0.0))
+
+                stable_agree = agree_runs >= int(max(1, validator_min_agree_frames))
+                stable_disagree = disagree_runs >= int(max(1, validator_min_disagree_frames))
+
+                gate = agree_smooth + (1.0 - agree_smooth) * float(validator_disagree_decay)
+                gate = np.clip(gate, 0.0, 1.0)
+
+                # Require consensus before fully accepting/rejecting
+                gate = np.where(stable_disagree, gate * float(validator_disagree_decay), gate)
+                gate = np.where(~stable_agree & ~stable_disagree, gate * 0.8, gate)
+
+                conf = conf * gate.astype(np.float32)
             except Exception:
                 # Validator should never crash peeling
                 pass
@@ -225,8 +279,6 @@ def iterative_spectral_subtraction(
         voiced_ratio = float(np.mean((conf > 0.1).astype(np.float32)))
         if voiced_ratio < 0.05:
             break
-
-        layers.append((f0, conf))
 
         # STFT -> apply harmonic mask -> iSTFT
         try:
@@ -250,13 +302,34 @@ def iterative_spectral_subtraction(
                     f0 = f0[:n_frames]
                     conf = conf[:n_frames]
 
+            # Adapt harmonics based on current F0 distribution and FFT
+            f0_valid = f0[f0 > 0.0]
+            median_f0 = float(np.median(f0_valid)) if f0_valid.size else 0.0
+            max_possible_h = int(float(sr) / 2.0 / max(median_f0, 1e-6)) if median_f0 > 0 else 1
+            adaptive_harmonics = int(max(1, min(int(max_harmonics), max_possible_h)))
+
+            # adapt mask width to FFT bin spacing and current mask schedule
+            effective_mask_width = float(np.clip(current_mask_width, min_mask_width, max_mask_width))
+            min_band = max(bin_hz, float(effective_mask_width) * max(median_f0, 1.0) * 0.5)
+
             mask = create_harmonic_mask(
                 f0_hz=f0,
                 sr=sr,
                 n_fft=n_fft,
-                mask_width=mask_width,
-                n_harmonics=8,
+                mask_width=effective_mask_width,
+                n_harmonics=adaptive_harmonics,
+                min_band_hz=min_band,
             )
+
+            magnitude = np.abs(Z).astype(np.float32)
+            harmonic_energy = float(np.mean(magnitude * (1.0 - mask)))
+            residual_energy = float(np.mean(magnitude * mask))
+            harmonic_snr = 10.0 * np.log10((harmonic_energy + 1e-9) / (residual_energy + 1e-9))
+
+            if harmonic_snr < float(harmonic_snr_stop_db):
+                break
+
+            layers.append((f0, conf))
 
             # Apply mask softly based on conf (avoid over-subtraction)
             strength = np.clip(conf, 0.0, 1.0).reshape(1, -1)
@@ -275,6 +348,20 @@ def iterative_spectral_subtraction(
             if residual.size < y.size:
                 residual = np.pad(residual, (0, y.size - residual.size))
             residual = residual[: y.size]
+
+            residual_rms = float(np.sqrt(np.mean(residual**2)) + 1e-9)
+            if residual_rms / base_rms < float(residual_rms_stop_ratio):
+                break
+
+            flatness = _spectral_flatness(magnitude)
+            if flatness > float(residual_flatness_stop):
+                break
+
+            # Adapt mask width for the next iteration (widen when SNR drops)
+            if harmonic_snr < float(harmonic_snr_stop_db) + 3.0:
+                current_mask_width = min(float(max_mask_width), float(current_mask_width) * float(mask_growth))
+            else:
+                current_mask_width = max(float(min_mask_width), float(current_mask_width) * float(mask_shrink))
         except Exception:
             # If STFT fails, stop peeling (but keep what we extracted)
             break
