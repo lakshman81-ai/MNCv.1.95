@@ -9,6 +9,10 @@ from typing import List, Dict, Tuple, Any, Optional
 import numpy as np
 import warnings
 import importlib.util
+try:
+    from scipy.optimize import linear_sum_assignment
+except Exception:  # pragma: no cover - optional dependency
+    linear_sum_assignment = None
 
 from .models import StageAOutput, FramePitch, AnalysisData, AudioType, StageBOutput, Stem
 from .config import PipelineConfig
@@ -24,7 +28,8 @@ from .detectors import (
 __all__ = [
     "extract_features",
     "create_harmonic_mask",
-    "iterative_spectral_subtraction"
+    "iterative_spectral_subtraction",
+    "MultiVoiceTracker",
 ]
 
 SCIPY_SIGNAL = None
@@ -498,6 +503,108 @@ def _resolve_polyphony_filter(config: Optional[PipelineConfig]) -> str:
         return "skyline_top_voice"
 
 
+class MultiVoiceTracker:
+    """
+    Lightweight multi-voice tracker to keep skyline assignments stable.
+
+    Tracks up to `max_tracks` concurrent voices using a Hungarian assignment on
+    pitch proximity with hangover/hysteresis to avoid rapid swapping.
+    """
+
+    def __init__(
+        self,
+        max_tracks: int,
+        max_jump_cents: float = 150.0,
+        hangover_frames: int = 2,
+        smoothing: float = 0.35,
+        confidence_bias: float = 5.0,
+    ) -> None:
+        self.max_tracks = max_tracks
+        self.max_jump_cents = float(max_jump_cents)
+        self.hangover_frames = int(max(0, hangover_frames))
+        self.smoothing = float(np.clip(smoothing, 0.0, 1.0))
+        self.confidence_bias = float(confidence_bias)
+        self.prev_pitches = np.zeros(max_tracks, dtype=np.float32)
+        self.prev_confs = np.zeros(max_tracks, dtype=np.float32)
+        self.hold = np.zeros(max_tracks, dtype=np.int32)
+
+    def _pitch_cost(self, prev: float, candidate: float) -> float:
+        if prev <= 0.0 or candidate <= 0.0:
+            return 0.0
+        cents = abs(1200.0 * np.log2((candidate + 1e-6) / (prev + 1e-6)))
+        penalty = self.max_jump_cents if cents > self.max_jump_cents else 0.0
+        return cents + penalty
+
+    def _assign(self, pitches: np.ndarray, confs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Fallback to greedy ordering when Hungarian solver missing
+        if linear_sum_assignment is None or pitches.size == 0:
+            ordered = sorted(zip(pitches, confs), key=lambda x: (-x[1], x[0]))
+            ordered = ordered[: self.max_tracks]
+            new_pitches = np.zeros_like(self.prev_pitches)
+            new_confs = np.zeros_like(self.prev_confs)
+            for idx, (p, c) in enumerate(ordered):
+                new_pitches[idx] = p
+                new_confs[idx] = c
+            return new_pitches, new_confs
+
+        cost = np.zeros((self.max_tracks, pitches.size), dtype=np.float32)
+        for i in range(self.max_tracks):
+            for j in range(pitches.size):
+                pitch_cost = self._pitch_cost(float(self.prev_pitches[i]), float(pitches[j]))
+                cost[i, j] = pitch_cost - float(confs[j]) * self.confidence_bias
+
+        row_idx, col_idx = linear_sum_assignment(cost)
+        new_pitches = np.zeros_like(self.prev_pitches)
+        new_confs = np.zeros_like(self.prev_confs)
+        for r, c in zip(row_idx, col_idx):
+            new_pitches[r] = pitches[c]
+            new_confs[r] = confs[c]
+        return new_pitches, new_confs
+
+    def step(self, candidates: List[Tuple[float, float]]) -> Tuple[np.ndarray, np.ndarray]:
+        if not candidates:
+            # Apply hangover to keep tracks alive briefly
+            carry_pitches = np.where(self.hold > 0, self.prev_pitches, 0.0)
+            carry_confs = np.where(self.hold > 0, self.prev_confs * 0.9, 0.0)
+            self.hold = np.maximum(self.hold - 1, 0)
+            self.prev_pitches = carry_pitches.astype(np.float32)
+            self.prev_confs = carry_confs.astype(np.float32)
+            return self.prev_pitches.copy(), self.prev_confs.copy()
+
+        # Keep only the strongest candidates up to track count
+        ordered = sorted(candidates, key=lambda x: (-x[1], x[0]))[: self.max_tracks]
+        pitches = np.array([c[0] for c in ordered], dtype=np.float32)
+        confs = np.array([c[1] for c in ordered], dtype=np.float32)
+
+        assigned_pitches, assigned_confs = self._assign(pitches, confs)
+
+        updated_pitches = np.zeros_like(self.prev_pitches)
+        updated_confs = np.zeros_like(self.prev_confs)
+        for idx in range(self.max_tracks):
+            if assigned_pitches[idx] > 0.0:
+                if self.prev_pitches[idx] > 0.0:
+                    smoothed = (
+                        self.smoothing * float(self.prev_pitches[idx])
+                        + (1.0 - self.smoothing) * float(assigned_pitches[idx])
+                    )
+                else:
+                    smoothed = float(assigned_pitches[idx])
+                updated_pitches[idx] = smoothed
+                updated_confs[idx] = assigned_confs[idx]
+                self.hold[idx] = self.hangover_frames
+            elif self.hold[idx] > 0:
+                updated_pitches[idx] = self.prev_pitches[idx]
+                updated_confs[idx] = self.prev_confs[idx] * 0.85
+                self.hold[idx] -= 1
+            else:
+                updated_pitches[idx] = 0.0
+                updated_confs[idx] = 0.0
+
+        self.prev_pitches = updated_pitches
+        self.prev_confs = updated_confs
+        return updated_pitches.copy(), updated_confs.copy()
+
+
 def extract_features(
     stage_a_out: StageAOutput,
     config: Optional[PipelineConfig] = None,
@@ -540,6 +647,7 @@ def extract_features(
     # Polyphonic context detection
     polyphonic_context = _is_polyphonic(getattr(stage_a_out, "audio_type", None))
     skyline_mode = _resolve_polyphony_filter(config)
+    tracker_cfg = getattr(b_conf, "voice_tracking", {}) or {}
 
     # Optional harmonic masking to create synthetic melody/bass stems for synthetic material
     augmented_stems = dict(resolved_stems)
@@ -610,6 +718,19 @@ def extract_features(
                         validator_detector=validator,
                         max_polyphony=b_conf.polyphonic_peeling.get("max_layers", 4),
                         mask_width=b_conf.polyphonic_peeling.get("mask_width", 0.03),
+                        min_mask_width=b_conf.polyphonic_peeling.get("min_mask_width", 0.02),
+                        max_mask_width=b_conf.polyphonic_peeling.get("max_mask_width", 0.08),
+                        mask_growth=b_conf.polyphonic_peeling.get("mask_growth", 1.1),
+                        mask_shrink=b_conf.polyphonic_peeling.get("mask_shrink", 0.9),
+                        harmonic_snr_stop_db=b_conf.polyphonic_peeling.get("harmonic_snr_stop_db", 3.0),
+                        residual_rms_stop_ratio=b_conf.polyphonic_peeling.get("residual_rms_stop_ratio", 0.08),
+                        residual_flatness_stop=b_conf.polyphonic_peeling.get("residual_flatness_stop", 0.45),
+                        validator_cents_tolerance=b_conf.polyphonic_peeling.get("validator_cents_tolerance", b_conf.pitch_disagreement_cents),
+                        validator_agree_window=b_conf.polyphonic_peeling.get("validator_agree_window", 5),
+                        validator_disagree_decay=b_conf.polyphonic_peeling.get("validator_disagree_decay", 0.6),
+                        validator_min_agree_frames=b_conf.polyphonic_peeling.get("validator_min_agree_frames", 2),
+                        validator_min_disagree_frames=b_conf.polyphonic_peeling.get("validator_min_disagree_frames", 2),
+                        max_harmonics=b_conf.polyphonic_peeling.get("max_harmonics", 12),
                         audio_path=stage_a_out.meta.audio_path,
                     )
                     all_layers.extend([f0 for f0, _ in iss_layers])
@@ -644,10 +765,17 @@ def extract_features(
         padded_rms = _pad_to(rms_vals, max_frames)
 
         timeline: List[FramePitch] = []
-        main_track = np.zeros(max_frames, dtype=np.float32)
-        # Secondary voice tracks built from the remaining active pitches (by confidence)
-        max_alt_voices = 2
-        alt_tracks = [np.zeros(max_frames, dtype=np.float32) for _ in range(max_alt_voices)]
+        max_alt_voices = int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0)
+        tracker = MultiVoiceTracker(
+            max_tracks=1 + max_alt_voices,
+            max_jump_cents=tracker_cfg.get("max_jump_cents", 150.0),
+            hangover_frames=tracker_cfg.get("hangover_frames", 2),
+            smoothing=tracker_cfg.get("smoothing", 0.35),
+            confidence_bias=tracker_cfg.get("confidence_bias", 5.0),
+        )
+
+        track_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
+        track_conf_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
 
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
@@ -657,21 +785,23 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
-            chosen_pitch = 0.0
-            chosen_conf = 0.0
-            # Sort by confidence (desc), then by pitch to preserve high-confidence lower voices
-            active = sorted(candidates, key=lambda x: (x[1], x[0]), reverse=True)
+            tracked_pitches, tracked_confs = tracker.step(candidates)
+            for voice_idx in range(tracker.max_tracks):
+                track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
+                track_conf_buffers[voice_idx][i] = tracked_confs[voice_idx]
 
-            if active:
-                chosen_pitch, chosen_conf = active[0]
-                for voice_idx in range(1, min(len(active), max_alt_voices + 1)):
-                    alt_tracks[voice_idx - 1][i] = active[voice_idx][0]
-
-            main_track[i] = chosen_pitch
+            chosen_pitch = float(tracked_pitches[0]) if tracked_pitches.size else 0.0
+            chosen_conf = float(tracked_confs[0]) if tracked_confs.size else 0.0
 
             midi = None
             if chosen_pitch > 0.0:
                 midi = int(round(69.0 + 12.0 * np.log2(chosen_pitch / 440.0)))
+
+            active = [
+                (float(p), float(track_conf_buffers[idx][i]))
+                for idx, p in enumerate(tracked_pitches)
+                if p > 0.0
+            ]
 
             timeline.append(
                 FramePitch(
@@ -687,11 +817,12 @@ def extract_features(
         stem_timelines[stem_name] = timeline
 
         # Keep secondary voices as separate layers to aid downstream segmentation/rendering
-        for alt in alt_tracks:
+        for alt in track_buffers[1:]:
             if np.count_nonzero(alt) > 0:
                 all_layers.append(alt)
 
         # Set main f0 (prefer vocals, then mix)
+        main_track = track_buffers[0]
         if stem_name == "vocals":
             f0_main = main_track
         elif stem_name == "mix" and f0_main is None:
@@ -724,6 +855,10 @@ def extract_features(
             "max_layers": b_conf.polyphonic_peeling.get("max_layers", 0),
         },
         "skyline_mode": skyline_mode,
+        "voice_tracking": {
+            "max_alt_voices": int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0),
+            "max_jump_cents": tracker_cfg.get("max_jump_cents", 150.0),
+        },
     }
 
     return StageBOutput(
