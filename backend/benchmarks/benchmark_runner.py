@@ -105,6 +105,12 @@ def run_pipeline_on_audio(
 ) -> Dict[str, Any]:
     """Run full pipeline on raw audio array."""
 
+    # Synthetic benchmarks do not require source separation and the default Demucs
+    # model download can fail in offline environments. Disable separation here to
+    # keep the ladder runnable without external network access.
+    if config.stage_b.separation.get("enabled", False):
+        config.stage_b.separation["enabled"] = False
+
     # 1. Stage A (Manual construction since we have raw audio, but let's simulate Stage A output)
     # We can skip load_and_preprocess if we already have the array, but we should fill meta correctly.
     meta = MetaData(
