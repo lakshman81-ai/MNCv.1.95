@@ -20,7 +20,6 @@ _root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-# List of top‑level modules that correspond to pipeline stages and utilities
 # List of top‑level modules that correspond to pipeline stages and utilities.
 # We intentionally omit 'models' here because a local ``backend/pipeline/models.py``
 # file is provided.  Importing ``backend.pipeline.models`` should resolve to
@@ -58,6 +57,7 @@ try:
     from stage_b import extract_features  # type: ignore
     from stage_c import apply_theory  # type: ignore
     from stage_d import quantize_and_render  # type: ignore
+    from transcribe import transcribe  # type: ignore
 except Exception:
     # If these imports fail, the test suite will surface an error
     pass
@@ -68,4 +68,5 @@ __all__ = [
     'extract_features',
     'apply_theory',
     'quantize_and_render',
+    'transcribe',
 ]
