@@ -141,5 +141,6 @@
       }
     },
     "instrument_profiles": []
-  }
+  },
+  "detectors_ran": []
 }
