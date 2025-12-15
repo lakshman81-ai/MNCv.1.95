@@ -82,6 +82,8 @@ def main():
 
     logger.info(f"Detected tempo: {tempo} BPM")
 
+    beat_period_sec = 60.0 / tempo if tempo > 0 else 0.5
+
     # 4. Pitch Tracking (pyin)
     logger.info("Step 4: Pitch Tracking...")
     f0, voiced_flag, voiced_probs = librosa.pyin(
@@ -95,6 +97,31 @@ def main():
 
     times = librosa.times_like(f0, sr=sr, hop_length=params["hop_length"])
 
+    rms_energy = librosa.feature.rms(
+        y=y,
+        frame_length=params["frame_length"],
+        hop_length=params["hop_length"]
+    )[0]
+    mean_rms = float(np.mean(rms_energy)) if rms_energy.size else 0.0
+    voiced_confidence = float(np.nanmean(voiced_probs)) if voiced_probs is not None else 0.0
+
+    energy_factor = np.interp(mean_rms, [0.01, 0.1], [0.85, 1.15])
+    confidence_factor = np.interp(voiced_confidence, [0.3, 0.9], [0.9, 1.1])
+    adaptive_factor = (energy_factor + confidence_factor) / 2.0
+
+    params["min_note_duration_sec"] = max(0.03, beat_period_sec * 0.25 * adaptive_factor)
+    params["merge_gap_threshold_sec"] = beat_period_sec * 0.4 * (0.75 + (confidence_factor - 0.9))
+
+    logger.info(
+        "Adaptive timing: beat_period_sec=%.3fs, min_note_duration_sec=%.3fs, "
+        "merge_gap_threshold_sec=%.3fs (energy_factor=%.3f, voiced_confidence=%.3f)",
+        beat_period_sec,
+        params["min_note_duration_sec"],
+        params["merge_gap_threshold_sec"],
+        energy_factor,
+        voiced_confidence,
+    )
+
     # 7. Segment Notes (Simplified logic merging Steps 5-8)
     logger.info("Step 7: Segmenting Notes...")
 
@@ -103,6 +130,17 @@ def main():
 
     # Convert f0 sequence to MIDI sequence (handling None/unvoiced)
     midi_sequence = [freq_to_midi(f) if v else None for f, v in zip(f0, voiced_flag)]
+
+    midi_pitches = [m for m in midi_sequence if m is not None]
+    if midi_pitches:
+        median_pitch = float(np.median(midi_pitches))
+        lower_quartile = float(np.percentile(midi_pitches, 25))
+        upper_quartile = float(np.percentile(midi_pitches, 75))
+        params["split_midi_threshold"] = int(round((lower_quartile + median_pitch + upper_quartile) / 3.0))
+    logger.info(
+        "Adaptive staff split threshold set to MIDI %s based on pitch distribution",
+        params["split_midi_threshold"],
+    )
 
     note_events = []
 
@@ -247,8 +285,21 @@ def main():
         logger.warning(f"PNG generation failed (environment dependencies likely missing): {e}")
 
     # 16. Logging
+    log_payload = {
+        "parameters": {
+            "tempo_bpm": tempo,
+            "beat_period_sec": beat_period_sec,
+            "min_note_duration_sec": params["min_note_duration_sec"],
+            "merge_gap_threshold_sec": params["merge_gap_threshold_sec"],
+            "split_midi_threshold": params["split_midi_threshold"],
+            "mean_rms_energy": mean_rms,
+            "voiced_confidence": voiced_confidence,
+        },
+        "notes": log_entries,
+    }
+
     with open(args.output_log, 'w') as f:
-        json.dump(log_entries, f, indent=2)
+        json.dump(log_payload, f, indent=2)
     logger.info(f"Written log to {args.output_log}")
 
 if __name__ == "__main__":
