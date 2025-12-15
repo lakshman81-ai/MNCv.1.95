@@ -156,7 +156,12 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     from demucs.apply import apply_model
     import torch
 
-    model = get_model(model_name)
+    try:
+        model = get_model(model_name)
+    except Exception as exc:
+        warnings.warn(f"HTDemucs unavailable ({exc}); skipping neural separation.")
+        return None
+
     model_sr = getattr(model, "samplerate", sr)
 
     if model_sr != sr:
@@ -168,8 +173,12 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
         resampled = audio
 
     mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, None, :]
-    with torch.no_grad():
-        demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
+    try:
+        with torch.no_grad():
+            demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
+    except Exception as exc:
+        warnings.warn(f"HTDemucs inference failed ({exc}); skipping neural separation.")
+        return None
 
     sources = getattr(model, "sources", ["vocals", "drums", "bass", "other"])
     separated = {}
@@ -184,33 +193,48 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     return separated
 
 
-def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Dict[str, Any]:
-    if not b_conf.separation.get("enabled", True):
-        return stage_a_out.stems
+def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Resolve separation strategy and track which path actually executed.
+    Returns (stems, diagnostics).
+    """
+    diag = {
+        "requested": bool(b_conf.separation.get("enabled", True)),
+        "synthetic_requested": bool(b_conf.separation.get("synthetic_model", False)),
+        "mode": "disabled",
+        "synthetic_ran": False,
+        "htdemucs_ran": False,
+        "fallback": False,
+    }
+
+    if not diag["requested"]:
+        return stage_a_out.stems, diag
 
     if len(stage_a_out.stems) > 1 and any(k != "mix" for k in stage_a_out.stems.keys()):
-        return stage_a_out.stems
+        diag["mode"] = "preseparated"
+        return stage_a_out.stems, diag
 
     mix_stem = stage_a_out.stems.get("mix")
     if mix_stem is None:
-        return stage_a_out.stems
+        return stage_a_out.stems, diag
 
     sep_conf = b_conf.separation
-    synthetic_requested = sep_conf.get("synthetic_model", False)
     overlap = sep_conf.get("overlap", 0.25)
     shifts = sep_conf.get("shifts", 1)
 
-    if synthetic_requested:
+    if diag["synthetic_requested"]:
         synthetic = SyntheticMDXSeparator(sample_rate=mix_stem.sr, hop_length=stage_a_out.meta.hop_length)
         try:
             synthetic_stems = synthetic.separate(mix_stem.audio, mix_stem.sr)
             if synthetic_stems:
+                diag.update({"mode": "synthetic_mdx", "synthetic_ran": True})
                 return {
                     name: type(mix_stem)(audio=audio, sr=mix_stem.sr, type=name)
                     for name, audio in synthetic_stems.items()
-                } | {"mix": mix_stem}
+                } | {"mix": mix_stem}, diag
         except Exception as exc:
             warnings.warn(f"Synthetic separator failed; falling back to {sep_conf.get('model', 'htdemucs')}: {exc}")
+            diag["fallback"] = True
 
     separated = _run_htdemucs(
         mix_stem.audio,
@@ -221,12 +245,14 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Dict[str, Any]:
     )
 
     if separated:
+        diag.update({"mode": sep_conf.get("model", "htdemucs"), "htdemucs_ran": True})
         return {
             name: type(mix_stem)(audio=audio, sr=mix_stem.sr, type=name)
             for name, audio in separated.items()
-        } | {"mix": mix_stem}
+        } | {"mix": mix_stem}, diag
 
-    return stage_a_out.stems
+    diag["mode"] = "passthrough"
+    return stage_a_out.stems, diag
 
 def _arrays_to_timeline(
     f0: np.ndarray,
@@ -264,19 +290,22 @@ def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) ->
     if not conf.get("enabled", False):
         return None
 
+    # Remove control/meta keys we already pass positionally
+    kwargs = {k: v for k, v in conf.items() if k not in ("enabled", "hop_length")}
+
     try:
         if name == "swiftf0":
-            return SwiftF0Detector(sr, hop_length, **conf)
+            return SwiftF0Detector(sr, hop_length, **kwargs)
         elif name == "sacf":
-            return SACFDetector(sr, hop_length, **conf)
+            return SACFDetector(sr, hop_length, **kwargs)
         elif name == "yin":
-            return YinDetector(sr, hop_length, **conf)
+            return YinDetector(sr, hop_length, **kwargs)
         elif name == "cqt":
-            return CQTDetector(sr, hop_length, **conf)
+            return CQTDetector(sr, hop_length, **kwargs)
         elif name == "rmvpe":
-            return RMVPEDetector(sr, hop_length, **conf)
+            return RMVPEDetector(sr, hop_length, **kwargs)
         elif name == "crepe":
-            return CREPEDetector(sr, hop_length, **conf)
+            return CREPEDetector(sr, hop_length, **kwargs)
     except Exception as e:
         warnings.warn(f"Failed to init detector {name}: {e}")
         return None
@@ -488,7 +517,7 @@ def extract_features(
 
     # Separation routing happens before harmonic masking/ISS so downstream
     # detectors always see the requested stem layout.
-    resolved_stems = _resolve_separation(stage_a_out, b_conf)
+    resolved_stems, separation_diag = _resolve_separation(stage_a_out, b_conf)
 
     # 1. Initialize Detectors based on Config
     detectors: Dict[str, BasePitchDetector] = {}
@@ -506,13 +535,15 @@ def extract_features(
     per_detector: Dict[str, Any] = {}
     f0_main: Optional[np.ndarray] = None
     all_layers: List[np.ndarray] = []
+    iss_total_layers = 0
 
     # Polyphonic context detection
     polyphonic_context = _is_polyphonic(getattr(stage_a_out, "audio_type", None))
     skyline_mode = _resolve_polyphony_filter(config)
 
     # Optional harmonic masking to create synthetic melody/bass stems for synthetic material
-    augmented_stems = dict(stage_a_out.stems)
+    augmented_stems = dict(resolved_stems)
+    harmonic_mask_applied = False
     harmonic_cfg = b_conf.separation.get("harmonic_masking", {}) if hasattr(b_conf, "separation") else {}
     if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems:
         prior_det = detectors.get("swiftf0")
@@ -532,6 +563,7 @@ def extract_features(
                 audio_path=stage_a_out.meta.audio_path,
             )
             augmented_stems.update(synthetic)
+            harmonic_mask_applied = bool(synthetic)
 
     stems_for_processing = augmented_stems
     polyphonic_context = polyphonic_context or len(stems_for_processing) > 1 or b_conf.polyphonic_peeling.get("force_on_mix", False)
@@ -581,6 +613,7 @@ def extract_features(
                         audio_path=stage_a_out.meta.audio_path,
                     )
                     all_layers.extend([f0 for f0, _ in iss_layers])
+                    iss_total_layers += len(iss_layers)
                 except Exception as e:
                     warnings.warn(f"ISS peeling failed for stem {stem_name}: {e}")
 
@@ -597,6 +630,8 @@ def extract_features(
 
         # Build timeline with optional skyline selection from poly layers
         voicing_thr = float(b_conf.confidence_voicing_threshold)
+        if polyphonic_context:
+            voicing_thr = max(0.0, voicing_thr - float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0)))
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
 
@@ -610,6 +645,9 @@ def extract_features(
 
         timeline: List[FramePitch] = []
         main_track = np.zeros(max_frames, dtype=np.float32)
+        # Secondary voice tracks built from the remaining active pitches (by confidence)
+        max_alt_voices = 2
+        alt_tracks = [np.zeros(max_frames, dtype=np.float32) for _ in range(max_alt_voices)]
 
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
@@ -621,14 +659,13 @@ def extract_features(
 
             chosen_pitch = 0.0
             chosen_conf = 0.0
-            active = sorted(candidates, key=lambda x: x[0], reverse=True)
+            # Sort by confidence (desc), then by pitch to preserve high-confidence lower voices
+            active = sorted(candidates, key=lambda x: (x[1], x[0]), reverse=True)
 
             if active:
-                if skyline_mode == "skyline_top_voice":
-                    chosen_pitch, chosen_conf = active[0]
-                else:
-                    # default to highest confidence
-                    chosen_pitch, chosen_conf = max(active, key=lambda x: x[1])
+                chosen_pitch, chosen_conf = active[0]
+                for voice_idx in range(1, min(len(active), max_alt_voices + 1)):
+                    alt_tracks[voice_idx - 1][i] = active[voice_idx][0]
 
             main_track[i] = chosen_pitch
 
@@ -649,6 +686,11 @@ def extract_features(
 
         stem_timelines[stem_name] = timeline
 
+        # Keep secondary voices as separate layers to aid downstream segmentation/rendering
+        for alt in alt_tracks:
+            if np.count_nonzero(alt) > 0:
+                all_layers.append(alt)
+
         # Set main f0 (prefer vocals, then mix)
         if stem_name == "vocals":
             f0_main = main_track
@@ -666,11 +708,30 @@ def extract_features(
     if len(f0_main) > 0:
         time_grid = np.arange(len(f0_main)) * hop_length / sr
 
+    diagnostics = {
+        "polyphonic_context": bool(polyphonic_context),
+        "detectors_initialized": list(detectors.keys()),
+        "separation": separation_diag,
+        "harmonic_masking": {
+            "enabled": harmonic_cfg.get("enabled", False),
+            "applied": harmonic_mask_applied,
+            "mask_width": harmonic_cfg.get("mask_width"),
+            "n_harmonics": harmonic_cfg.get("n_harmonics"),
+        },
+        "iss": {
+            "enabled": polyphonic_context and b_conf.polyphonic_peeling.get("max_layers", 0) > 0,
+            "layers_found": iss_total_layers,
+            "max_layers": b_conf.polyphonic_peeling.get("max_layers", 0),
+        },
+        "skyline_mode": skyline_mode,
+    }
+
     return StageBOutput(
         time_grid=time_grid,
         f0_main=f0_main,
         f0_layers=all_layers,
         per_detector=per_detector,
         stem_timelines=stem_timelines,
-        meta=stage_a_out.meta
+        meta=stage_a_out.meta,
+        diagnostics=diagnostics,
     )

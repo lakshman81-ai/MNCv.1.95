@@ -38,15 +38,17 @@
       "separation": {
         "enabled": false,
         "model": "htdemucs",
+        "synthetic_model": false,
         "overlap": 0.25,
         "shifts": 1,
         "harmonic_masking": {
-          "enabled": false,
-          "mask_width": 0.025,
-          "n_harmonics": 8
+          "enabled": true,
+          "mask_width": 0.02,
+          "n_harmonics": 12
         }
       },
-      "confidence_voicing_threshold": 0.65,
+      "confidence_voicing_threshold": 0.58,
+      "polyphonic_voicing_relaxation": 0.07,
       "confidence_priority_floor": 0.5,
       "pitch_disagreement_cents": 45.0,
       "ensemble_weights": {
@@ -101,7 +103,7 @@
         ]
       },
       "min_note_duration_ms": 30.0,
-      "min_note_duration_ms_poly": 60.0,
+      "min_note_duration_ms_poly": 55.0,
       "frame_stability": {
         "stable_frames_required": 2
       },
@@ -110,8 +112,8 @@
         "max_gap_ms": 100.0
       },
       "polyphonic_confidence": {
-        "melody": 0.2,
-        "accompaniment": 0.45
+        "melody": 0.35,
+        "accompaniment": 0.48
       },
       "velocity_map": {
         "min_db": -15.0,
@@ -141,6 +143,5 @@
       }
     },
     "instrument_profiles": []
-  },
-  "detectors_ran": []
+  }
 }

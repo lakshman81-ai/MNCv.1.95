@@ -38,6 +38,7 @@
       "separation": {
         "enabled": false,
         "model": "htdemucs",
+        "synthetic_model": false,
         "overlap": 0.25,
         "shifts": 1,
         "harmonic_masking": {
@@ -101,7 +102,7 @@
         ]
       },
       "min_note_duration_ms": 30.0,
-      "min_note_duration_ms_poly": 60.0,
+      "min_note_duration_ms_poly": 90.0,
       "frame_stability": {
         "stable_frames_required": 2
       },
@@ -110,8 +111,8 @@
         "max_gap_ms": 100.0
       },
       "polyphonic_confidence": {
-        "melody": 0.2,
-        "accompaniment": 0.45
+        "melody": 0.35,
+        "accompaniment": 0.6
       },
       "velocity_map": {
         "min_db": -15.0,
@@ -141,6 +142,5 @@
       }
     },
     "instrument_profiles": []
-  },
-  "detectors_ran": []
+  }
 }

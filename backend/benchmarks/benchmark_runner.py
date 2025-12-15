@@ -5,10 +5,10 @@ This module implements the full benchmark ladder:
 - L0: Mono Sanity (Synthetic Sine/Vibrato)
 - L1: Mono Musical (Synthetic MIDI)
 - L2: Poly Dominant (Synthetic Mix)
-- L3: Full Poly (Placeholder)
+- L3: Full Poly (MusicXML-backed synthetic score)
 - L4: Real Songs (via run_real_songs)
 
-It validates algorithm selection (Stage B) and saves artifacts/metrics.
+It validates algorithm selection (Stage B), records polyphonic diagnostics, and saves artifacts/metrics.
 """
 
 from __future__ import annotations
@@ -70,13 +70,43 @@ def synthesize_audio(notes: List[Tuple[int, float]], sr: int = 44100, waveform: 
         signal = np.concatenate((signal, wave))
     return signal
 
+
+def _load_musicxml_notes(xml_path: str) -> List[Tuple[int, float, float]]:
+    """Parse a MusicXML into note tuples (midi, start_sec, end_sec)."""
+    score = music21.converter.parse(xml_path)
+    bpm = 120.0
+    mm = score.flat.getElementsByClass('MetronomeMark')
+    if mm:
+        bpm = mm[0].number
+
+    sec_per_beat = 60.0 / bpm
+    gt: List[Tuple[int, float, float]] = []
+    for n in score.flat.notes:
+        if n.isRest:
+            continue
+        start_sec = float(n.offset * sec_per_beat)
+        end_sec = float((n.offset + n.quarterLength) * sec_per_beat)
+        if hasattr(n, "pitches"):
+            for p in n.pitches:
+                gt.append((int(p.midi), start_sec, end_sec))
+        else:
+            gt.append((int(n.pitch.midi), start_sec, end_sec))
+    return gt
+
 def run_pipeline_on_audio(
     audio: np.ndarray,
     sr: int,
     config: PipelineConfig,
-    audio_type: AudioType = AudioType.MONOPHONIC
+    audio_type: AudioType = AudioType.MONOPHONIC,
+    audio_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run full pipeline on raw audio array."""
+
+    # Synthetic benchmarks do not require source separation and the default Demucs
+    # model download can fail in offline environments. Disable separation here to
+    # keep the ladder runnable without external network access.
+    if config.stage_b.separation.get("enabled", False):
+        config.stage_b.separation["enabled"] = False
 
     # 1. Stage A (Manual construction since we have raw audio, but let's simulate Stage A output)
     # We can skip load_and_preprocess if we already have the array, but we should fill meta correctly.
@@ -86,6 +116,7 @@ def run_pipeline_on_audio(
         duration_sec=float(len(audio)) / sr,
         processing_mode=audio_type.value,
         audio_type=audio_type,
+        audio_path=audio_path,
         hop_length=config.stage_b.detectors.get('yin', {}).get('hop_length', 512),
         window_size=config.stage_b.detectors.get('yin', {}).get('n_fft', 2048),
         # Assuming normalized already for synthetic
@@ -127,6 +158,38 @@ class BenchmarkSuite:
         self.results = []
         os.makedirs(output_dir, exist_ok=True)
 
+    def _poly_config(self, use_harmonic_masking: bool = False) -> PipelineConfig:
+        config = PipelineConfig()
+        config.stage_b.separation["enabled"] = True
+        config.stage_b.separation["synthetic_model"] = False
+        config.stage_b.separation["harmonic_masking"]["enabled"] = use_harmonic_masking
+        config.stage_b.polyphonic_peeling["force_on_mix"] = True
+        return config
+
+    def _enable_high_capacity_frontend(self, config: PipelineConfig) -> None:
+        config.stage_b.detectors["crepe"]["enabled"] = True
+        config.stage_b.detectors["crepe"]["model_capacity"] = "full"
+        config.stage_b.detectors["rmvpe"]["enabled"] = True
+        config.stage_b.detectors["rmvpe"]["fmax"] = 2000.0
+
+    def _compute_diff(self, previous: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prev_map = {(r.get("level"), r.get("name")): r for r in previous}
+        diff: List[Dict[str, Any]] = []
+        for r in current:
+            key = (r.get("level"), r.get("name"))
+            prev = prev_map.get(key)
+            if not prev:
+                continue
+            diff.append({
+                "level": r.get("level"),
+                "name": r.get("name"),
+                "delta_note_f1": r.get("note_f1") - prev.get("note_f1", 0.0),
+                "delta_onset_mae_ms": (r.get("onset_mae_ms") or 0.0) - (prev.get("onset_mae_ms") or 0.0),
+                "previous": prev,
+                "current": r,
+            })
+        return diff
+
     def _save_run(self, level: str, name: str, res: Dict[str, Any], gt: List[Tuple[int, float, float]]):
         """Save artifacts for a single run."""
         pred_notes = res['notes']
@@ -167,8 +230,10 @@ class BenchmarkSuite:
         # Log resolved config
         # We also want to see what detectors ran
         detectors_ran = list(res['stage_b_out'].per_detector.get('mix', {}).keys())
+        diagnostics = getattr(res.get("stage_b_out"), "diagnostics", {}) if res.get("stage_b_out") else {}
         run_info = {
             "detectors_ran": detectors_ran,
+            "diagnostics": diagnostics,
             "config": asdict(res['resolved_config'])
         }
         with open(f"{base_path}_run_info.json", "w") as f:
@@ -271,7 +336,7 @@ class BenchmarkSuite:
 
         res = run_pipeline_on_audio(mix, sr, config, AudioType.POLYPHONIC_DOMINANT)
 
-        m = self._save_run("L2", "melody_plus_bass", res, gt_melody)
+        m = self._save_run("L2", "melody_plus_bass_synthetic_sep", res, gt_melody)
 
         # We expect it to find the melody (highest energy/frequency?)
         # Standard YIN might track bass or jump. RMVPE/Swift should track melody.
@@ -285,6 +350,13 @@ class BenchmarkSuite:
             raise RuntimeError("L2 Failed: insufficient detector coverage on poly mix")
 
         logger.info(f"L2 Complete. F1: {m['note_f1']}")
+
+        # High-capacity frontend experiment (CREPE + RMVPE)
+        exp_config = self._poly_config(use_harmonic_masking=True)
+        self._enable_high_capacity_frontend(exp_config)
+        exp_res = run_pipeline_on_audio(mix, sr, exp_config, AudioType.POLYPHONIC_DOMINANT)
+        m_exp = self._save_run("L2", "melody_plus_bass_crepe_rmvpe", exp_res, gt_melody)
+        logger.info(f"L2 CREPE/RMVPE Complete. F1: {m_exp['note_f1']}")
 
     def run_L3_full_poly(self):
         logger.info("Running L3: Full Poly")
@@ -383,6 +455,8 @@ class BenchmarkSuite:
     def generate_summary(self):
         summary_path = os.path.join(self.output_dir, "summary.csv")
         leaderboard_path = os.path.join(self.output_dir, "leaderboard.json")
+        snapshot_path = os.path.join(self.output_dir, "summary.json")
+        latest_path = os.path.join("results", "benchmark_latest.json")
 
         # CSV
         header = ["level", "name", "note_f1", "onset_mae_ms", "predicted_count", "gt_count"]
@@ -396,6 +470,26 @@ class BenchmarkSuite:
         lb = {r['name']: r['note_f1'] for r in self.results}
         with open(leaderboard_path, "w") as f:
             json.dump(lb, f, indent=2)
+
+        with open(snapshot_path, "w") as f:
+            json.dump(self.results, f, indent=2)
+
+        # Diff against previous run
+        os.makedirs(os.path.dirname(latest_path), exist_ok=True)
+        previous: List[Dict[str, Any]] = []
+        if os.path.exists(latest_path):
+            try:
+                with open(latest_path) as f:
+                    previous = json.load(f)
+            except Exception:
+                previous = []
+
+        diff = self._compute_diff(previous, self.results)
+        with open(os.path.join(self.output_dir, "summary_diff.json"), "w") as f:
+            json.dump(diff, f, indent=2)
+
+        with open(latest_path, "w") as f:
+            json.dump(self.results, f, indent=2)
 
         logger.info(f"Summary saved to {summary_path}")
 
