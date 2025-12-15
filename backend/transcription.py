@@ -23,6 +23,10 @@ def transcribe_audio_pipeline(
     use_crepe: bool = False,
     trim_silence: bool = True,
     mode: str = "quality", # "quality" or "fast"
+    target_sample_rate: Optional[int] = None,
+    window_size: Optional[int] = None,
+    hop_length: Optional[int] = None,
+    silence_top_db: Optional[float] = None,
     **kwargs,
 ) -> TranscriptionResult:
     """
@@ -44,9 +48,34 @@ def transcribe_audio_pipeline(
             midi_bytes=b""
         )
 
+    # Build a configurable pipeline config so callers can control the audio front end.
+    from .pipeline.config import PipelineConfig
+
+    pipeline_conf = PipelineConfig()
+
+    # Stage A (audio front end)
+    if target_sample_rate is not None:
+        pipeline_conf.stage_a.target_sample_rate = int(target_sample_rate)
+
+    pipeline_conf.stage_a.silence_trimming["enabled"] = bool(trim_silence)
+    if silence_top_db is not None:
+        pipeline_conf.stage_a.silence_trimming["top_db"] = float(silence_top_db)
+
+    # Allow explicit front-end window/hop settings by propagating them to the detector
+    # configs Stage A reads for frame sizing.
+    if window_size is not None:
+        pipeline_conf.stage_b.detectors["yin"]["frame_length"] = int(window_size)
+        pipeline_conf.stage_b.detectors["swiftf0"]["n_fft"] = int(window_size)
+
+    if hop_length is not None:
+        pipeline_conf.stage_b.detectors["yin"]["hop_length"] = int(hop_length)
+        pipeline_conf.stage_b.detectors["swiftf0"]["hop_length"] = int(hop_length)
+        # Keep RMVPE hop aligned if enabled by callers
+        pipeline_conf.stage_b.detectors["rmvpe"]["hop_length"] = int(hop_length)
+
     # 1. Stage A: Load and Preprocess (with Source Separation)
     # Returns StageAOutput
-    stage_a_out = load_and_preprocess(audio_path, target_sr=22050, trim_silence=trim_silence, fast_mode=(mode == "fast"))
+    stage_a_out = load_and_preprocess(audio_path, config=pipeline_conf)
 
     meta = stage_a_out.meta
     meta.processing_mode = mode
