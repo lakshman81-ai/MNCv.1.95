@@ -130,7 +130,7 @@ def main():
                 # Pitch change -> End current, start new
                 duration = t - start_time
                 if duration >= params["min_note_duration_sec"]:
-                     note_events.append({
+                    note_events.append({
                         "start_sec": start_time,
                         "end_sec": t,
                         "midi": current_midi
@@ -140,7 +140,7 @@ def main():
 
     # Close last note if active
     if current_midi is not None:
-         note_events.append({
+        note_events.append({
             "start_sec": start_time,
             "end_sec": times[-1],
             "midi": current_midi
