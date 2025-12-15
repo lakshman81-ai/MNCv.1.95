@@ -15,7 +15,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Transcribe audio to music notation")
     parser.add_argument("--audio_path", required=True, help="Path to input audio file")
     parser.add_argument("--audio_start_offset_sec", type=float, default=10.0, help="Start offset in seconds")
-    parser.add_argument("--sample_rate", type=int, default=22050, help="Sample rate")
+    parser.add_argument(
+        "--sample_rate",
+        type=int,
+        default=44100,
+        choices=[16000, 44100, 48000],
+        help="Sample rate (supports 16k, 44.1k, or 48k)",
+    )
+    parser.add_argument(
+        "--hop_length",
+        type=int,
+        default=256,
+        help="Hop length for analysis (e.g., 256 or the hop size required by a neural model)",
+    )
     parser.add_argument("--output_musicxml", default="output.musicxml", help="Output MusicXML path")
     parser.add_argument("--output_midi", default="output.mid", help="Output MIDI path")
     parser.add_argument("--output_png", default="output.png", help="Output PNG path")
@@ -45,7 +57,7 @@ def main():
         "f0_fmin": librosa.note_to_hz('C2'),
         "f0_fmax": librosa.note_to_hz('C6'),
         "frame_length": 2048,
-        "hop_length": 512,
+        "hop_length": args.hop_length,
         "pitch_smoothing_ms": 75,
         "min_note_duration_sec": 0.06,
         "merge_gap_threshold_sec": 0.15,
@@ -63,7 +75,11 @@ def main():
     # 1. Load Audio
     logger.info("Step 1: Loading Audio...")
     try:
-        y, sr = librosa.load(args.audio_path, sr=args.sample_rate, offset=args.audio_start_offset_sec)
+        y, sr = librosa.load(
+            args.audio_path,
+            sr=args.sample_rate,
+            offset=args.audio_start_offset_sec,
+        )
     except Exception as e:
         logger.error(f"Failed to load audio: {e}")
         sys.exit(1)
