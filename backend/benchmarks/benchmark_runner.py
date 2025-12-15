@@ -20,8 +20,11 @@ import argparse
 import logging
 import numpy as np
 import warnings
+import tempfile
+import soundfile as sf
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import asdict
+from music21 import tempo, chord
 
 from backend.pipeline.config import PipelineConfig, InstrumentProfile
 from backend.pipeline.models import (
@@ -33,6 +36,8 @@ from backend.pipeline.stage_c import apply_theory, quantize_notes
 from backend.pipeline.stage_d import quantize_and_render
 from backend.benchmarks.metrics import note_f1, onset_offset_mae
 from backend.benchmarks.run_real_songs import run_song as run_real_song
+from backend.benchmarks.ladder.generators import generate_benchmark_example
+from backend.benchmarks.ladder.synth import midi_to_wav_synth
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -131,6 +136,12 @@ class BenchmarkSuite:
         f1 = note_f1(pred_list, gt, onset_tol=0.05)
         onset_mae, offset_mae = onset_offset_mae(pred_list, gt)
 
+        # Normalize NaNs for downstream checks/serialization
+        if np.isnan(f1):
+            f1 = 0.0
+        if onset_mae is not None and np.isnan(onset_mae):
+            onset_mae = None
+
         metrics = {
             "level": level,
             "name": name,
@@ -164,6 +175,26 @@ class BenchmarkSuite:
             json.dump(run_info, f, indent=2, default=str)
 
         return metrics
+
+    @staticmethod
+    def _score_to_gt(score) -> List[Tuple[int, float, float]]:
+        tempo_marks = score.flat.getElementsByClass(tempo.MetronomeMark)
+        bpm = float(tempo_marks[0].number) if tempo_marks else 100.0
+        sec_per_quarter = 60.0 / bpm if bpm else 0.6
+
+        gt: List[Tuple[int, float, float]] = []
+        for el in score.flat.notes:
+            start = float(el.offset) * sec_per_quarter
+            dur = float(el.quarterLength) * sec_per_quarter
+            end = start + dur
+
+            if isinstance(el, chord.Chord):
+                for p in el.pitches:
+                    gt.append((int(p.midi), start, end))
+            else:
+                gt.append((int(el.pitch.midi), start, end))
+
+        return gt
 
     def run_L0_mono_sanity(self):
         logger.info("Running L0: Mono Sanity")
@@ -234,6 +265,7 @@ class BenchmarkSuite:
         gt_melody = [(72, 0.0, 0.5), (76, 0.5, 1.0), (79, 1.0, 1.5)]
 
         config = PipelineConfig()
+        config.stage_b.separation['enabled'] = False
         # Enable separation if possible, or assume dominant melody extraction works
         # config.stage_b.separation['enabled'] = True
 
@@ -244,12 +276,71 @@ class BenchmarkSuite:
         # We expect it to find the melody (highest energy/frequency?)
         # Standard YIN might track bass or jump. RMVPE/Swift should track melody.
         # This is a harder test without separation.
+        detectors = res['stage_b_out'].per_detector.get('mix', {})
+        if m['note_f1'] < 0.25:
+            raise RuntimeError(f"L2 Failed: melody_plus_bass F1 {m['note_f1']} < 0.25")
+        if m['onset_mae_ms'] is None or m['onset_mae_ms'] > 250:
+            raise RuntimeError(f"L2 Failed: onset MAE {m['onset_mae_ms']}ms is too high")
+        if len(detectors) < 2:
+            raise RuntimeError("L2 Failed: insufficient detector coverage on poly mix")
+
         logger.info(f"L2 Complete. F1: {m['note_f1']}")
 
     def run_L3_full_poly(self):
-        # Placeholder
-        logger.info("L3: Full Poly - Placeholder")
-        pass
+        logger.info("Running L3: Full Poly")
+
+        # 1. Generate full-poly example and synthesize audio
+        score = generate_benchmark_example('old_macdonald_poly_full')
+        gt = self._score_to_gt(score)
+
+        sr = 22050
+        wav_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+            midi_to_wav_synth(score, wav_path, sr=sr)
+            audio, read_sr = sf.read(wav_path)
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+
+        # Trim to a shorter clip to keep CI/runtime reasonable while retaining polyphony
+        max_duration = 8.0
+        if len(audio) > int(max_duration * read_sr):
+            audio = audio[: int(max_duration * read_sr)]
+            gt = [
+                (m, s, min(e, max_duration))
+                for m, s, e in gt
+                if s < max_duration
+            ]
+
+        config = PipelineConfig()
+        config.stage_b.separation['enabled'] = False
+        config.stage_b.polyphonic_peeling["max_layers"] = 0
+        for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
+            if det in config.stage_b.detectors:
+                config.stage_b.detectors[det]["enabled"] = False
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+
+        m = self._save_run("L3", "old_macdonald_poly_full", res, gt)
+
+        detectors = res['stage_b_out'].per_detector.get('mix', {})
+        if m['note_f1'] < 0.2:
+            raise RuntimeError(f"L3 Failed: old_macdonald_poly_full F1 {m['note_f1']} < 0.2")
+        if m['onset_mae_ms'] is None or m['onset_mae_ms'] > 300:
+            raise RuntimeError(f"L3 Failed: onset MAE {m['onset_mae_ms']}ms is too high")
+        if len(detectors) < 2:
+            raise RuntimeError("L3 Failed: insufficient detector coverage on full-poly mix")
+        if m['predicted_count'] == 0:
+            raise RuntimeError("L3 Failed: no notes predicted for full-poly example")
+
+        logger.info(f"L3 Complete. F1: {m['note_f1']}")
 
     def run_L4_real_songs(self):
         logger.info("Running L4: Real Songs")
@@ -312,16 +403,27 @@ class BenchmarkSuite:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
+    parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4"], default="all",
+                        help="Run a specific benchmark level or all levels")
     args = parser.parse_args()
 
     runner = BenchmarkSuite(args.output)
 
+    level_order = ["L0", "L1", "L2", "L3", "L4"]
+    to_run = level_order if args.level == "all" else [args.level]
+
     try:
-        runner.run_L0_mono_sanity()
-        runner.run_L1_mono_musical()
-        runner.run_L2_poly_dominant()
-        runner.run_L3_full_poly()
-        runner.run_L4_real_songs()
+        for lvl in to_run:
+            if lvl == "L0":
+                runner.run_L0_mono_sanity()
+            elif lvl == "L1":
+                runner.run_L1_mono_musical()
+            elif lvl == "L2":
+                runner.run_L2_poly_dominant()
+            elif lvl == "L3":
+                runner.run_L3_full_poly()
+            elif lvl == "L4":
+                runner.run_L4_real_songs()
     except Exception as e:
         logger.error(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
