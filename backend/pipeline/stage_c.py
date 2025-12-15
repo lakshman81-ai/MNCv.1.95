@@ -209,6 +209,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     # Detect polyphonic context based on active pitch annotations
     poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
+    voice_timelines: List[List[FramePitch]] = [timeline]
     if poly_frames:
         conf_thr = poly_conf
         try:
@@ -217,49 +218,80 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         except Exception:
             pass
 
-    segs = _segment_monophonic(
-        timeline=timeline,
-        conf_thr=conf_thr,
-        min_note_dur_s=min_note_dur_s,
-        gap_tolerance_s=gap_tolerance_s,
-        semitone_stability=semitone_stability,
-        min_rms=min_rms
-    )
+        max_voices = max(1, int(_get(config, "stage_c.polyphonic_voice_count", 2)))
+        for voice_idx in range(1, max_voices):
+            alt_timeline: List[FramePitch] = []
+            for fp in timeline:
+                pitch = 0.0
+                conf = 0.0
+                if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > voice_idx:
+                    pitch, conf = fp.active_pitches[voice_idx]
+                midi = None
+                if pitch > 0.0:
+                    midi = int(round(69.0 + 12.0 * np.log2(pitch / 440.0)))
+                alt_timeline.append(
+                    FramePitch(
+                        time=fp.time,
+                        pitch_hz=pitch,
+                        confidence=conf,
+                        midi=midi,
+                        rms=fp.rms,
+                        active_pitches=fp.active_pitches,
+                    )
+                )
+            voice_timelines.append(alt_timeline)
 
     # hop estimate for end time
     dt = [timeline[i].time - timeline[i - 1].time for i in range(1, min(len(timeline), 50))]
     hop_s = float(np.median(dt)) if dt else 0.01
 
-    notes: List[NoteEvent] = []
-    for (s, e) in segs:
-        mids = [timeline[i].midi for i in range(s, e + 1) if timeline[i].midi is not None and timeline[i].midi > 0]
-        hzs = [timeline[i].pitch_hz for i in range(s, e + 1) if timeline[i].pitch_hz > 0]
-        confs = [timeline[i].confidence for i in range(s, e + 1)]
-        rmss = [timeline[i].rms for i in range(s, e + 1)]
-
-        if not mids:
-            continue
-
-        midi_note = int(round(float(np.median(mids))))
-        pitch_hz = float(np.median(hzs)) if hzs else 0.0
-        confidence = float(np.mean(confs)) if confs else 0.0
-        velocity = _velocity_from_rms(rmss)
-
-        start_sec = float(timeline[s].time)
-        end_sec = float(timeline[e].time + hop_s)
-        if end_sec <= start_sec:
-            end_sec = start_sec + hop_s
-
-        notes.append(
-            NoteEvent(
-                start_sec=start_sec,
-                end_sec=end_sec,
-                midi_note=midi_note,
-                pitch_hz=pitch_hz,
-                confidence=confidence,
-                velocity=velocity,
-            )
+    def _extract_notes_from_timeline(active_timeline: List[FramePitch], conf_gate: float) -> List[NoteEvent]:
+        segs = _segment_monophonic(
+            timeline=active_timeline,
+            conf_thr=conf_gate,
+            min_note_dur_s=min_note_dur_s,
+            gap_tolerance_s=gap_tolerance_s,
+            semitone_stability=semitone_stability,
+            min_rms=min_rms
         )
+
+        collected: List[NoteEvent] = []
+        for (s, e) in segs:
+            mids = [active_timeline[i].midi for i in range(s, e + 1) if active_timeline[i].midi is not None and active_timeline[i].midi > 0]
+            hzs = [active_timeline[i].pitch_hz for i in range(s, e + 1) if active_timeline[i].pitch_hz > 0]
+            confs = [active_timeline[i].confidence for i in range(s, e + 1)]
+            rmss = [active_timeline[i].rms for i in range(s, e + 1)]
+
+            if not mids:
+                continue
+
+            midi_note = int(round(float(np.median(mids))))
+            pitch_hz = float(np.median(hzs)) if hzs else 0.0
+            confidence_val = float(np.mean(confs)) if confs else conf_gate
+            velocity = _velocity_from_rms(rmss)
+
+            start_sec = float(active_timeline[s].time)
+            end_sec = float(active_timeline[e].time + hop_s)
+            if end_sec <= start_sec:
+                end_sec = start_sec + hop_s
+
+            collected.append(
+                NoteEvent(
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    midi_note=midi_note,
+                    pitch_hz=pitch_hz,
+                    confidence=confidence_val,
+                    velocity=velocity,
+                )
+            )
+        return collected
+
+    notes: List[NoteEvent] = []
+    for vidx, vtimeline in enumerate(voice_timelines):
+        # Primary voice uses the base/poly melody gate; secondary voices use accompaniment gate
+        voice_conf_gate = conf_thr if vidx == 0 else float(_get(config, "stage_c.polyphonic_confidence.accompaniment", poly_conf))
+        notes.extend(_extract_notes_from_timeline(vtimeline, voice_conf_gate))
 
     analysis_data.notes = notes
     return notes
