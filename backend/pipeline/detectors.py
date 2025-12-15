@@ -38,6 +38,11 @@ def hz_to_midi(hz: float) -> float:
     return 69.0 + 12.0 * float(np.log2(hz / 440.0))
 
 
+def midi_to_hz(m: int) -> float:
+    """Convert MIDI pitch to frequency in Hz."""
+    return 440.0 * 2 ** ((float(m) - 69.0) / 12.0)
+
+
 def _safe_float(x: Any, default: float) -> float:
     try:
         return float(x)
@@ -473,6 +478,19 @@ class SACFDetector(BasePitchDetector):
         f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
         return f0, conf
 
+    def validate_curve(self, f0_curve: np.ndarray, audio: np.ndarray) -> float:
+        """Compare a proposed f0 curve against SACF's internal estimate."""
+        f0_curve = np.asarray(f0_curve, dtype=np.float32)
+        pred_f0, pred_conf = self.predict(audio)
+        n = min(len(f0_curve), len(pred_f0))
+        if n == 0:
+            return 0.0
+
+        agreement = np.abs(f0_curve[:n] - pred_f0[:n])
+        weights = np.where(pred_conf[:n] > 0.0, pred_conf[:n], 0.0)
+        score = float(np.mean(weights * (agreement < 5.0))) if np.sum(weights) > 0 else 0.0
+        return score
+
 
 class CQTDetector(BasePitchDetector):
     """
@@ -484,7 +502,13 @@ class CQTDetector(BasePitchDetector):
         self.bins_per_octave = _safe_int(kwargs.get("bins_per_octave", 36), 36)
         self.n_bins = _safe_int(kwargs.get("n_bins", 7 * self.bins_per_octave), 7 * self.bins_per_octave)
 
-    def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(
+        self,
+        audio: np.ndarray,
+        audio_path: Optional[str] = None,
+        polyphony: bool = False,
+        max_peaks: int = 5,
+    ) -> Tuple[Any, Any]:
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
         if y.size == 0:
             return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
@@ -509,9 +533,33 @@ class CQTDetector(BasePitchDetector):
             if M.size == 0:
                 return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
+            freqs = librosa.cqt_frequencies(
+                n_bins=int(self.n_bins), fmin=float(self.fmin), bins_per_octave=int(self.bins_per_octave)
+            )
+
+            if polyphony:
+                # Return top-N peaks per frame for integration tests that expect poly lists
+                pitches_list: List[List[float]] = []
+                confs_list: List[List[float]] = []
+                for frame_idx in range(M.shape[1]):
+                    ordered_bins = np.argsort(M[:, frame_idx])[::-1]
+                    frame_conf = []
+                    frame_pitch = []
+                    frame_mean = np.mean(M[:, frame_idx]) + 1e-9
+                    for b in ordered_bins:
+                        freq_val = float(freqs[b])
+                        if any(abs(freq_val - existing) < 5.0 for existing in frame_pitch):
+                            continue
+                        frame_pitch.append(freq_val)
+                        frame_conf.append(float(np.clip((M[b, frame_idx] / frame_mean - 1.0) / 4.0, 0.0, 1.0)))
+                        if len(frame_pitch) >= max_peaks:
+                            break
+                    pitches_list.append(frame_pitch)
+                    confs_list.append(frame_conf)
+                return pitches_list, confs_list
+
             # dominant bin per frame
             idx = np.argmax(M, axis=0)
-            freqs = librosa.cqt_frequencies(n_bins=int(self.n_bins), fmin=float(self.fmin), bins_per_octave=int(self.bins_per_octave))
             f0 = freqs[idx].astype(np.float32)
 
             # confidence from peak-to-mean ratio

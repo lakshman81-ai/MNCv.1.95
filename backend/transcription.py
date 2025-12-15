@@ -185,34 +185,42 @@ def transcribe_audio_pipeline(
     events_with_theory = apply_theory(notes, analysis_data)
 
     # 5. Stage D: Quantize and Render
+    midi_bytes = b""
     try:
-        musicxml_str = quantize_and_render(events_with_theory, analysis_data)
+        stage_d_result = quantize_and_render(events_with_theory, analysis_data)
+        if isinstance(stage_d_result, TranscriptionResult):
+            musicxml_str = stage_d_result.musicxml
+            midi_bytes = stage_d_result.midi_bytes or b""
+        else:
+            musicxml_str = stage_d_result
     except Exception as e:
         print(f"Stage D (Rendering) failed: {e}. Returning placeholder XML.")
         musicxml_str = "<?xml version='1.0' encoding='utf-8'?><score-partwise><part><measure><note><rest/></note></measure></part></score-partwise>"
 
-    # 6. Generate MIDI bytes
-    midi_bytes = b""
+    # 6. Generate MIDI bytes if not provided
     tmp_xml_path = None
     tmp_midi_path = None
 
     try:
         # Save XML to temp file to parse back for MIDI generation
         # (music21 allows parsing string, but temp file is safer for some backends)
-        with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False, mode='w', encoding='utf-8') as tmp_xml:
-            tmp_xml.write(musicxml_str)
-            tmp_xml_path = tmp_xml.name
+        if not midi_bytes:
+            with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False, mode='w', encoding='utf-8') as tmp_xml:
+                tmp_xml.write(musicxml_str)
+                tmp_xml_path = tmp_xml.name
 
         try:
-            s = music21.converter.parse(tmp_xml_path)
+            if tmp_xml_path:
+                s = music21.converter.parse(tmp_xml_path)
 
             with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp_midi:
                 tmp_midi_path = tmp_midi.name
 
-            s.write('midi', fp=tmp_midi_path)
+            if tmp_xml_path:
+                s.write('midi', fp=tmp_midi_path)
 
-            with open(tmp_midi_path, 'rb') as f:
-                midi_bytes = f.read()
+                with open(tmp_midi_path, 'rb') as f:
+                    midi_bytes = f.read()
 
         except Exception as e:
             print(f"MIDI generation failed: {e}")

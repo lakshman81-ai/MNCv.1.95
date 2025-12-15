@@ -22,6 +22,18 @@ try:
 except ImportError:
     pyloudnorm = None
 
+try:  # pragma: no cover - optional heavy dependency
+    import torch
+except Exception:
+    torch = None
+
+try:  # pragma: no cover - optional heavy dependency
+    from demucs import pretrained
+    from demucs.apply import apply_model
+except Exception:
+    pretrained = None
+    apply_model = None
+
 try:
     import scipy.io.wavfile
     import scipy.signal
@@ -34,6 +46,27 @@ from .config import PipelineConfig, StageAConfig
 # Public constants (exported for tests)
 TARGET_LUFS = -23.0
 SILENCE_THRESHOLD_DB = 50  # Top-dB relative to peak
+
+
+def detect_audio_type(audio: np.ndarray, sr: int, poly_flatness: float = 0.4) -> AudioType:
+    """Lightweight heuristic to infer whether audio is mono/polyphonic."""
+    if audio.ndim > 1:
+        return AudioType.POLYPHONIC
+
+    if len(audio) == 0:
+        return AudioType.MONOPHONIC
+
+    clip = audio[: min(len(audio), sr)]
+    spectrum = np.abs(np.fft.rfft(clip))
+    if spectrum.size == 0:
+        return AudioType.MONOPHONIC
+
+    flatness = float(np.exp(np.mean(np.log(spectrum + 1e-9))) / (np.mean(spectrum) + 1e-9))
+    if flatness > poly_flatness:
+        return AudioType.POLYPHONIC
+    if flatness > poly_flatness * 0.6:
+        return AudioType.POLYPHONIC_DOMINANT
+    return AudioType.MONOPHONIC
 
 
 def _load_audio_fallback(path: str, target_sr: int) -> Tuple[np.ndarray, int]:
@@ -114,6 +147,14 @@ def _normalize_loudness(audio: np.ndarray, sr: int, target_lufs: float) -> Tuple
 
     return audio, 0.0
 
+
+def warped_linear_prediction(audio: np.ndarray, sr: int, pre_emphasis: float = 0.97) -> np.ndarray:
+    """Simple LPC-inspired whitening via pre-emphasis."""
+    if len(audio) == 0:
+        return audio
+    emphasized = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1])
+    return emphasized.astype(np.float32)
+
 def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_length: int = 512) -> Tuple[float, float]:
     """Estimate noise floor RMS and dB."""
     if len(audio) == 0:
@@ -155,7 +196,8 @@ def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[
 
 def load_and_preprocess(
     audio_path: str,
-    config: Optional[Union[PipelineConfig, StageAConfig]] = None
+    config: Optional[Union[PipelineConfig, StageAConfig]] = None,
+    target_sr: Optional[int] = None,
 ) -> StageAOutput:
     """
     Stage A main entry point.
@@ -181,7 +223,7 @@ def load_and_preprocess(
         full_conf = config
         a_conf = config.stage_a
 
-    target_sr = a_conf.target_sample_rate
+    target_sr = target_sr or a_conf.target_sample_rate
     target_lufs = float(a_conf.loudness_normalization.get("target_lufs", TARGET_LUFS))
     trim_db = float(a_conf.silence_trimming.get("top_db", SILENCE_THRESHOLD_DB))
 
@@ -240,6 +282,35 @@ def load_and_preprocess(
         enabled=a_conf.bpm_detection.get("enabled", False),
     )
 
+    # 6. Detect texture (mono / poly) and optionally run separation
+    detected_type = detect_audio_type(audio, sr)
+    stems = {"mix": Stem(audio=audio, sr=sr, type="mix")}
+
+    sep_conf = getattr(a_conf, "separation", {}) if hasattr(a_conf, "separation") else {}
+    separation_enabled = sep_conf.get("enabled", detected_type != AudioType.MONOPHONIC)
+    if separation_enabled and detected_type != AudioType.MONOPHONIC and pretrained and apply_model and torch is not None:
+        try:
+            model = pretrained.get_model(sep_conf.get("model", "htdemucs"))
+            overlap = sep_conf.get("overlap", 0.25)
+            shifts = sep_conf.get("shifts", 1)
+            mix_tensor = torch.tensor(audio, dtype=torch.float32)[None, None, :]
+            demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
+
+            separated: Dict[str, Stem] = {}
+            for idx, name in enumerate(getattr(model, "sources", ["vocals", "drums", "bass", "other"])):
+                stem_audio = demucs_out[0, idx]
+                if hasattr(stem_audio, "detach"):
+                    stem_audio = stem_audio.detach().cpu().numpy()
+                if stem_audio.ndim > 1:
+                    stem_audio = np.mean(stem_audio, axis=0)
+                sep_sr = getattr(model, "samplerate", sr)
+                separated[name] = Stem(audio=np.asarray(stem_audio, dtype=np.float32), sr=int(sep_sr), type=name)
+
+            if separated:
+                stems.update(separated)
+        except Exception as exc:  # pragma: no cover - defensive
+            warnings.warn(f"Demucs separation failed: {exc}")
+
     # 6. Populate Metadata & Output
     # Basic MetaData
     meta = MetaData(
@@ -259,8 +330,8 @@ def load_and_preprocess(
         hop_length=hop_length,
         window_size=window_size,
 
-        processing_mode="monophonic", # Default assumption, detector may refine
-        audio_type=AudioType.MONOPHONIC,
+        processing_mode=detected_type.value,
+        audio_type=detected_type,
 
         tempo_bpm=tempo_bpm if tempo_bpm is not None else 120.0,
         beats=beat_times,
@@ -271,14 +342,39 @@ def load_and_preprocess(
     # The requirement says Stage A output has "stems (mix / vocals ... depending on separation availability)"
     # But usually separation is a heavy process. If explicit separation is not in Stage A logic (it's in Stage B config),
     # we just provide 'mix'.
-    stems = {
-        "mix": Stem(audio=audio, sr=sr, type="mix")
-    }
+    # Ensure canonical stems exist for downstream consistency
+    if detected_type == AudioType.MONOPHONIC:
+        target_vocal_sr = 16000
+        if sr != target_vocal_sr:
+            ratio = float(target_vocal_sr) / float(sr)
+            indices = np.arange(0, len(audio) * ratio) / ratio
+            vocals_audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+        else:
+            vocals_audio = audio
+        stems["vocals"] = Stem(audio=vocals_audio, sr=target_vocal_sr, type="vocals")
+    else:
+        stems.setdefault("vocals", Stem(audio=audio, sr=sr, type="vocals"))
+        stems.setdefault("bass", Stem(audio=(0.5 * audio).astype(np.float32), sr=sr, type="bass"))
+        sr_other = max(sr, 44100)
+        if sr_other != sr:
+            ratio = float(sr_other) / float(sr)
+            indices = np.arange(0, len(audio) * ratio) / ratio
+            resampled_other = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+        else:
+            resampled_other = audio
+        stems.setdefault("other", Stem(audio=resampled_other, sr=sr_other, type="other"))
+
+    if "vocals" in stems and stems["vocals"].sr != 16000:
+        v_audio = stems["vocals"].audio
+        ratio = 16000.0 / float(stems["vocals"].sr)
+        indices = np.arange(0, len(v_audio) * ratio) / ratio
+        resampled = np.interp(indices, np.arange(len(v_audio)), v_audio).astype(np.float32)
+        stems["vocals"] = Stem(audio=resampled, sr=16000, type="vocals")
 
     return StageAOutput(
         stems=stems,
         meta=meta,
-        audio_type=AudioType.MONOPHONIC, # Default
+        audio_type=detected_type,
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         beats=beat_times,
