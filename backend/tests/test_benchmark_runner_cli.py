@@ -36,3 +36,10 @@ def test_benchmark_runner_l3_cli(tmp_path: Path):
 
     leaderboard = json.loads(leaderboard_path.read_text())
     assert metrics.get("name") in leaderboard
+
+    run_info_files = list(output_dir.glob("L3_*_run_info.json"))
+    assert run_info_files, "Run info diagnostics missing"
+    run_info = json.loads(run_info_files[0].read_text())
+    assert run_info.get("stage_timings")
+    assert run_info.get("detector_confidences")
+    assert run_info.get("artifacts_present", {}).get("timeline") is True

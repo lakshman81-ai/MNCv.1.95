@@ -43,6 +43,54 @@ class TestStageB:
             stems=stems
         )
 
+    @pytest.mark.parametrize(
+        "sr,duration,harmonics",
+        [
+            (22050, 1.0, 0),
+            (44100, 0.75, 2),
+            (16000, 1.5, 4),
+        ],
+    )
+    def test_440hz_regression_with_confidences(self, sr, duration, harmonics):
+        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+        base = 0.6 * np.sin(2 * np.pi * 440.0 * t)
+        enriched = base + sum(
+            (0.2 / (i + 1)) * np.sin(2 * np.pi * 440.0 * (i + 2) * t)
+            for i in range(harmonics)
+        )
+
+        meta = MetaData(
+            duration_sec=duration,
+            sample_rate=sr,
+            hop_length=256,
+            window_size=2048,
+            audio_path="440hz_regression.wav",
+        )
+        stage_a_out = StageAOutput(
+            audio_type="monophonic",
+            meta=meta,
+            stems={"mix": Stem(audio=enriched.astype(np.float32), sr=sr, type="mix")},
+        )
+
+        config = PipelineConfig()
+        config.stage_b.separation["enabled"] = True
+        config.stage_b.separation["synthetic_model"] = True
+        config.stage_b.detectors["yin"]["enabled"] = True
+
+        stage_b_out = extract_features(stage_a_out, config=config)
+        mix_detectors = stage_b_out.per_detector.get("mix", {})
+
+        voiced_frames = stage_b_out.f0_main[stage_b_out.f0_main > 0]
+        assert voiced_frames.size > 10
+        assert np.isclose(np.median(voiced_frames), 440.0, atol=5.0)
+
+        confidence_peaks = [np.mean(conf) for _, conf in mix_detectors.values() if len(conf) > 0]
+        assert confidence_peaks and max(confidence_peaks) > 0.0
+
+        diag = stage_b_out.diagnostics
+        assert diag["separation"]["requested"] is True
+        assert diag["detectors_initialized"]
+
     def test_create_harmonic_mask(self, sr):
         # Create a dummy STFT (freqs x frames)
         n_fft = 2048

@@ -91,8 +91,9 @@ class TestIntegrationAudio:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("backend.pipeline.stage_b.SwiftF0Detector", CQTDetector)
-
-            timeline, _, _, stem_timelines = extract_features(stage_a_out)
+            stage_b_out = extract_features(stage_a_out)
+            timeline = stage_b_out.stem_timelines.get("vocals") or stage_b_out.stem_timelines.get("other") or []
+            stem_timelines = stage_b_out.stem_timelines
 
             # Check polyphonic section
             poly_start = tune_data["mono_end_time"]

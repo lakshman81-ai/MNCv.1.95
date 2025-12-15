@@ -10,6 +10,7 @@ def plan():
 
 def test_plan_has_all_sections(plan):
     expected_sections = {
+        "ladder",
         "end_to_end",
         "stage_a",
         "stage_b",
@@ -30,9 +31,9 @@ def test_end_to_end_expectations(plan):
         "percussive_passages",
         "noisy_inputs",
     }
-    assert set(end_to_end["outputs"]) == {"musicxml", "midi_bytes", "analysis_timelines"}
+    assert set(end_to_end["outputs"]).issuperset({"musicxml", "midi_bytes", "analysis_timelines"})
     assert "stage_A_to_D_flow" in end_to_end["goals"]
-    assert {"note_f1", "onset_offset_f1"}.issubset(set(end_to_end["acceptance_metrics"]))
+    assert {"note_f1", "onset_offset_f1", "latency_budget_ms"}.issubset(set(end_to_end["acceptance_metrics"]))
 
 
 def test_stage_specific_expectations(plan):
@@ -48,8 +49,19 @@ def test_stage_specific_expectations(plan):
 
 def test_regression_and_profiling_expectations(plan):
     assert plan["regression"]["alerts"] is True
-    assert {"accuracy_delta", "latency_budget"}.issubset(set(plan["regression"]["thresholds"]))
+    assert {"accuracy_delta", "latency_budget", "artifact_completeness"}.issubset(set(plan["regression"]["thresholds"]))
     assert plan["regression"]["stage_thresholds"]["end_to_end_note_f1_delta"] == 0.01
     assert "stage_timings" in plan["profiling"]["hooks"]
     assert plan["profiling"]["purpose"] == "contextualize_benchmark_results"
     assert "profiling_traces" in plan["profiling"]["artifacts"]
+
+
+def test_ladder_and_artifact_expectations(plan):
+    ladder = plan["ladder"]
+    assert ladder["levels"] == ["L0", "L1", "L2", "L3", "L4"]
+    assert set(ladder["metrics"]) == {"note_f1", "onset_mae_ms", "offset_mae_ms"}
+    assert {"metrics_json", "summary_csv"}.issubset(set(ladder["artifacts"]))
+
+    stage_d = plan["stage_d"]
+    assert "musicxml_schema_validation" in stage_d["render_checks"]
+    assert {"musicxml", "midi_bytes"}.issubset(set(stage_d["artifacts"]))
