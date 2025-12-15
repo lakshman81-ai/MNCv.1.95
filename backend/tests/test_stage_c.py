@@ -48,7 +48,7 @@ def test_stage_c_quantization():
 
     analysis = AnalysisData(meta=MetaData(tempo_bpm=120.0))
 
-    quantized = quantize_notes([n], analysis)
+    quantized = quantize_notes([n], analysis_data=analysis)
     q = quantized[0]
 
     # 1.0s is 8th 16th note (0.125 * 8 = 1.0)

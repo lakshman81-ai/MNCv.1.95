@@ -331,16 +331,17 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 )
             )
 
-    quantized_notes = quantize_notes(notes, tempo_bpm=analysis_data)
+    quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
     analysis_data.notes = quantized_notes
     return quantized_notes
 
 
 def quantize_notes(
     notes: List[NoteEvent],
-    tempo_bpm: float | AnalysisData = 120.0,
+    tempo_bpm: float = 120.0,
     grid: str = "1/16",
     min_steps: int = 1,
+    analysis_data: AnalysisData | None = None,
 ) -> List[NoteEvent]:
     """
     Quantize note start/end times to a rhythmic grid.
@@ -349,7 +350,10 @@ def quantize_notes(
     ----------
     notes : List[NoteEvent]
     tempo_bpm : float
-        Tempo used to convert beats to seconds.
+        Tempo used to convert beats to seconds when no analysis_data is provided.
+    analysis_data : AnalysisData, optional
+        Preferred source for tempo and time signature; if provided, meta fields
+        take precedence over the tempo_bpm argument.
     grid : str
         Grid like "1/16", "1/8", "1/4". Interpreted as fraction of a whole note.
         In 4/4: one beat = quarter note, so step_beats = 4/denom.
@@ -364,11 +368,14 @@ def quantize_notes(
     if not notes:
         return []
 
-    analysis: Optional[AnalysisData] = tempo_bpm if isinstance(tempo_bpm, AnalysisData) else None
+    analysis: Optional[AnalysisData] = analysis_data
 
-    bpm_source = tempo_bpm
+    bpm_source = None
     if analysis is not None:
         bpm_source = _get(analysis, "meta.tempo_bpm", None)
+
+    if bpm_source is None:
+        bpm_source = tempo_bpm
 
     bpm = float(bpm_source) if bpm_source and bpm_source > 0 else 120.0
     sec_per_beat = 60.0 / bpm

@@ -137,6 +137,22 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
     noise_db = 20.0 * math.log10(noise_rms + 1e-9)
     return noise_rms, noise_db
 
+
+def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[Optional[float], List[float]]:
+    """Run a lightweight tempo/beat estimator if enabled and librosa is available."""
+
+    if not enabled or librosa is None:
+        return None, []
+
+    try:
+        tempo_est, beat_frames = librosa.beat.beat_track(y=audio, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+        tempo_val = float(tempo_est) if tempo_est is not None else None
+        return tempo_val, beat_times
+    except Exception as exc:  # pragma: no cover - defensive
+        warnings.warn(f"Beat tracking failed: {exc}")
+        return None, []
+
 def load_and_preprocess(
     audio_path: str,
     config: Optional[Union[PipelineConfig, StageAConfig]] = None
@@ -155,7 +171,10 @@ def load_and_preprocess(
         full_conf = PipelineConfig()
         a_conf = full_conf.stage_a
     elif isinstance(config, StageAConfig):
-        full_conf = None
+        # Wrap StageAConfig in a PipelineConfig so Stage B defaults still
+        # influence hop/window selection for consistency across stages.
+        full_conf = PipelineConfig()
+        full_conf.stage_a = config
         a_conf = config
     else:
         # It's a PipelineConfig
@@ -214,7 +233,14 @@ def load_and_preprocess(
     # 4. Noise Floor
     nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
 
-    # 5. Populate Metadata & Output
+    # 5. Optional tempo / beat detection (lightweight, single pass)
+    tempo_bpm, beat_times = _detect_tempo_and_beats(
+        audio,
+        sr=target_sr,
+        enabled=a_conf.bpm_detection.get("enabled", False),
+    )
+
+    # 6. Populate Metadata & Output
     # Basic MetaData
     meta = MetaData(
         audio_path=audio_path,
@@ -234,7 +260,10 @@ def load_and_preprocess(
         window_size=window_size,
 
         processing_mode="monophonic", # Default assumption, detector may refine
-        audio_type=AudioType.MONOPHONIC
+        audio_type=AudioType.MONOPHONIC,
+
+        tempo_bpm=tempo_bpm if tempo_bpm is not None else 120.0,
+        beats=beat_times,
     )
 
     # Stems: for now just 'mix' since we don't do separation in Stage A
@@ -251,5 +280,6 @@ def load_and_preprocess(
         meta=meta,
         audio_type=AudioType.MONOPHONIC, # Default
         noise_floor_rms=nf_rms,
-        noise_floor_db=nf_db
+        noise_floor_db=nf_db,
+        beats=beat_times,
     )
