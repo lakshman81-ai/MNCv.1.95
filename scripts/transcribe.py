@@ -348,58 +348,122 @@ def main():
 
     logger.info(f"Detected tempo: {tempo} BPM")
 
-    # 4. Pitch Tracking (Neural CREPE/SPICE)
-    logger.info("Step 4: Neural Pitch Tracking...")
-    f0_estimator = NeuralF0Estimator(params)
-    times, f0 = f0_estimator.run(y, sr)
+    beat_period_sec = 60.0 / tempo if tempo > 0 else 0.5
 
-    # 5-7. Onsets & Frames style detection
-    logger.info("Step 5-7: Detecting onsets, offsets, and pitch activations...")
-    onset_detector = OnsetsFramesDetector(params)
-    onset_probs, offset_probs, pitch_activation = onset_detector.run(y, sr)
-
-    # Align activations to time grid
-    if pitch_activation.shape[1] != len(times):
-        logger.debug("Resampling pitch activation to match F0 timeline")
-        pitch_activation = librosa.util.fix_length(pitch_activation, size=len(times), axis=1)
-    if len(onset_probs) != len(times):
-        onset_probs = librosa.util.fix_length(onset_probs, size=len(times))
-    if len(offset_probs) != len(times):
-        offset_probs = librosa.util.fix_length(offset_probs, size=len(times))
-
-    # Convert activation frequencies to MIDI bins if frequency matrix provided
-    multi_pitch_midi = []
-    if pitch_activation.ndim == 2:
-        # Assume first dimension represents frequency bins spaced as chromatic steps starting at C1
-        base_freq = librosa.note_to_hz("C1")
-        bins_per_octave = 12
-        bin_freqs = [base_freq * (2 ** (i / bins_per_octave)) for i in range(pitch_activation.shape[0])]
-        for frame in range(pitch_activation.shape[1]):
-            active = []
-            for bin_idx, activation in enumerate(pitch_activation[:, frame]):
-                if activation >= params["pitch_activation_threshold"]:
-                    midi = freq_to_midi(bin_freqs[bin_idx])
-                    if midi is not None:
-                        active.append(midi)
-            multi_pitch_midi.append(active)
-    else:
-        multi_pitch_midi = [[] for _ in times]
-
-    # If no activation matrix exists, fall back to monophonic F0 track mapped to MIDI
-    if not any(multi_pitch_midi) and f0 is not None:
-        multi_pitch_midi = [[freq_to_midi(freq)] if freq is not None else [] for freq in f0]
-
-    # 8. Build note events from neural detections (polyphonic aware)
-    logger.info("Step 8: Building polyphonic note events...")
-    note_events = build_events_from_detections(
-        times,
-        multi_pitch_midi,
-        onset_probs,
-        offset_probs,
-        params,
+    # 4. Pitch Tracking (pyin)
+    logger.info("Step 4: Pitch Tracking...")
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=params["f0_fmin"],
+        fmax=params["f0_fmax"],
+        sr=sr,
+        frame_length=params["frame_length"],
+        hop_length=params["hop_length"]
     )
 
-    logger.info(f"Total notes extracted: {len(note_events)}")
+    times = librosa.times_like(f0, sr=sr, hop_length=params["hop_length"])
+
+    rms_energy = librosa.feature.rms(
+        y=y,
+        frame_length=params["frame_length"],
+        hop_length=params["hop_length"]
+    )[0]
+    mean_rms = float(np.mean(rms_energy)) if rms_energy.size else 0.0
+    voiced_confidence = float(np.nanmean(voiced_probs)) if voiced_probs is not None else 0.0
+
+    energy_factor = np.interp(mean_rms, [0.01, 0.1], [0.85, 1.15])
+    confidence_factor = np.interp(voiced_confidence, [0.3, 0.9], [0.9, 1.1])
+    adaptive_factor = (energy_factor + confidence_factor) / 2.0
+
+    params["min_note_duration_sec"] = max(0.03, beat_period_sec * 0.25 * adaptive_factor)
+    params["merge_gap_threshold_sec"] = beat_period_sec * 0.4 * (0.75 + (confidence_factor - 0.9))
+
+    logger.info(
+        "Adaptive timing: beat_period_sec=%.3fs, min_note_duration_sec=%.3fs, "
+        "merge_gap_threshold_sec=%.3fs (energy_factor=%.3f, voiced_confidence=%.3f)",
+        beat_period_sec,
+        params["min_note_duration_sec"],
+        params["merge_gap_threshold_sec"],
+        energy_factor,
+        voiced_confidence,
+    )
+
+    # 7. Segment Notes (Simplified logic merging Steps 5-8)
+    logger.info("Step 7: Segmenting Notes...")
+
+    current_midi = None
+    start_time = None
+
+    # Convert f0 sequence to MIDI sequence (handling None/unvoiced)
+    midi_sequence = [freq_to_midi(f) if v else None for f, v in zip(f0, voiced_flag)]
+
+    midi_pitches = [m for m in midi_sequence if m is not None]
+    if midi_pitches:
+        median_pitch = float(np.median(midi_pitches))
+        lower_quartile = float(np.percentile(midi_pitches, 25))
+        upper_quartile = float(np.percentile(midi_pitches, 75))
+        params["split_midi_threshold"] = int(round((lower_quartile + median_pitch + upper_quartile) / 3.0))
+    logger.info(
+        "Adaptive staff split threshold set to MIDI %s based on pitch distribution",
+        params["split_midi_threshold"],
+    )
+
+    note_events = []
+
+    for i, midi in enumerate(midi_sequence):
+        t = times[i]
+
+        if midi is None:
+            if current_midi is not None:
+                # End note
+                duration = t - start_time
+                if duration >= params["min_note_duration_sec"]:
+                    note_events.append({
+                        "start_sec": start_time,
+                        "end_sec": t,
+                        "midi": current_midi
+                    })
+                current_midi = None
+                start_time = None
+        else:
+            if current_midi is None:
+                # Start note
+                current_midi = midi
+                start_time = t
+            elif midi != current_midi:
+                # Pitch change -> End current, start new
+                duration = t - start_time
+                if duration >= params["min_note_duration_sec"]:
+                    note_events.append({
+                        "start_sec": start_time,
+                        "end_sec": t,
+                        "midi": current_midi
+                    })
+                current_midi = midi
+                start_time = t
+
+    # Close last note if active
+    if current_midi is not None:
+        note_events.append({
+            "start_sec": start_time,
+            "end_sec": times[-1],
+            "midi": current_midi
+        })
+
+    # 8. Merge Adjacent Same-Pitch Notes
+    logger.info("Step 8: Merging Notes...")
+    merged_notes = []
+    if note_events:
+        merged_notes.append(note_events[0])
+        for n in note_events[1:]:
+            last = merged_notes[-1]
+            gap = n["start_sec"] - last["end_sec"]
+            if n["midi"] == last["midi"] and gap < params["merge_gap_threshold_sec"]:
+                last["end_sec"] = n["end_sec"]
+            else:
+                merged_notes.append(n)
+
+    logger.info(f"Total notes extracted: {len(merged_notes)}")
 
     # 9-14. Quantization, Voice Assignment, MusicXML
     logger.info("Step 9-14: Building Score...")
@@ -449,8 +513,21 @@ def main():
         logger.warning(f"PNG generation failed (environment dependencies likely missing): {e}")
 
     # 16. Logging
+    log_payload = {
+        "parameters": {
+            "tempo_bpm": tempo,
+            "beat_period_sec": beat_period_sec,
+            "min_note_duration_sec": params["min_note_duration_sec"],
+            "merge_gap_threshold_sec": params["merge_gap_threshold_sec"],
+            "split_midi_threshold": params["split_midi_threshold"],
+            "mean_rms_energy": mean_rms,
+            "voiced_confidence": voiced_confidence,
+        },
+        "notes": log_entries,
+    }
+
     with open(args.output_log, 'w') as f:
-        json.dump(log_entries, f, indent=2)
+        json.dump(log_payload, f, indent=2)
     logger.info(f"Written log to {args.output_log}")
 
 if __name__ == "__main__":
