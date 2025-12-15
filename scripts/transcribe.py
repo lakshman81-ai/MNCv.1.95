@@ -179,10 +179,11 @@ def main():
 
     for n in merged_notes:
         dur_sec = n["end_sec"] - n["start_sec"]
-        q_dur, q_beats = quantize_duration(dur_sec, tempo, params["rhythmic_denominators"])
+        q_dur, raw_beats = quantize_duration(dur_sec, tempo, params["rhythmic_denominators"])
 
         m21_note = music21.note.Note(n["midi"])
-        m21_note.quarterLength = q_beats
+        # Snap written duration to the quantized value instead of the raw beat length
+        m21_note.quarterLength = q_dur
 
         # Calculate start beat
         start_beat = n["start_sec"] * (tempo / 60.0)
@@ -199,7 +200,7 @@ def main():
             "start_sec": n["start_sec"],
             "end_sec": n["end_sec"],
             "midi": n["midi"],
-            "quantized_rhythm": q_beats,
+            "quantized_rhythm": q_dur,
             "start_beat": start_beat,
             "staff": staff
         })
