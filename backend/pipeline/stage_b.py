@@ -39,7 +39,10 @@ if importlib.util.find_spec("scipy.signal"):
 
 def _module_available(module_name: str) -> bool:
     """Helper to avoid importing heavy optional deps when missing."""
-    return importlib.util.find_spec(module_name) is not None
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.ndarray:
