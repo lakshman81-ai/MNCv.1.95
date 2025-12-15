@@ -60,7 +60,12 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "noisy_inputs",
             ],
             "outputs": ["musicxml", "midi_bytes", "analysis_timelines"],
-            "goals": ["stage_A_to_D_flow", "aggregate_outputs"],
+            "goals": [
+                "stage_A_to_D_flow",
+                "aggregate_outputs",
+                "consistency_across_artifacts",
+            ],
+            "acceptance_metrics": ["note_f1", "onset_offset_f1", "runtime_s"],
         },
         "stage_a": {
             "toggles": [
@@ -70,7 +75,17 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "loudness_normalization",
             ],
             "fixtures": ["silence", "dc_offset_tones", "clipped_signals"],
-            "metrics": ["snr_change", "loudness_change", "latency_s"],
+            "metrics": [
+                "snr_change",
+                "loudness_change",
+                "latency_s",
+                "headroom_recovery",
+            ],
+            "measurements": [
+                "pre_post_snr",
+                "pre_post_lufs",
+                "conditioning_wall_time",
+            ],
         },
         "stage_b": {
             "detectors": ["yin", "swiftf0", "crepe", "rmvpe"],
@@ -81,14 +96,27 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "source_separation",
                 "harmonic_masking",
             ],
-            "metrics": ["f0_precision", "f0_recall", "voicing_error", "latency_s"],
+            "metrics": [
+                "f0_precision",
+                "f0_recall",
+                "voicing_error",
+                "latency_s",
+                "robustness_to_masking",
+            ],
             "fixtures": ["annotated_monophonic", "annotated_polyphonic"],
+            "robustness_checks": ["separation_on_off", "harmonic_masking_on_off"],
         },
         "stage_c": {
             "segmentation_modes": ["hmm", "threshold"],
             "parameters": ["minimum_duration", "pitch_merge_tolerance", "gap_filling"],
             "fixtures": ["staccato", "legato", "varied_tempos"],
-            "metrics": ["note_f_measure", "fragmentation_rate", "merging_rate"],
+            "metrics": [
+                "note_f_measure",
+                "onset_offset_f_measure",
+                "fragmentation_rate",
+                "merging_rate",
+            ],
+            "tempo_sweeps": ["slow", "medium", "fast", "rubato_sim"]
         },
         "stage_d": {
             "scenarios": ["tempo_grids", "swing", "rubato"],
@@ -98,6 +126,7 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "notation_cleanliness",
             ],
             "ground_truth": "synthetic_midi_round_trip",
+            "render_checks": ["quantize_and_render", "swing_grid_alignment"],
         },
         "ablation": {
             "sweeps": [
@@ -109,7 +138,12 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
         },
         "regression": {
             "corpus": "fixed_benchmark_corpus",
-            "thresholds": ["accuracy_delta", "timing_delta"],
+            "thresholds": ["accuracy_delta", "timing_delta", "latency_budget"],
+            "stage_thresholds": {
+                "end_to_end_note_f1_delta": 0.01,
+                "stage_a_latency_delta_s": 0.05,
+                "stage_b_voicing_error_delta": 0.01,
+            },
             "alerts": True,
         },
         "profiling": {
@@ -120,6 +154,7 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "hmm_state_durations",
             ],
             "purpose": "contextualize_benchmark_results",
+            "artifacts": ["profiling_traces", "intermediate_metrics"],
         },
     }
 
@@ -269,6 +304,20 @@ class BenchmarkSuite:
                 "current": r,
             })
         return diff
+
+    def _merge_results(self, previous: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge current run results into the previously persisted snapshot.
+
+        When benchmarks are executed piecemeal (e.g., separate invocations for L1–L4),
+        this keeps the latest metrics for each (level, name) pair instead of
+        overwriting the entire snapshot with the most recent slice.
+        """
+
+        merged = {(r.get("level"), r.get("name")): r for r in previous}
+        for r in current:
+            merged[(r.get("level"), r.get("name"))] = r
+
+        return [merged[k] for k in sorted(merged.keys())]
 
     def _save_run(self, level: str, name: str, res: Dict[str, Any], gt: List[Tuple[int, float, float]]):
         """Save artifacts for a single run."""
@@ -564,12 +613,21 @@ class BenchmarkSuite:
             except Exception:
                 previous = []
 
-        diff = self._compute_diff(previous, self.results)
+        merged = self._merge_results(previous, self.results)
+        diff = self._compute_diff(previous, merged)
         with open(os.path.join(self.output_dir, "summary_diff.json"), "w") as f:
             json.dump(diff, f, indent=2)
 
         with open(latest_path, "w") as f:
-            json.dump(self.results, f, indent=2)
+            json.dump(merged, f, indent=2)
+
+        logger.info(
+            "Accuracy snapshot: "
+            + ", ".join(
+                f"{r['level']}:{r['name']} F1={r.get('note_f1', 0):.3f}"
+                for r in merged
+            )
+        )
 
         logger.info(f"Summary saved to {summary_path}")
 
