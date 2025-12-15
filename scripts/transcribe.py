@@ -3,9 +3,19 @@ import json
 import logging
 import os
 import sys
-import numpy as np
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
 import librosa
 import music21
+import numpy as np
+import torch
+
+# Optional neural helpers
+try:
+    import torchcrepe
+except Exception:  # pragma: no cover - optional dependency
+    torchcrepe = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,6 +47,256 @@ def quantize_duration(seconds, bpm, denominators=[4.0, 2.0, 1.0, 0.5, 0.25, 0.12
     # Simple quantization
     return closest, beats
 
+
+class NeuralF0Estimator:
+    """Estimate F0 using a neural model (CREPE/SPICE) with graceful fallback."""
+
+    def __init__(self, params: Dict):
+        self.params = params
+
+    def _crepe_available(self) -> bool:
+        return torchcrepe is not None
+
+    def run(self, y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return times (sec) and frequency estimates (Hz)."""
+        if self._crepe_available():
+            logger.info("Using torchcrepe for neural F0 estimation (CREPE).")
+            return self._run_crepe(y, sr)
+
+        logger.warning("torchcrepe unavailable; falling back to librosa.pyin for F0.")
+        f0, _, voiced_probs = librosa.pyin(
+            y,
+            fmin=self.params["f0_fmin"],
+            fmax=self.params["f0_fmax"],
+            sr=sr,
+            frame_length=self.params["frame_length"],
+            hop_length=self.params["hop_length"],
+        )
+        times = librosa.times_like(f0, sr=sr, hop_length=self.params["hop_length"])
+        # Use voiced probability to zero-out low confidence frames
+        f0_clean = np.where(np.asarray(voiced_probs) > self.params["f0_confidence_threshold"], f0, None)
+        return times, f0_clean
+
+    def _run_crepe(self, y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        hop_length = int(sr * self.params["crepe_hop_seconds"])
+        padded = torch.tensor(y, device=device).float().unsqueeze(0)
+        torchcrepe.load_pretrained(torchcrepe.pretrained.full, device=device)
+        with torch.no_grad():
+            f0, pd = torchcrepe.predict(
+                padded,
+                sr,
+                hop_length,
+                self.params["f0_fmin"],
+                self.params["f0_fmax"],
+                model=torchcrepe.pretrained.full,
+                return_periodicity=True,
+                batch_size=8,
+                device=device,
+            )
+        f0 = torchcrepe.filter.median(f0, 3)
+        f0 = f0.cpu().numpy()[0]
+        pd = pd.cpu().numpy()[0]
+        f0[np.where(pd < self.params["f0_confidence_threshold"])] = None
+        times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
+        return times, f0
+
+
+class OnsetsFramesDetector:
+    """Onsets & Frames style onset/offset detection with optional neural model."""
+
+    def __init__(self, params: Dict):
+        self.params = params
+
+    def run(self, y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return onset_probs, offset_probs, pitch_activation (freq matrix)."""
+        try:
+            import basic_pitch.inference  # type: ignore
+            from basic_pitch import ICASSP_2022_MODEL_PATH  # type: ignore
+
+            logger.info("Using basic-pitch (Onsets & Frames) model for event detection.")
+            times, onset_probs, offset_probs, pitch_activations = self._run_basic_pitch(
+                y, sr, ICASSP_2022_MODEL_PATH
+            )
+            return onset_probs, offset_probs, pitch_activations
+        except Exception as exc:  # pragma: no cover - optional dependency
+            logger.warning(
+                "basic-pitch unavailable, using spectral heuristics for onset/offset detection: %s",
+                exc,
+            )
+            return self._run_spectral_fallback(y, sr)
+
+    def _run_basic_pitch(
+        self, y: np.ndarray, sr: int, model_path: str
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        from basic_pitch.inference import predict  # type: ignore
+
+        waveform = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
+        model_output = predict(
+            waveform,
+            sr,
+            model_path=model_path,
+            onset_thresh=self.params["onset_threshold"],
+            frame_thresh=self.params["frame_threshold"],
+        )
+        onset = model_output["onset_predictions"].squeeze(0).numpy()
+        offset = model_output["offset_predictions"].squeeze(0).numpy()
+        pitch = model_output["frame_predictions"].squeeze(0).numpy()
+        times = model_output["note_times"]  # just to satisfy typing; not used downstream
+        return times, onset, offset, pitch
+
+    def _run_spectral_fallback(self, y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        hop_length = self.params["hop_length"]
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+        onset_probs = librosa.util.normalize(onset_env)
+        # offset via reversed onset strength
+        offset_env = librosa.onset.onset_strength(y=y[::-1], sr=sr, hop_length=hop_length)[::-1]
+        offset_probs = librosa.util.normalize(offset_env)
+
+        # Multi-pitch activation via spectrogram peaks (not neural but compatible)
+        S = np.abs(librosa.cqt(y, sr=sr, hop_length=hop_length, n_bins=84, bins_per_octave=12))
+        pitch_activation = np.zeros((84, S.shape[1]))
+        for i in range(S.shape[1]):
+            column = S[:, i]
+            threshold = np.percentile(column, 90)
+            active_bins = np.where(column >= threshold)[0]
+            pitch_activation[active_bins, i] = 1.0
+        return onset_probs, offset_probs, pitch_activation
+
+
+def build_events_from_detections(
+    times: np.ndarray,
+    multi_pitch_midi: List[List[Optional[int]]],
+    onset_probs: np.ndarray,
+    offset_probs: np.ndarray,
+    params: Dict,
+) -> List[Dict]:
+    """Convert neural detections into note events supporting polyphony."""
+
+    note_events: List[Dict] = []
+    active_notes: Dict[int, Dict[str, int]] = {}
+    onset_threshold = params.get("onset_threshold", 0.5)
+    offset_threshold = params.get("offset_threshold", 0.3)
+
+    for frame_idx, (frame_pitches, onset_prob, offset_prob) in enumerate(
+        zip(multi_pitch_midi, onset_probs, offset_probs)
+    ):
+        t = times[frame_idx]
+        current_pitch_set = set(filter(lambda m: m is not None, frame_pitches))
+
+        # Close notes explicitly ended by offset detector or deactivated bins
+        ended = []
+        for midi, info in active_notes.items():
+            last_frame = info["start_frame"]
+            if midi not in current_pitch_set or offset_prob >= offset_threshold:
+                start_sec = times[last_frame]
+                duration = t - start_sec
+                if duration >= params["min_note_duration_sec"]:
+                    note_events.append({
+                        "start_sec": start_sec,
+                        "end_sec": t,
+                        "midi": midi,
+                    })
+                ended.append(midi)
+        for midi in ended:
+            active_notes.pop(midi, None)
+
+        # Start new notes when onset probability is strong or note not yet active
+        if onset_prob >= onset_threshold:
+            for midi in current_pitch_set:
+                if midi not in active_notes:
+                    active_notes[midi] = {"start_frame": frame_idx}
+
+    # Close residual active notes at end of track
+    final_time = times[-1] if len(times) else 0
+    for midi, info in active_notes.items():
+        start_sec = times[info["start_frame"]]
+        duration = final_time - start_sec
+        if duration >= params["min_note_duration_sec"]:
+            note_events.append({
+                "start_sec": start_sec,
+                "end_sec": final_time,
+                "midi": midi,
+            })
+
+    note_events.sort(key=lambda n: (n["start_sec"], n["midi"]))
+    return merge_adjacent_same_pitch(note_events, params)
+
+
+def merge_adjacent_same_pitch(note_events: List[Dict], params: Dict) -> List[Dict]:
+    merged: List[Dict] = []
+    for note in note_events:
+        if merged and note["midi"] == merged[-1]["midi"]:
+            gap = note["start_sec"] - merged[-1]["end_sec"]
+            if gap < params["merge_gap_threshold_sec"]:
+                merged[-1]["end_sec"] = max(merged[-1]["end_sec"], note["end_sec"])
+                continue
+        merged.append(note)
+    return merged
+
+
+def assign_to_voices(notes: List[Dict], tempo: float, params: Dict) -> Tuple[music21.stream.Part, music21.stream.Part, List[Dict]]:
+    """Insert notes into treble/bass parts with polyphonic voices."""
+
+    p_treble = music21.stream.Part()
+    p_bass = music21.stream.Part()
+    p_treble.insert(0, music21.clef.TrebleClef())
+    p_bass.insert(0, music21.clef.BassClef())
+
+    mm = music21.tempo.MetronomeMark(number=tempo)
+    p_treble.insert(0, mm)
+
+    staff_voice_events: List[Dict] = []
+
+    treble_voices: Dict[int, music21.stream.Voice] = defaultdict(music21.stream.Voice)
+    bass_voices: Dict[int, music21.stream.Voice] = defaultdict(music21.stream.Voice)
+    treble_spans: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+    bass_spans: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+
+    def _place_note(part_voices, span_map, staff_name, note_dict):
+        start_beat = note_dict["start_sec"] * (tempo / 60.0)
+        end_beat = note_dict["end_sec"] * (tempo / 60.0)
+        q_dur, _ = quantize_duration(note_dict["end_sec"] - note_dict["start_sec"], tempo, params["rhythmic_denominators"])
+        m21_note = music21.note.Note(note_dict["midi"])
+        m21_note.quarterLength = q_dur
+
+        # find a voice without overlap
+        target_voice_idx = None
+        for vid, spans in span_map.items():
+            if all(end_beat <= s or span_end <= start_beat for s, span_end in spans):
+                target_voice_idx = vid
+                break
+        if target_voice_idx is None:
+            target_voice_idx = len(span_map)
+
+        voice_stream = part_voices[target_voice_idx]
+        voice_stream.id = f"voice-{staff_name}-{target_voice_idx}"
+        voice_stream.insert(start_beat, m21_note)
+        span_map[target_voice_idx].append((start_beat, end_beat))
+
+        staff_voice_events.append({
+            "start_sec": note_dict["start_sec"],
+            "end_sec": note_dict["end_sec"],
+            "midi": note_dict["midi"],
+            "quantized_rhythm": q_dur,
+            "start_beat": start_beat,
+            "staff": staff_name,
+            "voice": voice_stream.id,
+        })
+
+    for n in notes:
+        if n["midi"] >= params["split_midi_threshold"]:
+            _place_note(treble_voices, treble_spans, "treble", n)
+        else:
+            _place_note(bass_voices, bass_spans, "bass", n)
+
+    for v in treble_voices.values():
+        p_treble.append(v)
+    for v in bass_voices.values():
+        p_bass.append(v)
+
+    return p_treble, p_bass, staff_voice_events
+
 def main():
     args = parse_args()
 
@@ -46,6 +306,12 @@ def main():
         "f0_fmax": librosa.note_to_hz('C6'),
         "frame_length": 2048,
         "hop_length": 512,
+        "crepe_hop_seconds": 0.01,
+        "f0_confidence_threshold": 0.5,
+        "pitch_activation_threshold": 0.2,
+        "onset_threshold": 0.5,
+        "offset_threshold": 0.3,
+        "frame_threshold": 0.5,
         "pitch_smoothing_ms": 75,
         "min_note_duration_sec": 0.06,
         "merge_gap_threshold_sec": 0.15,
@@ -203,45 +469,7 @@ def main():
     logger.info("Step 9-14: Building Score...")
 
     s = music21.stream.Score()
-    p_treble = music21.stream.Part()
-    p_bass = music21.stream.Part()
-
-    p_treble.insert(0, music21.clef.TrebleClef())
-    p_bass.insert(0, music21.clef.BassClef())
-
-    # Tempo
-    mm = music21.tempo.MetronomeMark(number=tempo)
-    p_treble.insert(0, mm)
-
-    log_entries = []
-
-    for n in merged_notes:
-        dur_sec = n["end_sec"] - n["start_sec"]
-        q_dur, raw_beats = quantize_duration(dur_sec, tempo, params["rhythmic_denominators"])
-
-        m21_note = music21.note.Note(n["midi"])
-        # Snap written duration to the quantized value instead of the raw beat length
-        m21_note.quarterLength = q_dur
-
-        # Calculate start beat
-        start_beat = n["start_sec"] * (tempo / 60.0)
-
-        # Determine staff
-        if n["midi"] >= params["split_midi_threshold"]:
-            p_treble.insert(start_beat, m21_note)
-            staff = "treble"
-        else:
-            p_bass.insert(start_beat, m21_note)
-            staff = "bass"
-
-        log_entries.append({
-            "start_sec": n["start_sec"],
-            "end_sec": n["end_sec"],
-            "midi": n["midi"],
-            "quantized_rhythm": q_dur,
-            "start_beat": start_beat,
-            "staff": staff
-        })
+    p_treble, p_bass, log_entries = assign_to_voices(note_events, tempo, params)
 
     s.insert(0, p_treble)
     s.insert(0, p_bass)
