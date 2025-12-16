@@ -373,7 +373,13 @@ class BenchmarkSuite:
                     f"Regression gate: end-to-end latency {total_ms:.2f}ms exceeds budget {latency_budget}ms"
                 )
 
-    def _poly_config(self, use_harmonic_masking: bool = False, mask_width: float = 0.03) -> PipelineConfig:
+    def _poly_config(
+        self,
+        use_harmonic_masking: bool = False,
+        mask_width: float = 0.03,
+        enable_high_capacity: bool = True,
+        use_crepe_viterbi: bool = True,
+    ) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
         config.stage_b.separation["synthetic_model"] = True
@@ -386,6 +392,8 @@ class BenchmarkSuite:
             "shift_range": [2, 4],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
+        if enable_high_capacity:
+            self._enable_high_capacity_frontend(config, use_crepe_viterbi)
         if use_poly_dominant_segmentation:
             self._apply_poly_dominant_segmentation(config)
         return config
@@ -404,9 +412,10 @@ class BenchmarkSuite:
             config.stage_c.polyphonic_confidence["melody"],
         )
 
-    def _enable_high_capacity_frontend(self, config: PipelineConfig) -> None:
+    def _enable_high_capacity_frontend(self, config: PipelineConfig, use_crepe_viterbi: bool = False) -> None:
         config.stage_b.detectors["crepe"]["enabled"] = True
         config.stage_b.detectors["crepe"]["model_capacity"] = "full"
+        config.stage_b.detectors["crepe"]["use_viterbi"] = use_crepe_viterbi
         config.stage_b.detectors["rmvpe"]["enabled"] = True
         config.stage_b.detectors["rmvpe"]["fmax"] = 2000.0
 
@@ -597,7 +606,12 @@ class BenchmarkSuite:
         mix = melody + bass
         gt_melody = [(72, 0.0, 0.5), (76, 0.5, 1.0), (79, 1.0, 1.5)]
 
-        baseline_config = self._poly_config(use_harmonic_masking=True, mask_width=0.03)
+        baseline_config = self._poly_config(
+            use_harmonic_masking=True,
+            mask_width=0.03,
+            enable_high_capacity=True,
+            use_crepe_viterbi=True,
+        )
 
         res = run_pipeline_on_audio(
             mix,
@@ -622,9 +636,14 @@ class BenchmarkSuite:
 
         logger.info(f"L2 Complete. F1: {m['note_f1']}")
 
-        # High-capacity frontend experiment (CREPE + RMVPE)
-        exp_config = self._poly_config(use_harmonic_masking=True, mask_width=0.03)
-        self._enable_high_capacity_frontend(exp_config)
+        # High-capacity frontend is now part of the baseline; still run a
+        # secondary CREPE/RMVPE pass for regression visibility.
+        exp_config = self._poly_config(
+            use_harmonic_masking=True,
+            mask_width=0.03,
+            enable_high_capacity=True,
+            use_crepe_viterbi=True,
+        )
         exp_res = run_pipeline_on_audio(
             mix,
             sr,
