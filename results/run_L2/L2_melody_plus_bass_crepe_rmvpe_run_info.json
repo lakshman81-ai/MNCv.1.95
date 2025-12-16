@@ -18,22 +18,22 @@
       "cqt"
     ],
     "separation": {
-      "requested": false,
-      "synthetic_requested": false,
-      "mode": "disabled",
-      "synthetic_ran": false,
+      "requested": true,
+      "synthetic_requested": true,
+      "mode": "synthetic_mdx",
+      "synthetic_ran": true,
       "htdemucs_ran": false,
       "fallback": false
     },
     "harmonic_masking": {
       "enabled": true,
-      "applied": false,
-      "mask_width": 0.02,
+      "applied": true,
+      "mask_width": 0.03,
       "n_harmonics": 12
     },
     "iss": {
       "enabled": true,
-      "layers_found": 0,
+      "layers_found": 1,
       "max_layers": 8
     },
     "skyline_mode": "skyline_top_voice",
@@ -79,14 +79,14 @@
     },
     "stage_b": {
       "separation": {
-        "enabled": false,
+        "enabled": true,
         "model": "htdemucs",
-        "synthetic_model": false,
+        "synthetic_model": true,
         "overlap": 0.25,
         "shifts": 1,
         "harmonic_masking": {
           "enabled": true,
-          "mask_width": 0.02,
+          "mask_width": 0.03,
           "n_harmonics": 12
         }
       },
@@ -206,5 +206,59 @@
       }
     },
     "instrument_profiles": []
+  },
+  "stage_timings": {
+    "stage_a_s": 4.033799996250309e-05,
+    "stage_b_s": 4.409054318000017,
+    "stage_c_s": 0.002688277999368438,
+    "stage_d_s": 0.05456574000072578,
+    "total_s": 4.4663486740000735
+  },
+  "detector_confidences": {
+    "vocals": {
+      "rmvpe": 0.8705728054046631,
+      "crepe": 0.870529294013977,
+      "swiftf0": 0.8705728054046631,
+      "yin": 0.8705728054046631,
+      "sacf": 0.8705728054046631,
+      "cqt": 0.8705728054046631
+    },
+    "bass": {
+      "rmvpe": 0.9162587523460388,
+      "crepe": 0.9748252034187317,
+      "swiftf0": 0.8371379375457764,
+      "yin": 0.8371379375457764,
+      "sacf": 0.8371379375457764,
+      "cqt": 0.8371379375457764
+    },
+    "drums": {
+      "rmvpe": 0.8505311012268066,
+      "crepe": 0.8434008359909058,
+      "swiftf0": 0.8505311012268066,
+      "yin": 0.8505311012268066,
+      "sacf": 0.8505311012268066,
+      "cqt": 0.8505311012268066
+    },
+    "other": {
+      "rmvpe": 0.8266825675964355,
+      "crepe": 0.7483826279640198,
+      "swiftf0": 0.8266825675964355,
+      "yin": 0.8266825675964355,
+      "sacf": 0.8266825675964355,
+      "cqt": 0.8266825675964355
+    },
+    "mix": {
+      "rmvpe": 0.8479198217391968,
+      "crepe": 0.8383938670158386,
+      "swiftf0": 0.8479198217391968,
+      "yin": 0.8479198217391968,
+      "sacf": 0.8479198217391968,
+      "cqt": 0.8479198217391968
+    }
+  },
+  "artifacts_present": {
+    "musicxml": true,
+    "midi_bytes": true,
+    "timeline": true
   }
 }
