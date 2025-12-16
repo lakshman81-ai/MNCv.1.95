@@ -844,6 +844,10 @@ def extract_features(
                         validator_min_disagree_frames=b_conf.polyphonic_peeling.get("validator_min_disagree_frames", 2),
                         max_harmonics=b_conf.polyphonic_peeling.get("max_harmonics", 12),
                         audio_path=stage_a_out.meta.audio_path,
+                    iss_adaptive=b_conf.polyphonic_peeling.get("iss_adaptive", False),
+                    strength_min=b_conf.polyphonic_peeling.get("strength_min", 0.8),
+                    strength_max=b_conf.polyphonic_peeling.get("strength_max", 1.2),
+                    flatness_thresholds=b_conf.polyphonic_peeling.get("flatness_thresholds", [0.3, 0.6]),
                     )
                     all_layers.extend([f0 for f0, _ in iss_layers])
                     iss_total_layers += len(iss_layers)

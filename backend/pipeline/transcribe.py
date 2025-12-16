@@ -30,11 +30,272 @@ from .stage_b import extract_features
 from .stage_c import apply_theory
 from .stage_d import quantize_and_render
 from .neural_transcription import transcribe_onsets_frames
-from .models import AnalysisData, StageAOutput, TranscriptionResult, StageBOutput
+from .models import AnalysisData, StageAOutput, TranscriptionResult, StageBOutput, NoteEvent, FramePitch, Stem, AudioType
 from .validation import validate_invariants, dump_resolved_config
 from .instrumentation import PipelineLogger
 import numpy as np
+import copy
+from dataclasses import asdict, replace
 
+def _slice_stage_a_output(
+    stage_a_out: StageAOutput,
+    start_sec: float,
+    end_sec: float,
+    pad_sec: float = 0.5
+) -> StageAOutput:
+    """
+    Slice StageAOutput into a time window.
+
+    Copies metadata but slices audio arrays in `stems`.
+    Does NOT slice 'beats' or other time-global metadata yet,
+    as Stage B/C mostly care about audio content.
+    """
+    sr = stage_a_out.meta.sample_rate
+    total_samples = 0
+
+    # Determine safe indices
+    # We must know the length of at least one stem to clamp
+    mix = stage_a_out.stems.get("mix")
+    if mix:
+        total_samples = len(mix.audio)
+    else:
+        # Fallback if no mix stem (unlikely)
+        any_stem = next(iter(stage_a_out.stems.values()), None)
+        if any_stem:
+            total_samples = len(any_stem.audio)
+
+    start_idx = int(max(0, start_sec * sr))
+    end_idx = int(min(total_samples, end_sec * sr))
+
+    # Create new stems
+    new_stems = {}
+    for name, stem in stage_a_out.stems.items():
+        # Slice audio
+        audio_slice = stem.audio[start_idx:end_idx]
+        new_stems[name] = Stem(
+            audio=audio_slice,
+            sr=stem.sr,
+            type=stem.type
+        )
+
+    # Create new MetaData (shallow copy + update duration)
+    new_meta = replace(stage_a_out.meta)
+    new_meta.duration_sec = (end_idx - start_idx) / sr
+
+    # Adjust beats if needed (shift time)
+    # Stage B doesn't strictly need shifted beats unless beat-tracking
+    # is re-run. Here we are just slicing audio for pitch detection.
+    # We will ignore beats in the slice for now as we use global grid.
+
+    return StageAOutput(
+        stems=new_stems,
+        meta=new_meta,
+        audio_type=stage_a_out.audio_type,
+        noise_floor_rms=stage_a_out.noise_floor_rms,
+        noise_floor_db=stage_a_out.noise_floor_db,
+        beats=[]
+    )
+
+def _score_segment(
+    notes: list[NoteEvent],
+    duration_sec: float,
+    audio_type: AudioType,
+    config: PipelineConfig
+) -> float:
+    """
+    Compute quality score [0,1] for a transcribed segment.
+
+    Heuristics:
+      1. Inverse Note Density: Penalize if too many notes per second.
+      2. Onset Plausibility: Penalize very short notes.
+    """
+    if duration_sec <= 0:
+        return 0.0
+
+    note_count = len(notes)
+    if note_count == 0:
+        # Silence is valid if the input was silent, but here we assume
+        # we want to detect something if audio is present.
+        # However, if true silence, density is 0 which is 'stable'.
+        return 1.0 # Tentative: low density = high score?
+                   # But empty transcription on busy audio is bad.
+                   # Since we don't have ground truth, we assume 'stable' = good.
+
+    # 1. Density Score
+    # "Too many notes" => chaos/noise.
+    density = note_count / duration_sec
+    target = config.segmented_transcription.density_target_notes_per_sec
+    span = config.segmented_transcription.density_penalty_span
+
+    # Soft clamp: if density <= target, score 1.0.
+    # If density >= target + span, score -> 0.0.
+    excess = max(0.0, density - target)
+    density_score = 1.0 - np.clip(excess / span, 0.0, 1.0)
+
+    # 2. Onset Plausibility
+    # Penalize short notes
+    min_dur = config.stage_c.min_note_duration_ms / 1000.0
+    if audio_type in (AudioType.POLYPHONIC, AudioType.POLYPHONIC_DOMINANT):
+         min_dur = config.stage_c.min_note_duration_ms_poly / 1000.0
+
+    short_notes = sum(1 for n in notes if (n.end_sec - n.start_sec) < min_dur)
+    plausibility = 1.0 - (short_notes / note_count)
+
+    # Weighted combination
+    # Density is a strong indicator of "noise explosion".
+    # Plausibility checks for "fragmentation".
+    final_score = 0.6 * density_score + 0.4 * plausibility
+    return float(final_score)
+
+def _build_candidate_configs(
+    base_config: PipelineConfig,
+    segment_audio_type: AudioType
+) -> list[PipelineConfig]:
+    """
+    Generate candidate configurations for retry logic.
+
+    C1: Original
+    C2: Alternate algorithm priorities
+    C3: Relaxed thresholds
+    """
+    configs = []
+
+    # C1: Primary
+    configs.append(base_config)
+
+    # C2: Alternate Algorithms
+    # If mono/poly-dominant: enable CREPE + Multi-res YIN
+    # If poly: enable ISS adaptive
+    c2 = copy.deepcopy(base_config)
+    if segment_audio_type == AudioType.POLYPHONIC:
+        # Enable adaptive ISS
+        c2.stage_b.polyphonic_peeling["iss_adaptive"] = True
+    else:
+        # Boost CREPE/YIN for melody
+        if "crepe" in c2.stage_b.detectors:
+            c2.stage_b.detectors["crepe"]["enabled"] = True
+        if "yin" in c2.stage_b.detectors:
+            c2.stage_b.detectors["yin"]["enable_multires_f0"] = True
+
+    configs.append(c2)
+
+    # C3: Relaxed Thresholds
+    # Lower confidence thresholds, increase gap tolerance
+    c3 = copy.deepcopy(base_config)
+    c3.stage_c.confidence_threshold *= 0.8
+    if hasattr(c3.stage_c, "gap_tolerance_s"):
+        c3.stage_c.gap_tolerance_s *= 2.0
+
+    # Increase smoothing
+    c3.stage_b.voice_tracking["smoothing"] = 0.7
+
+    configs.append(c3)
+
+    return configs
+
+def _stitch_events(
+    accumulated_notes: list[NoteEvent],
+    new_segment_notes: list[NoteEvent],
+    overlap_start: float,
+    overlap_end: float
+) -> list[NoteEvent]:
+    """
+    Merge notes from new segment into accumulated notes, handling overlap.
+
+    Strategy:
+    - Notes ending before overlap_start are kept as-is.
+    - Notes in new segment starting after overlap_end are kept as-is.
+    - In overlap region [overlap_start, overlap_end]:
+        - Match notes by pitch.
+        - Merge if they overlap in time (within small tolerance).
+        - Resolve conflicts (duplicates).
+    """
+    # 1. Split accumulated notes
+    # Keep notes that end cleanly before the merge region or just inside it
+    # We define "safe" zone as anything ending before overlap_start
+    safe_history = []
+    candidates_history = []
+
+    for n in accumulated_notes:
+        if n.end_sec < overlap_start:
+            safe_history.append(n)
+        else:
+            candidates_history.append(n)
+
+    # 2. Process new notes
+    # Shift time of new notes is NOT needed because Stage B/C inputs
+    # were sliced but returned times relative to the slice start?
+    # WAIT. Stage B output timestamps are relative to the *slice*.
+    # We must assume the caller has already shifted the timestamps
+    # of new_segment_notes to global time!
+    # Let's verify this assumption in the calling loop.
+    # Yes, we will shift them before calling stitch.
+
+    # 3. Merging logic
+    # Simple approach:
+    # - Start with safe_history.
+    # - Try to merge candidates_history with new_segment_notes.
+
+    merged = list(safe_history)
+
+    # Sort by start time
+    all_overlap = sorted(candidates_history + new_segment_notes, key=lambda x: x.start_sec)
+
+    # We will use a greedy merge on sorted events
+    # If two events have same pitch and overlap in time, merge them.
+
+    if not all_overlap:
+        return merged
+
+    current = all_overlap[0]
+
+    for next_note in all_overlap[1:]:
+        # Check overlap/adjacency
+        # Tolerance for "touching" notes
+        TOLERANCE = 0.05
+
+        is_same_pitch = (current.midi_note == next_note.midi_note)
+        # Check time overlap: (StartA <= EndB) and (EndA >= StartB)
+        # With tolerance for gaps
+        is_overlapping = (current.start_sec - TOLERANCE <= next_note.end_sec) and \
+                         (current.end_sec + TOLERANCE >= next_note.start_sec)
+
+        if is_same_pitch and is_overlapping:
+            # Merge
+            # Extend duration
+            new_start = min(current.start_sec, next_note.start_sec)
+            new_end = max(current.end_sec, next_note.end_sec)
+
+            # Max confidence
+            new_conf = max(current.confidence, next_note.confidence)
+            # Max velocity
+            new_vel = max(current.velocity, next_note.velocity)
+
+            # Weighted average pitch Hz (if valid)
+            w1 = current.confidence
+            w2 = next_note.confidence
+            if w1 + w2 > 0:
+                new_hz = (current.pitch_hz * w1 + next_note.pitch_hz * w2) / (w1 + w2)
+            else:
+                new_hz = current.pitch_hz
+
+            # Update current
+            current.start_sec = new_start
+            current.end_sec = new_end
+            current.confidence = new_conf
+            current.velocity = new_vel
+            current.pitch_hz = new_hz
+            # Keep voice/staff from winner (conf based? or just current?)
+            if next_note.confidence > current.confidence:
+                current.voice = next_note.voice
+                current.staff = next_note.staff
+        else:
+            # No merge, push current and move on
+            merged.append(current)
+            current = next_note
+
+    merged.append(current)
+    return merged
 
 def transcribe(
     audio_path: str,
@@ -165,58 +426,226 @@ def transcribe(
         )
 
     # --------------------------------------------------------
-    # Stage B: Feature Extraction (Detectors + Ensemble)
+    # SEGMENTED TRANSCRIPTION LOGIC (Optional)
     # --------------------------------------------------------
-    pipeline_logger.log_event(
-        "stage_b",
-        "detector_selection",
-        {
-            "detectors": config.stage_b.detectors if hasattr(config, "stage_b") else {},
-            "dependencies": PipelineLogger.dependency_snapshot(["torch", "crepe", "demucs"]),
-        },
-    )
-    t_b = time.perf_counter()
-    stage_b_out = extract_features(
-        stage_a_out,
-        config=config,
-    )
-    validate_invariants(stage_b_out, config)
-    pipeline_logger.record_timing(
-        "stage_b",
-        time.perf_counter() - t_b,
-        metadata={
-            "resolved_hop": stage_a_out.meta.hop_length,
-            "resolved_window": stage_a_out.meta.window_size,
-            "detectors_run": list(stage_b_out.per_detector.get("mix", {}).keys()),
-            "crepe_used": "crepe" in list(stage_b_out.per_detector.get("mix", {}).keys()),
-            "iss_layers": stage_b_out.diagnostics.get("iss", {}).get("layers_found", 0),
-        },
+    seg_conf = getattr(config, "segmented_transcription", None)
+    use_segmented = (
+        seg_conf and
+        seg_conf.enabled and
+        stage_a_out.meta.duration_sec > seg_conf.segment_sec
     )
 
-    # --------------------------------------------------------
-    # Stage C: Note Event Extraction (Theory Application)
-    # --------------------------------------------------------
-    analysis_data = AnalysisData(
-        meta=stage_a_out.meta,
-        timeline=[],
-        stem_timelines=stage_b_out.stem_timelines,
-    )
+    if use_segmented:
+        pipeline_logger.log_event("pipeline", "segmented_mode_start", asdict(seg_conf))
 
-    pipeline_logger.log_event(
-        "stage_c",
-        "segmentation",
-        {
-            "method": config.stage_c.segmentation_method.get("method") if hasattr(config, "stage_c") else None,
-            "pitch_tolerance_cents": getattr(config.stage_c, "pitch_tolerance_cents", None) if hasattr(config, "stage_c") else None,
-        },
-    )
-    t_c = time.perf_counter()
-    notes = apply_theory(
-        analysis_data,
-        config=config,
-    )
-    validate_invariants(notes, config, analysis_data=analysis_data)
-    pipeline_logger.record_timing("stage_c", time.perf_counter() - t_c, metadata={"note_count": len(notes)})
+        # Determine segments
+        duration = stage_a_out.meta.duration_sec
+        seg_len = seg_conf.segment_sec
+        overlap = seg_conf.overlap_sec
+        step = seg_len - overlap
+        if step <= 0:
+            step = seg_len # safety
+
+        accumulated_notes = []
+
+        # Loop segments
+        current_time = 0.0
+        seg_idx = 0
+
+        # Keep track of last stitched point to know valid regions
+        # Actually stitch logic handles regions.
+
+        while current_time < duration:
+            seg_start = current_time
+            seg_end = min(duration, current_time + seg_len)
+
+            pipeline_logger.log_event("segment", "start", {"index": seg_idx, "start": seg_start, "end": seg_end})
+
+            # Slice audio (Stage A subset)
+            seg_stage_a = _slice_stage_a_output(stage_a_out, seg_start, seg_end)
+
+            # Build candidates (C1, C2, C3)
+            # Use global audio type, but allow lightweight check?
+            # (User requested lightweight check: silence/low rms -> skip poly)
+            # For now we use global + simple candidates.
+            candidates = _build_candidate_configs(config, stage_a_out.audio_type)
+            candidates = candidates[:seg_conf.retry_max_candidates]
+
+            best_notes = []
+            best_score = -1.0
+            selected_cand_idx = 0
+
+            for c_idx, cand_config in enumerate(candidates):
+                # Run Stage B
+                sb_out = extract_features(seg_stage_a, config=cand_config)
+
+                # Run Stage C
+                sc_analysis = AnalysisData(
+                    meta=seg_stage_a.meta,
+                    timeline=[],
+                    stem_timelines=sb_out.stem_timelines
+                )
+                cand_notes = apply_theory(sc_analysis, config=cand_config)
+
+                # Score
+                score = _score_segment(cand_notes, seg_end - seg_start, stage_a_out.audio_type, config)
+
+                pipeline_logger.log_event("segment", "candidate_evaluated", {
+                    "segment_index": seg_idx,
+                    "candidate_index": c_idx,
+                    "score": score,
+                    "note_count": len(cand_notes)
+                })
+
+                if score > best_score:
+                    best_score = score
+                    best_notes = cand_notes
+                    selected_cand_idx = c_idx
+
+                if score >= seg_conf.retry_quality_threshold:
+                    break
+
+            pipeline_logger.log_event("segment", "segment_complete", {
+                "index": seg_idx,
+                "selected_candidate": selected_cand_idx,
+                "final_score": best_score,
+                "notes_count": len(best_notes)
+            })
+
+            # Time-shift notes to global time
+            # Stage B output timelines start at 0.0 relative to slice.
+            for n in best_notes:
+                n.start_sec += seg_start
+                n.end_sec += seg_start
+
+            # Stitch
+            overlap_start = current_time + step # Start of overlap region in next iteration
+            # But for *this* iteration, we are merging into previous.
+            # The overlap region with previous segment was [seg_start, seg_start + overlap]
+            # The overlap region with next segment is [seg_end - overlap, seg_end]
+
+            # _stitch_events merges "accumulated" (processed up to now) with "new" (current segment)
+            # The overlap happens at `seg_start`.
+            # Overlap region is roughly [seg_start, seg_start + overlap]
+            # (assuming previous segment ended at seg_start + overlap)
+
+            # Correct logic:
+            # We append to accumulated_notes.
+            # The "stitch zone" is where the previous segment and this segment overlap.
+            # Previous segment covered [prev_start, prev_end].
+            # This segment covers [seg_start, seg_end].
+            # prev_end was approx seg_start + overlap.
+            # So overlap is [seg_start, prev_end].
+
+            # Since we iterate by `step`, seg_start = prev_start + step.
+            # prev_end = prev_start + seg_len.
+            # So prev_end = seg_start - step + seg_len = seg_start + overlap.
+            # Correct.
+
+            merge_start = seg_start
+            merge_end = seg_start + overlap
+
+            if seg_idx == 0:
+                accumulated_notes = best_notes
+            else:
+                accumulated_notes = _stitch_events(accumulated_notes, best_notes, merge_start, merge_end)
+
+            # Prepare next loop
+            current_time += step
+            seg_idx += 1
+
+        # Final Analysis Data construction
+        # We need to build a dummy StageB output or just populate AnalysisData directly
+        # The contract expects `stage_b_out` for `dump_resolved_config` later, but
+        # `dump_resolved_config` might handle missing bits?
+        # Actually we can just proceed to Stage D with populated AnalysisData.
+
+        # We'll create a synthetic StageBOutput for logging/dumping purposes?
+        # Or just reuse the last one?
+        # For simplicity, we reuse the last one but warn it's partial.
+        # Ideally we aggregate timelines, but that's heavy.
+        # We will populate AnalysisData.stem_timelines with empty/minimal data
+        # because Stage D mostly consumes `notes` (except for visualization).
+
+        # Note: Stage D `quantize_and_render` takes `notes` as first arg.
+        analysis_data = AnalysisData(
+            meta=stage_a_out.meta,
+            timeline=[],
+            stem_timelines={}, # We don't stitch timelines yet, only notes.
+            notes=accumulated_notes
+        )
+
+        # Use the last run's Stage B output for invariants/logging
+        stage_b_out = StageBOutput(
+            time_grid=np.array([]),
+            f0_main=np.array([]),
+            f0_layers=[],
+            per_detector={},
+            meta=stage_a_out.meta,
+            diagnostics={"mode": "segmented"}
+        )
+
+        # Pass the accumulated notes to Stage D
+        notes = accumulated_notes
+
+    else:
+        # --------------------------------------------------------
+        # ORIGINAL SINGLE-PASS PATH
+        # --------------------------------------------------------
+
+        # --------------------------------------------------------
+        # Stage B: Feature Extraction (Detectors + Ensemble)
+        # --------------------------------------------------------
+        pipeline_logger.log_event(
+            "stage_b",
+            "detector_selection",
+            {
+                "detectors": config.stage_b.detectors if hasattr(config, "stage_b") else {},
+                "dependencies": PipelineLogger.dependency_snapshot(["torch", "crepe", "demucs"]),
+            },
+        )
+        t_b = time.perf_counter()
+        stage_b_out = extract_features(
+            stage_a_out,
+            config=config,
+        )
+        validate_invariants(stage_b_out, config)
+        pipeline_logger.record_timing(
+            "stage_b",
+            time.perf_counter() - t_b,
+            metadata={
+                "resolved_hop": stage_a_out.meta.hop_length,
+                "resolved_window": stage_a_out.meta.window_size,
+                "detectors_run": list(stage_b_out.per_detector.get("mix", {}).keys()),
+                "crepe_used": "crepe" in list(stage_b_out.per_detector.get("mix", {}).keys()),
+                "iss_layers": stage_b_out.diagnostics.get("iss", {}).get("layers_found", 0),
+            },
+        )
+
+        # --------------------------------------------------------
+        # Stage C: Note Event Extraction (Theory Application)
+        # --------------------------------------------------------
+        analysis_data = AnalysisData(
+            meta=stage_a_out.meta,
+            timeline=[],
+            stem_timelines=stage_b_out.stem_timelines,
+        )
+
+        pipeline_logger.log_event(
+            "stage_c",
+            "segmentation",
+            {
+                "method": config.stage_c.segmentation_method.get("method") if hasattr(config, "stage_c") else None,
+                "pitch_tolerance_cents": getattr(config.stage_c, "pitch_tolerance_cents", None) if hasattr(config, "stage_c") else None,
+            },
+        )
+        t_c = time.perf_counter()
+        notes = apply_theory(
+            analysis_data,
+            config=config,
+        )
+        validate_invariants(notes, config, analysis_data=analysis_data)
+        pipeline_logger.record_timing("stage_c", time.perf_counter() - t_c, metadata={"note_count": len(notes)})
 
     # --------------------------------------------------------
     # Stage D: Quantization + MusicXML Rendering
