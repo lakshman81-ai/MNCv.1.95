@@ -136,6 +136,97 @@ def note_f1(pred_notes: List[Tuple[int, float, float]], gt_notes: List[Tuple[int
     return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
 
+def _dtw_path(pred_onsets: List[float], gt_onsets: List[float]) -> List[Tuple[int, int]]:
+    n, m = len(pred_onsets), len(gt_onsets)
+    if n == 0 or m == 0:
+        return []
+    dp = np.full((n + 1, m + 1), np.inf)
+    dp[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = abs(pred_onsets[i - 1] - gt_onsets[j - 1])
+            dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+
+    path: List[Tuple[int, int]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        options = []
+        if i > 0 and j > 0:
+            options.append((dp[i - 1, j - 1], "diag"))
+        if i > 0:
+            options.append((dp[i - 1, j], "up"))
+        if j > 0:
+            options.append((dp[i, j - 1], "left"))
+        _, move = min(options, key=lambda x: x[0])
+        if move == "diag":
+            path.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif move == "up":
+            i -= 1
+        else:
+            j -= 1
+    path.reverse()
+    return path
+
+
+def dtw_note_f1(
+    pred_notes: List[Tuple[int, float, float]],
+    gt_notes: List[Tuple[int, float, float]],
+    onset_tol: float = 0.05,
+    pitch_mismatch_penalty: float = 0.05,
+) -> float:
+    """DTW-aligned Note F1 using onset sequences with optional pitch penalty."""
+
+    if not gt_notes and not pred_notes:
+        return float('nan')
+
+    pred_sorted = sorted(pred_notes, key=lambda x: x[1])
+    gt_sorted = sorted(gt_notes, key=lambda x: x[1])
+    path = _dtw_path([p[1] for p in pred_sorted], [g[1] for g in gt_sorted])
+
+    tp = 0
+    for i, j in path:
+        p_midi, p_start, _ = pred_sorted[i]
+        g_midi, g_start, _ = gt_sorted[j]
+        onset_close = abs(p_start - g_start) <= onset_tol
+        pitch_match = p_midi == g_midi
+        # Apply a light penalty for pitch mismatch by requiring tighter onset
+        if onset_close and (pitch_match or abs(p_start - g_start) <= max(0.0, onset_tol - pitch_mismatch_penalty)):
+            tp += 1
+
+    fp = len(pred_sorted) - tp
+    fn = len(gt_sorted) - tp
+    precision = tp / float(tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / float(tp + fn) if (tp + fn) > 0 else 0.0
+    return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+
+def dtw_onset_error_ms(
+    pred_notes: List[Tuple[int, float, float]],
+    gt_notes: List[Tuple[int, float, float]],
+) -> float:
+    """Mean onset error (ms) along the DTW alignment path for matching MIDI pitches."""
+
+    if not pred_notes or not gt_notes:
+        return float('nan')
+
+    pred_sorted = sorted(pred_notes, key=lambda x: x[1])
+    gt_sorted = sorted(gt_notes, key=lambda x: x[1])
+    path = _dtw_path([p[1] for p in pred_sorted], [g[1] for g in gt_sorted])
+
+    errors = []
+    for i, j in path:
+        p_midi, p_start, _ = pred_sorted[i]
+        g_midi, g_start, _ = gt_sorted[j]
+        if p_midi == g_midi:
+            errors.append(abs(p_start - g_start) * 1000.0)
+
+    if not errors:
+        return float('nan')
+    return float(np.mean(errors))
+
+
 def onset_offset_mae(pred_notes: List[Tuple[int, float, float]], gt_notes: List[Tuple[int, float, float]]) -> Tuple[float, float]:
     """Compute mean absolute error of note onsets and offsets.
 
