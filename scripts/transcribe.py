@@ -83,13 +83,27 @@ class DurationClassifier:
 
 def quantize_duration(
     seconds,
-    start_time,
-    tempo_times,
-    tempo_curve,
-    denominators,
+    start_time=None,
+    tempo_times=None,
+    tempo_curve=None,
+    denominators=None,
     classifier=None,
+    bpm=None,
 ):
-    local_bpm = float(np.interp(start_time, tempo_times, tempo_curve))
+    if denominators is None:
+        raise ValueError("denominators must be provided")
+
+    if bpm is not None:
+        local_bpm = float(bpm)
+    elif tempo_times is not None and tempo_curve is not None:
+        start_time_val = 0.0 if start_time is None else float(start_time)
+        local_bpm = float(np.interp(start_time_val, tempo_times, tempo_curve))
+    elif start_time is not None:
+        # Backward compatibility: treat start_time as a constant bpm when tempo curve is absent
+        local_bpm = float(start_time)
+    else:
+        local_bpm = 120.0
+
     beats = seconds * (local_bpm / 60.0)
 
     if classifier is not None:
@@ -329,7 +343,11 @@ def assign_to_voices(notes: List[Dict], tempo: float, params: Dict) -> Tuple[mus
     def _place_note(part_voices, span_map, staff_name, note_dict):
         start_beat = note_dict["start_sec"] * (tempo / 60.0)
         end_beat = note_dict["end_sec"] * (tempo / 60.0)
-        q_dur, _ = quantize_duration(note_dict["end_sec"] - note_dict["start_sec"], tempo, params["rhythmic_denominators"])
+        q_dur, _, _ = quantize_duration(
+            note_dict["end_sec"] - note_dict["start_sec"],
+            bpm=tempo,
+            denominators=params["rhythmic_denominators"],
+        )
         m21_note = music21.note.Note(note_dict["midi"])
         m21_note.quarterLength = q_dur
 

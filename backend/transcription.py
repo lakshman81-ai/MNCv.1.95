@@ -12,6 +12,7 @@ from .pipeline.stage_b import extract_features
 from .pipeline.stage_c import apply_theory
 from .pipeline.stage_d import quantize_and_render
 from .pipeline.models import AnalysisData, TranscriptionResult, MetaData, AudioType
+from .pipeline.validation import validate_invariants, dump_resolved_config
 
 def transcribe_audio_pipeline(
     audio_path: str,
@@ -75,7 +76,13 @@ def transcribe_audio_pipeline(
 
     # 1. Stage A: Load and Preprocess (with Source Separation)
     # Returns StageAOutput
-    stage_a_out = load_and_preprocess(audio_path, config=pipeline_conf)
+    stage_a_out = load_and_preprocess(
+        audio_path,
+        config=pipeline_conf,
+        start_offset=float(start_offset or 0.0),
+        max_duration=max_duration,
+    )
+    validate_invariants(stage_a_out, pipeline_conf)
 
     meta = stage_a_out.meta
     meta.processing_mode = mode
@@ -88,10 +95,12 @@ def transcribe_audio_pipeline(
 
     stage_b_out = extract_features(
         stage_a_out,
+        config=pipeline_conf,
         use_crepe=use_crepe,
         confidence_threshold=conf_thresh,
         min_duration_ms=min_dur
     )
+    validate_invariants(stage_b_out, pipeline_conf)
 
     # Unpack from StageBOutput
     timeline = [] # Global timeline computed from main f0?
@@ -182,12 +191,18 @@ def transcribe_audio_pipeline(
     analysis_data.notes_before_quantization = [replace(n) for n in notes]
 
     # 4. Stage C: Apply Theory
-    events_with_theory = apply_theory(notes, analysis_data)
+    events_with_theory = apply_theory(analysis_data, config=pipeline_conf)
+    validate_invariants(events_with_theory, pipeline_conf, analysis_data=analysis_data)
 
     # 5. Stage D: Quantize and Render
     midi_bytes = b""
     try:
-        stage_d_result = quantize_and_render(events_with_theory, analysis_data)
+        stage_d_result = quantize_and_render(
+            events_with_theory,
+            analysis_data,
+            config=pipeline_conf,
+        )
+        validate_invariants(stage_d_result, pipeline_conf)
         if isinstance(stage_d_result, TranscriptionResult):
             musicxml_str = stage_d_result.musicxml
             midi_bytes = stage_d_result.midi_bytes or b""
@@ -239,6 +254,9 @@ def transcribe_audio_pipeline(
         analysis_data=analysis_data,
         midi_bytes=midi_bytes
     )
+
+    # Emit runtime-resolved configuration for debugging
+    dump_resolved_config(pipeline_conf, meta, stage_b_out)
 
     return result
 

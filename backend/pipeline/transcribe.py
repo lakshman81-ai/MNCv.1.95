@@ -29,6 +29,7 @@ from .stage_b import extract_features
 from .stage_c import apply_theory
 from .stage_d import quantize_and_render
 from .models import AnalysisData, StageAOutput, TranscriptionResult
+from .validation import validate_invariants, dump_resolved_config
 
 
 def transcribe(
@@ -62,6 +63,7 @@ def transcribe(
         audio_path,
         config=config,
     )
+    validate_invariants(stage_a_out, config)
 
     # --------------------------------------------------------
     # Stage B: Feature Extraction (Detectors + Ensemble)
@@ -70,6 +72,7 @@ def transcribe(
         stage_a_out,
         config=config,
     )
+    validate_invariants(stage_b_out, config)
 
     # --------------------------------------------------------
     # Stage C: Note Event Extraction (Theory Application)
@@ -84,6 +87,7 @@ def transcribe(
         analysis_data,
         config=config,
     )
+    validate_invariants(notes, config, analysis_data=analysis_data)
 
     # --------------------------------------------------------
     # Stage D: Quantization + MusicXML Rendering
@@ -93,6 +97,10 @@ def transcribe(
         analysis_data,
         config=config,
     )
+    validate_invariants(d_out, config)
+
+    # Save resolved configuration for debugging parity with API path
+    dump_resolved_config(config, stage_a_out.meta, stage_b_out)
 
     # d_out contains musicxml, analysis_data, and midi_bytes.
     # Ensure we return a TranscriptionResult with all fields.
