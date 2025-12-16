@@ -356,13 +356,18 @@ class BenchmarkSuite:
                     f"Regression gate: end-to-end latency {total_ms:.2f}ms exceeds budget {latency_budget}ms"
                 )
 
-    def _poly_config(self, use_harmonic_masking: bool = False) -> PipelineConfig:
+    def _poly_config(self, use_harmonic_masking: bool = False, mask_width: float = 0.03) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
         config.stage_b.separation["synthetic_model"] = True
         config.stage_b.separation["harmonic_masking"]["enabled"] = use_harmonic_masking
         if use_harmonic_masking:
-            config.stage_b.separation["harmonic_masking"]["mask_width"] = 0.03
+            config.stage_b.separation["harmonic_masking"]["mask_width"] = mask_width
+        config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
+        config.stage_b.separation["polyphonic_dominant_preset"].update({
+            "overlap": 0.5,
+            "shift_range": [2, 4],
+        })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
         return config
 
@@ -446,15 +451,25 @@ class BenchmarkSuite:
         # We also want to see what detectors ran
         detectors_ran = list(res['stage_b_out'].per_detector.get('mix', {}).keys())
         diagnostics = getattr(res.get("stage_b_out"), "diagnostics", {}) if res.get("stage_b_out") else {}
+        resolved_config = res.get("resolved_config")
         run_info = {
             "detectors_ran": detectors_ran,
             "diagnostics": diagnostics,
-            "config": asdict(res['resolved_config'])
+            "config": asdict(resolved_config) if resolved_config else {},
         }
         profiling = res.get("profiling", {})
         run_info["stage_timings"] = profiling.get("stage_timings", {})
         run_info["detector_confidences"] = profiling.get("detector_confidences", {})
         run_info["artifacts_present"] = profiling.get("artifacts", {})
+        sep_diag = diagnostics.get("separation", {}) if diagnostics else {}
+        stage_b_conf = getattr(resolved_config, "stage_b", None)
+        run_info["separation_preset"] = {
+            "preset": sep_diag.get("preset") or "default",
+            "overlap": sep_diag.get("resolved_overlap", stage_b_conf.separation.get("overlap") if stage_b_conf else None),
+            "shifts": sep_diag.get("resolved_shifts", stage_b_conf.separation.get("shifts") if stage_b_conf else None),
+            "shift_range": sep_diag.get("shift_range", (stage_b_conf.separation.get("polyphonic_dominant_preset", {}).get("shift_range") if stage_b_conf else None)),
+            "harmonic_mask_width": diagnostics.get("harmonic_masking", {}).get("mask_width") if diagnostics else None,
+        }
 
         with open(f"{base_path}_run_info.json", "w") as f:
             json.dump(run_info, f, indent=2, default=str)
@@ -549,16 +564,12 @@ class BenchmarkSuite:
         mix = melody + bass
         gt_melody = [(72, 0.0, 0.5), (76, 0.5, 1.0), (79, 1.0, 1.5)]
 
-        config = PipelineConfig()
-        config.stage_b.separation['enabled'] = True
-        config.stage_b.separation['synthetic_model'] = True
-        config.stage_b.separation['harmonic_masking']['enabled'] = True
-        config.stage_b.separation['harmonic_masking']['mask_width'] = 0.03
+        baseline_config = self._poly_config(use_harmonic_masking=True, mask_width=0.03)
 
         res = run_pipeline_on_audio(
             mix,
             sr,
-            config,
+            baseline_config,
             AudioType.POLYPHONIC_DOMINANT,
             allow_separation=True,
         )
@@ -579,7 +590,7 @@ class BenchmarkSuite:
         logger.info(f"L2 Complete. F1: {m['note_f1']}")
 
         # High-capacity frontend experiment (CREPE + RMVPE)
-        exp_config = self._poly_config(use_harmonic_masking=True)
+        exp_config = self._poly_config(use_harmonic_masking=True, mask_width=0.03)
         self._enable_high_capacity_frontend(exp_config)
         exp_res = run_pipeline_on_audio(
             mix,
@@ -590,6 +601,35 @@ class BenchmarkSuite:
         )
         m_exp = self._save_run("L2", "melody_plus_bass_crepe_rmvpe", exp_res, gt_melody)
         logger.info(f"L2 CREPE/RMVPE Complete. F1: {m_exp['note_f1']}")
+
+        # Harmonic masking sweep to measure melody isolation sensitivity
+        mask_widths = [0.02, 0.04, 0.06]
+        sweep_results = []
+        for width in mask_widths:
+            sweep_config = self._poly_config(use_harmonic_masking=True, mask_width=width)
+            sweep_res = run_pipeline_on_audio(
+                mix,
+                sr,
+                sweep_config,
+                AudioType.POLYPHONIC_DOMINANT,
+                allow_separation=True,
+            )
+            sweep_metric = self._save_run(
+                "L2",
+                f"melody_plus_bass_mask_{width:.2f}",
+                sweep_res,
+                gt_melody,
+            )
+            sweep_results.append((width, sweep_metric.get("note_f1", 0.0)))
+
+        if sweep_results:
+            best_width, best_f1 = max(sweep_results, key=lambda x: x[1])
+            logger.info(
+                "L2 harmonic masking sweep complete. Best width %.2f -> F1 %.3f (baseline %.3f)",
+                best_width,
+                best_f1,
+                m.get("note_f1", 0.0),
+            )
 
     def run_L3_full_poly(self):
         logger.info("Running L3: Full Poly")

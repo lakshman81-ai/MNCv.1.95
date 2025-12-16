@@ -72,6 +72,11 @@ class StageBConfig:
             "synthetic_model": False,
             "overlap": 0.25,  # Demucs overlap
             "shifts": 1,      # number of shifts (test-time augmentation)
+            # Polyphonic-dominant preset: heavier overlap + more TTA to peel melody
+            "polyphonic_dominant_preset": {
+                "overlap": 0.5,
+                "shift_range": [2, 4],
+            },
             # Optional harmonic masking guided by a fast F0 prior
             "harmonic_masking": {
                 "enabled": True,
