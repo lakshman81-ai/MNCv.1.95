@@ -39,7 +39,18 @@ def quantize_and_render(
     """
 
     d_conf = config.stage_d
-    bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
+
+    bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else None
+    if bpm is None:
+        beats_seq = getattr(analysis_data, "beats", []) or []
+        if beats_seq:
+            diffs = np.diff(sorted(beats_seq))
+            if diffs.size:
+                med = float(np.median(diffs))
+                if med > 0:
+                    bpm = 60.0 / med
+    if bpm is None or not np.isfinite(bpm):
+        bpm = 100.0
     ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else "4/4"
     split_pitch = d_conf.staff_split_point.get("pitch", 60)  # C4
 

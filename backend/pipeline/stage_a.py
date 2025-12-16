@@ -205,10 +205,31 @@ def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[
         return None, []
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tempo_est, beat_frames = librosa.beat.beat_track(y=audio, sr=sr)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            return None, []
+
+        # Downsample and cap duration to keep beat tracking stable/cheap
+        target_sr = 16000 if sr > 16000 else max(11025, sr)
+        max_seconds = 90.0
+        if librosa:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if sr != target_sr:
+                    y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+                if y.size > int(target_sr * max_seconds):
+                    y = y[: int(target_sr * max_seconds)]
+                tempo_est, beat_frames = librosa.beat.beat_track(
+                    y=y,
+                    sr=target_sr,
+                    hop_length=256,
+                    tightness=100,
+                )
+                beat_times = librosa.frames_to_time(beat_frames, sr=target_sr, hop_length=256).tolist()
+        else:  # pragma: no cover - defensive fallback
+            beat_times = []
+            tempo_est = None
+
         tempo_val = tempo_est
         if tempo_val is not None and hasattr(tempo_val, "__len__"):
             tempo_val = tempo_val[0] if len(tempo_val) else None
@@ -372,7 +393,7 @@ def load_and_preprocess(
         processing_mode=detected_type.value,
         audio_type=detected_type,
 
-        tempo_bpm=tempo_bpm if tempo_bpm is not None else 120.0,
+        tempo_bpm=tempo_bpm,
         beats=beat_times,
     )
 
