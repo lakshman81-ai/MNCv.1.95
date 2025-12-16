@@ -232,6 +232,10 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, An
         "synthetic_ran": False,
         "htdemucs_ran": False,
         "fallback": False,
+        "preset": None,
+        "resolved_overlap": None,
+        "resolved_shifts": None,
+        "shift_range": None,
     }
 
     if not diag["requested"]:
@@ -248,6 +252,26 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, An
     sep_conf = b_conf.separation
     overlap = sep_conf.get("overlap", 0.25)
     shifts = sep_conf.get("shifts", 1)
+
+    preset_conf: Dict[str, Any] = {}
+    if getattr(stage_a_out, "audio_type", None) == AudioType.POLYPHONIC_DOMINANT:
+        preset_conf = sep_conf.get("polyphonic_dominant_preset", {}) or {}
+        diag["preset"] = "polyphonic_dominant"
+        overlap = float(preset_conf.get("overlap", overlap))
+        if preset_conf.get("shift_range"):
+            diag["shift_range"] = list(preset_conf.get("shift_range"))
+        if "shifts" in preset_conf:
+            shifts = int(preset_conf.get("shifts", shifts))
+        else:
+            shift_range = preset_conf.get("shift_range")
+            if shift_range and isinstance(shift_range, (list, tuple)):
+                try:
+                    shifts = int(max(shift_range))
+                except (TypeError, ValueError):
+                    shifts = int(shifts)
+
+    diag["resolved_overlap"] = overlap
+    diag["resolved_shifts"] = shifts
 
     if diag["synthetic_requested"]:
         synthetic = SyntheticMDXSeparator(sample_rate=mix_stem.sr, hop_length=stage_a_out.meta.hop_length)
