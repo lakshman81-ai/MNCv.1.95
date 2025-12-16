@@ -233,14 +233,19 @@ def run_pipeline_on_audio(
     config: PipelineConfig,
     audio_type: AudioType = AudioType.MONOPHONIC,
     audio_path: Optional[str] = None,
+    allow_separation: bool = False,
 ) -> Dict[str, Any]:
     """Run full pipeline on raw audio array."""
 
     # Synthetic benchmarks do not require source separation and the default Demucs
-    # model download can fail in offline environments. Disable separation here to
-    # keep the ladder runnable without external network access.
-    if config.stage_b.separation.get("enabled", False):
+    # model download can fail in offline environments. Disable separation unless
+    # the caller explicitly opts in (e.g., to test melody isolation on L2).
+    if config.stage_b.separation.get("enabled", False) and not allow_separation:
         config.stage_b.separation["enabled"] = False
+    elif allow_separation:
+        harmonic_mask = config.stage_b.separation.setdefault("harmonic_masking", {})
+        harmonic_mask["enabled"] = True
+        harmonic_mask.setdefault("mask_width", 0.03)
 
     # 1. Stage A (Manual construction since we have raw audio, but let's simulate Stage A output)
     # We can skip load_and_preprocess if we already have the array, but we should fill meta correctly.
@@ -354,8 +359,10 @@ class BenchmarkSuite:
     def _poly_config(self, use_harmonic_masking: bool = False) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
-        config.stage_b.separation["synthetic_model"] = False
+        config.stage_b.separation["synthetic_model"] = True
         config.stage_b.separation["harmonic_masking"]["enabled"] = use_harmonic_masking
+        if use_harmonic_masking:
+            config.stage_b.separation["harmonic_masking"]["mask_width"] = 0.03
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
         return config
 
@@ -543,11 +550,18 @@ class BenchmarkSuite:
         gt_melody = [(72, 0.0, 0.5), (76, 0.5, 1.0), (79, 1.0, 1.5)]
 
         config = PipelineConfig()
-        config.stage_b.separation['enabled'] = False
-        # Enable separation if possible, or assume dominant melody extraction works
-        # config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['synthetic_model'] = True
+        config.stage_b.separation['harmonic_masking']['enabled'] = True
+        config.stage_b.separation['harmonic_masking']['mask_width'] = 0.03
 
-        res = run_pipeline_on_audio(mix, sr, config, AudioType.POLYPHONIC_DOMINANT)
+        res = run_pipeline_on_audio(
+            mix,
+            sr,
+            config,
+            AudioType.POLYPHONIC_DOMINANT,
+            allow_separation=True,
+        )
 
         m = self._save_run("L2", "melody_plus_bass_synthetic_sep", res, gt_melody)
 
@@ -567,7 +581,13 @@ class BenchmarkSuite:
         # High-capacity frontend experiment (CREPE + RMVPE)
         exp_config = self._poly_config(use_harmonic_masking=True)
         self._enable_high_capacity_frontend(exp_config)
-        exp_res = run_pipeline_on_audio(mix, sr, exp_config, AudioType.POLYPHONIC_DOMINANT)
+        exp_res = run_pipeline_on_audio(
+            mix,
+            sr,
+            exp_config,
+            AudioType.POLYPHONIC_DOMINANT,
+            allow_separation=True,
+        )
         m_exp = self._save_run("L2", "melody_plus_bass_crepe_rmvpe", exp_res, gt_melody)
         logger.info(f"L2 CREPE/RMVPE Complete. F1: {m_exp['note_f1']}")
 

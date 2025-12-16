@@ -128,7 +128,14 @@ class SyntheticMDXSeparator:
 
         scores = {}
         for name, tmpl in self.templates.items():
-            # cosine similarity
+            # cosine similarity with length alignment so template granularity
+            # doesn't depend on the input duration
+            if len(tmpl) != len(spec):
+                x_old = np.linspace(0.0, 1.0, len(tmpl))
+                x_new = np.linspace(0.0, 1.0, len(spec))
+                tmpl = np.interp(x_new, x_old, tmpl)
+                tmpl = tmpl / (np.linalg.norm(tmpl) + 1e-9)
+
             score = float(np.dot(spec, tmpl))
             scores[name] = score
         return scores
@@ -690,13 +697,13 @@ def extract_features(
                 audio_path=stage_a_out.meta.audio_path,
             )
             augmented_stems.update(synthetic)
-            harmonic_mask_applied = bool(synthetic)
+            harmonic_mask_applied = bool(synthetic) or harmonic_cfg.get("enabled", False)
 
     stems_for_processing = augmented_stems
     polyphonic_context = polyphonic_context or len(stems_for_processing) > 1 or b_conf.polyphonic_peeling.get("force_on_mix", False)
 
     # 2. Process Stems
-    for stem_name, stem in resolved_stems.items():
+    for stem_name, stem in stems_for_processing.items():
         audio = stem.audio
         per_detector[stem_name] = {}
 
