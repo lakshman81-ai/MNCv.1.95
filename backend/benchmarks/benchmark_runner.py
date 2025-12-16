@@ -373,7 +373,11 @@ class BenchmarkSuite:
                     f"Regression gate: end-to-end latency {total_ms:.2f}ms exceeds budget {latency_budget}ms"
                 )
 
-    def _poly_config(self, use_harmonic_masking: bool = False) -> PipelineConfig:
+    def _poly_config(
+        self,
+        use_harmonic_masking: bool = False,
+        use_poly_dominant_segmentation: bool = False,
+    ) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
         config.stage_b.separation["synthetic_model"] = True
@@ -381,7 +385,22 @@ class BenchmarkSuite:
         if use_harmonic_masking:
             config.stage_b.separation["harmonic_masking"]["mask_width"] = 0.03
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
+        if use_poly_dominant_segmentation:
+            self._apply_poly_dominant_segmentation(config)
         return config
+
+    def _apply_poly_dominant_segmentation(self, config: PipelineConfig) -> None:
+        config.stage_c.segmentation_method["preset"] = "poly_dominant_strict"
+        config.stage_c.min_note_duration_ms_poly = max(
+            float(config.stage_c.min_note_duration_ms_poly), 95.0
+        )
+        config.stage_c.polyphonic_confidence["melody"] = max(
+            float(config.stage_c.polyphonic_confidence.get("melody", 0.0)), 0.5
+        )
+        config.stage_c.polyphonic_confidence["accompaniment"] = max(
+            float(config.stage_c.polyphonic_confidence.get("accompaniment", 0.0)),
+            config.stage_c.polyphonic_confidence["melody"],
+        )
 
     def _enable_high_capacity_frontend(self, config: PipelineConfig) -> None:
         config.stage_b.detectors["crepe"]["enabled"] = True
@@ -597,7 +616,10 @@ class BenchmarkSuite:
         logger.info(f"L2 Complete. F1: {m['note_f1']}")
 
         # High-capacity frontend experiment (CREPE + RMVPE)
-        exp_config = self._poly_config(use_harmonic_masking=True)
+        exp_config = self._poly_config(
+            use_harmonic_masking=True,
+            use_poly_dominant_segmentation=True,
+        )
         self._enable_high_capacity_frontend(exp_config)
         exp_res = run_pipeline_on_audio(
             mix,
