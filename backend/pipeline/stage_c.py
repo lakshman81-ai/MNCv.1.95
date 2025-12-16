@@ -92,6 +92,8 @@ def _segment_monophonic(
     gap_tolerance_s: float,
     semitone_stability: float = 0.60,
     min_rms: float = 0.01,
+    conf_start: float | None = None,
+    conf_end: float | None = None,
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
@@ -115,7 +117,10 @@ def _segment_monophonic(
     hop_s = float(np.median(dt)) if dt.size else 0.01
     hop_s = max(1e-4, hop_s)
 
-    active = (mids > 0) & (conf >= float(conf_thr)) & (rmss >= min_rms)
+    start_thr = float(conf_start) if conf_start is not None else float(conf_thr)
+    end_thr = float(conf_end) if conf_end is not None else float(conf_thr)
+
+    active = (mids > 0) & (conf >= start_thr) & (rmss >= min_rms)
 
     segs: List[Tuple[int, int]] = []
     i = 0
@@ -167,7 +172,8 @@ def _segment_monophonic(
                 gap = 0.0
             else:
                 gap += hop_s
-                if gap > float(gap_tolerance_s):
+                # Allow brief dips down to end_thr before splitting
+                if conf[i] < end_thr or gap > float(gap_tolerance_s):
                     break
             i += 1
 
@@ -215,6 +221,10 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     # Thresholds (read from config if available)
     base_conf = float(_get(config, "stage_c.confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
+    hyst_conf = _get(config, "stage_c.confidence_hysteresis", {}) or {}
+    start_conf = float(hyst_conf.get("start", base_conf))
+    end_conf = float(hyst_conf.get("end", base_conf))
+
     poly_conf = float(_get(config, "stage_c.polyphonic_confidence.melody", base_conf))
     accomp_conf = float(_get(config, "stage_c.polyphonic_confidence.accompaniment", poly_conf))
     conf_thr = base_conf
@@ -226,7 +236,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         except Exception:
             pass
     min_note_dur_ms_poly = _get(config, "stage_c.min_note_duration_ms_poly", None)
-    gap_tolerance_s = float(_get(config, "stage_c.gap_tolerance_s", 0.03))
+    gap_tolerance_s = float(_get(config, "stage_c.gap_tolerance_s", 0.05))
 
     # Derive semitone stability from configuration.  The config may specify
     # stage_c.pitch_tolerance_cents (e.g. 50), which we convert to a semitone
@@ -293,7 +303,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             min_note_dur_s=voice_min_dur_s,
             gap_tolerance_s=gap_tolerance_s,
             semitone_stability=semitone_stability,
-            min_rms=min_rms
+            min_rms=min_rms,
+            conf_start=max(start_conf, voice_conf_gate),
+            conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
         )
 
         # hop estimate for end time
@@ -373,28 +385,52 @@ def quantize_notes(
     bpm_source = None
     if analysis is not None:
         bpm_source = _get(analysis, "meta.tempo_bpm", None)
+        if bpm_source is None:
+            beats_seq = _get(analysis, "beats", []) or []
+            if beats_seq:
+                diffs = np.diff(sorted(beats_seq))
+                if diffs.size:
+                    median_diff = float(np.median(diffs))
+                    if median_diff > 0:
+                        bpm_source = 60.0 / median_diff
 
     if bpm_source is None:
         bpm_source = tempo_bpm
 
-    bpm = float(bpm_source) if bpm_source and bpm_source > 0 else 120.0
-    sec_per_beat = 60.0 / bpm
+    bpm = float(bpm_source) if bpm_source and bpm_source > 0 else None
+    use_soft_snap = bpm is None or not np.isfinite(bpm)
+    effective_bpm = bpm if bpm and np.isfinite(bpm) else 100.0
+    sec_per_beat = 60.0 / effective_bpm
 
     # Parse grid
     denom = 16
-    try:
-        m = grid.strip().split("/")
-        if len(m) == 2:
-            denom = int(m[1])
-        else:
-            denom = int(grid)
-    except Exception:
-        denom = 16
-    denom = max(1, denom)
+    if not use_soft_snap:
+        try:
+            m = grid.strip().split("/")
+            if len(m) == 2:
+                denom = int(m[1])
+            else:
+                denom = int(grid)
+        except Exception:
+            denom = 16
+        denom = max(1, denom)
+        # Adaptive grid: slower tempi -> coarser grid
+        if effective_bpm < 75:
+            denom = min(denom, 8)
+        elif effective_bpm > 140:
+            denom = max(denom, 32)
+    else:
+        denom = 8  # coarse snap when tempo unknown
 
-    step_beats = 4.0 / float(denom)  # in 4/4, quarter note = 1 beat
+    step_beats = 4.0 / float(max(1, denom))  # in 4/4, quarter note = 1 beat
     step_sec = sec_per_beat * step_beats
     step_sec = max(1e-4, step_sec)
+
+    if use_soft_snap:
+        durations = [float(n.end_sec - n.start_sec) for n in notes if n.end_sec > n.start_sec]
+        median_dur = float(np.median(durations)) if durations else step_sec
+        soft_step = max(0.08, min(step_sec * 1.5, median_dur * 0.5))
+        step_sec = max(step_sec, soft_step)
 
     beats_per_measure = 4
     if analysis is not None:
@@ -410,8 +446,12 @@ def quantize_notes(
         s = float(n.start_sec)
         e = float(n.end_sec)
 
-        qs = round(s / step_sec) * step_sec
-        qe = round(e / step_sec) * step_sec
+        if use_soft_snap:
+            qs = round(s / step_sec) * step_sec
+            qe = round(e / step_sec) * step_sec
+        else:
+            qs = round(s / step_sec) * step_sec
+            qe = round(e / step_sec) * step_sec
 
         if qe <= qs:
             qe = qs + max(int(min_steps), 1) * step_sec

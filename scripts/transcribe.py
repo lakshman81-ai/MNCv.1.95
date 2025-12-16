@@ -111,16 +111,7 @@ def quantize_duration(
     else:
         quantized = min(denominators, key=lambda x: abs(x - beats))
 
-    include_local_bpm = (
-        return_local_bpm
-        if return_local_bpm is not None
-        else tempo_times is not None and tempo_curve is not None
-    )
-
-    if include_local_bpm:
-        return quantized, beats, local_bpm
-
-    return quantized, beats
+    return quantized, beats, local_bpm
 
 
 def compute_tempo_curve(y, sr, hop_length):

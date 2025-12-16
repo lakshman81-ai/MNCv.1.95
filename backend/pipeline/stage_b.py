@@ -338,6 +338,68 @@ def _arrays_to_timeline(
         ))
     return timeline
 
+
+def _median_filter(signal: np.ndarray, kernel_size: int) -> np.ndarray:
+    if kernel_size <= 1:
+        return np.asarray(signal, dtype=np.float32)
+    k = int(max(1, kernel_size))
+    if k % 2 == 0:
+        k += 1
+    if SCIPY_SIGNAL is not None and hasattr(SCIPY_SIGNAL, "medfilt"):
+        return np.asarray(SCIPY_SIGNAL.medfilt(signal, kernel_size=k), dtype=np.float32)
+
+    pad = k // 2
+    padded = np.pad(signal, (pad, pad), mode="edge")
+    filtered = [np.median(padded[i : i + k]) for i in range(len(signal))]
+    return np.asarray(filtered, dtype=np.float32)
+
+
+def _apply_melody_filters(
+    f0: np.ndarray,
+    conf: np.ndarray,
+    rms: Optional[np.ndarray],
+    filter_conf: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    f0_out = np.asarray(f0, dtype=np.float32)
+    conf_out = np.asarray(conf, dtype=np.float32)
+    raw_conf = conf_out.copy()
+
+    if f0_out.size == 0:
+        return f0_out, conf_out
+
+    median_win = int(filter_conf.get("median_window", 0) or 0)
+    if median_win > 1:
+        f0_out = _median_filter(f0_out, median_win)
+
+    voiced_thr = float(filter_conf.get("voiced_prob_threshold", 0.0) or 0.0)
+    if voiced_thr > 0.0:
+        conf_out = np.where(conf_out >= voiced_thr, conf_out, 0.0)
+        if not np.any(conf_out):
+            relaxed = voiced_thr * 0.7
+            conf_out = np.where(raw_conf >= relaxed, raw_conf, 0.0)
+
+    if rms is not None and rms.size:
+        rms_gate_db = float(filter_conf.get("rms_gate_db", -40.0))
+        rms_gate = 10 ** (rms_gate_db / 20.0)
+        conf_out = np.where(rms >= rms_gate, conf_out, 0.0)
+
+    fmin = float(filter_conf.get("fmin_hz", 0.0) or 0.0)
+    fmax = float(filter_conf.get("fmax_hz", 0.0) or 0.0)
+    if fmin > 0.0:
+        conf_out = np.where(f0_out >= fmin, conf_out, 0.0)
+    if fmax > 0.0:
+        conf_out = np.where(f0_out <= fmax, conf_out, 0.0)
+
+    if not np.any(conf_out) and raw_conf.size:
+        conf_out = raw_conf
+        if fmin > 0.0:
+            conf_out = np.where(f0_out >= fmin, conf_out, 0.0)
+        if fmax > 0.0:
+            conf_out = np.where(f0_out <= fmax, conf_out, 0.0)
+
+    f0_out = np.where(conf_out > 0.0, f0_out, 0.0)
+    return f0_out, conf_out
+
 def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) -> Optional[BasePitchDetector]:
     """Initialize a detector if enabled."""
     if not conf.get("enabled", False):
@@ -799,10 +861,20 @@ def extract_features(
         elif len(rms_vals) > len(merged_f0):
             rms_vals = rms_vals[:len(merged_f0)]
 
+        # Melody stabilization before skyline selection
+        filter_conf = getattr(b_conf, "melody_filtering", {}) or {}
+        merged_f0, merged_conf = _apply_melody_filters(
+            merged_f0,
+            merged_conf,
+            rms_vals,
+            filter_conf,
+        )
+
         # Build timeline with optional skyline selection from poly layers
         voicing_thr = float(b_conf.confidence_voicing_threshold)
         if polyphonic_context:
             voicing_thr = max(0.0, voicing_thr - float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0)))
+        voicing_thr = min(voicing_thr, float(filter_conf.get("voiced_prob_threshold", voicing_thr)))
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
 
@@ -864,7 +936,24 @@ def extract_features(
                 )
             )
 
+        if timeline:
+            tail_window = 0.35
+            last_pitch = next((fp.pitch_hz for fp in reversed(timeline) if fp.pitch_hz > 0.0), 0.0)
+            if last_pitch > 0.0:
+                last_midi = int(round(69.0 + 12.0 * np.log2(last_pitch / 440.0)))
+                tail_start = timeline[-1].time - tail_window
+                for fp in reversed(timeline):
+                    if fp.time < tail_start:
+                        break
+                    if fp.pitch_hz <= 0.0:
+                        fp.pitch_hz = last_pitch
+                        fp.midi = last_midi
+                        fp.confidence = max(fp.confidence, voicing_thr)
+
         stem_timelines[stem_name] = timeline
+
+        if not any(fp.pitch_hz > 0.0 for fp in timeline) and np.any(merged_f0 > 0):
+            stem_timelines[stem_name] = _arrays_to_timeline(merged_f0, merged_conf, rms_vals, sr, hop_length)
 
         # Keep secondary voices as separate layers to aid downstream segmentation/rendering
         for alt in track_buffers[1:]:

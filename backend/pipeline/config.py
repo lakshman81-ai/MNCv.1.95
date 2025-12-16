@@ -139,7 +139,7 @@ class StageBConfig:
         default_factory=lambda: {
             "max_alt_voices": 4,
             "max_jump_cents": 150.0,
-            "hangover_frames": 2,
+            "hangover_frames": 4,
             "smoothing": 0.35,
             "confidence_bias": 5.0,
         }
@@ -163,9 +163,27 @@ class StageBConfig:
                 "use_viterbi": False,
             },
             "swiftf0": {"enabled": True},
-            "yin": {"enabled": True},
+            "yin": {
+                "enabled": True,
+                "fmin": 80.0,
+                "fmax": 1000.0,
+                "hop_length": 256,
+                "frame_length": 4096,
+                "threshold": 0.08,
+            },
             "sacf": {"enabled": True},
             "cqt": {"enabled": True},
+        }
+    )
+
+    # Melody post-filtering (applied after detector merge)
+    melody_filtering: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "median_window": 5,
+            "voiced_prob_threshold": 0.4,
+            "rms_gate_db": -40.0,
+            "fmin_hz": 80.0,
+            "fmax_hz": 1000.0,
         }
     )
 
@@ -198,6 +216,15 @@ class StageCConfig:
 
     # Pitch tolerance for merging (cents)
     pitch_tolerance_cents: float = 50.0
+
+    # Allow bridging micro-gaps within sustained notes (seconds)
+    gap_tolerance_s: float = 0.05
+
+    # Base confidence threshold and hysteresis for note activation
+    confidence_threshold: float = 0.25
+    confidence_hysteresis: Dict[str, float] = field(
+        default_factory=lambda: {"start": 0.6, "end": 0.4}
+    )
 
     # Gap filling (legato) in ms
     gap_filling: Dict[str, Any] = field(

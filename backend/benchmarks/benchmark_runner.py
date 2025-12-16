@@ -379,6 +379,7 @@ class BenchmarkSuite:
         mask_width: float = 0.03,
         enable_high_capacity: bool = True,
         use_crepe_viterbi: bool = True,
+        use_poly_dominant_segmentation: bool = False,
     ) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
@@ -393,10 +394,30 @@ class BenchmarkSuite:
             "overlap_candidates": [0.5, 0.75],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
+        config.stage_b.polyphonic_peeling["max_layers"] = 1
+        config.stage_b.melody_filtering.update({
+            "median_window": 7,
+            "voiced_prob_threshold": 0.45,
+            "rms_gate_db": -38.0,
+            "fmin_hz": 80.0,
+            "fmax_hz": 1400.0,
+        })
+        yin_conf = config.stage_b.detectors.get("yin", {})
+        yin_conf.update({
+            "hop_length": 256,
+            "frame_length": 4096,
+            "fmin": 80.0,
+            "fmax": 1200.0,
+        })
+        config.stage_b.detectors["yin"] = yin_conf
         if enable_high_capacity:
             self._enable_high_capacity_frontend(config, use_crepe_viterbi)
         if use_poly_dominant_segmentation:
             self._apply_poly_dominant_segmentation(config)
+        config.stage_c.gap_tolerance_s = max(getattr(config.stage_c, "gap_tolerance_s", 0.07), 0.07)
+        config.stage_c.pitch_tolerance_cents = max(getattr(config.stage_c, "pitch_tolerance_cents", 50.0), 60.0)
+        config.stage_c.min_note_duration_ms_poly = max(getattr(config.stage_c, "min_note_duration_ms_poly", 120.0), 150.0)
+        config.stage_c.confidence_hysteresis.update({"start": 0.6, "end": 0.4})
         return config
 
     def _apply_poly_dominant_segmentation(self, config: PipelineConfig) -> None:
