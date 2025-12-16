@@ -131,6 +131,11 @@ class StageBConfig:
             "validator_min_disagree_frames": 2,
             "max_harmonics": 12,
             "force_on_mix": True,
+            # Adaptive ISS (WI Feature E)
+            "iss_adaptive": False,
+            "strength_min": 0.8,
+            "strength_max": 1.2,
+            "flatness_thresholds": [0.3, 0.6],  # [low, high]
         }
     )
 
@@ -157,10 +162,12 @@ class StageBConfig:
             },
             "crepe": {
                 "enabled": False,
-                "model_capacity": "full",
-                "fmin": 190.0,
-                "fmax": 3500.0,
+                "model_capacity": "small",  # "tiny"|"small"|"medium"|"large"|"full"
+                "fmin": 80.0,
+                "fmax": 1000.0,
                 "use_viterbi": False,
+                "step_ms": 10,
+                "conf_threshold": 0.5,
             },
             "swiftf0": {"enabled": True},
             "yin": {
@@ -170,9 +177,18 @@ class StageBConfig:
                 "hop_length": 256,
                 "frame_length": 4096,
                 "threshold": 0.08,
+                # Multi-resolution + Octave Correction (WI Feature C)
+                "enable_multires_f0": False,
+                "enable_octave_correction": False,
+                "octave_jump_penalty": 0.35,
             },
             "sacf": {"enabled": True},
-            "cqt": {"enabled": True},
+            "cqt": {
+                "enabled": True,
+                # Morphological filtering (WI Feature D)
+                "enable_salience_morphology": False,
+                "morph_kernel": 3,
+            },
         }
     )
 
@@ -184,6 +200,16 @@ class StageBConfig:
             "rms_gate_db": -40.0,
             "fmin_hz": 80.0,
             "fmax_hz": 1000.0,
+        }
+    )
+
+    # Onsets & Frames (WI Feature B)
+    onsets_and_frames: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "onset_threshold": 0.5,
+            "frame_threshold": 0.5,
+            "min_note_duration_ms": 30,
         }
     )
 

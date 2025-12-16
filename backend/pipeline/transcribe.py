@@ -3,8 +3,8 @@ High-level transcription orchestrator.
 
 Pipeline:
     Stage A: load_and_preprocess
-    Stage B: extract_features
-    Stage C: apply_theory
+    Stage B: extract_features (OR neural_transcription if enabled)
+    Stage C: apply_theory (skipped if neural_transcription used)
     Stage D: quantize_and_render
 
 Contract (as used in tests/test_pipeline_flow.py):
@@ -29,9 +29,11 @@ from .stage_a import load_and_preprocess
 from .stage_b import extract_features
 from .stage_c import apply_theory
 from .stage_d import quantize_and_render
-from .models import AnalysisData, StageAOutput, TranscriptionResult
+from .neural_transcription import transcribe_onsets_frames
+from .models import AnalysisData, StageAOutput, TranscriptionResult, StageBOutput
 from .validation import validate_invariants, dump_resolved_config
 from .instrumentation import PipelineLogger
+import numpy as np
 
 
 def transcribe(
@@ -90,6 +92,79 @@ def transcribe(
     )
 
     # --------------------------------------------------------
+    # Pipeline Branch: Onsets & Frames (Feature B)
+    # --------------------------------------------------------
+    # If O&F is enabled and functional, we skip classical B/C and go straight to D.
+    of_notes = []
+    of_diag = {}
+
+    # Check if enabled in config
+    if config.stage_b.onsets_and_frames.get("enabled", False):
+        t_of = time.perf_counter()
+
+        # We need the mix audio. Stage A provides stems["mix"].
+        mix_audio = stage_a_out.stems["mix"].audio
+        sr = stage_a_out.meta.sample_rate
+
+        of_notes, of_diag = transcribe_onsets_frames(mix_audio, sr, config)
+
+        pipeline_logger.record_timing(
+            "onsets_frames",
+            time.perf_counter() - t_of,
+            metadata=of_diag
+        )
+
+        if of_diag.get("run", False):
+            pipeline_logger.log_event("pipeline", "branch_switch", {"mode": "onsets_frames"})
+
+    if of_notes:
+        # --------------------------------------------------------
+        # Bypass Stage B/C -> Stage D
+        # --------------------------------------------------------
+        # We construct AnalysisData with the detected notes.
+        # We leave stem_timelines empty or minimal.
+
+        analysis_data = AnalysisData(
+            meta=stage_a_out.meta,
+            timeline=[], # No FramePitch timeline from O&F
+            stem_timelines={},
+            notes=of_notes,
+            pitch_tracker="onsets_frames"
+        )
+
+        # We skip apply_theory, but we must populate analysis_data.events or notes
+        # which we did above.
+
+        # --------------------------------------------------------
+        # Stage D: Quantization + MusicXML Rendering
+        # --------------------------------------------------------
+        t_d = time.perf_counter()
+        d_out: TranscriptionResult = quantize_and_render(
+            of_notes,
+            analysis_data,
+            config=config,
+        )
+
+        pipeline_logger.record_timing(
+            "stage_d",
+            time.perf_counter() - t_d,
+            metadata={"beats_detected": len(d_out.analysis_data.beats), "mode": "onsets_frames"},
+        )
+
+        pipeline_logger.log_event(
+            "pipeline",
+            "complete",
+            {"notes": len(d_out.analysis_data.notes), "run_dir": pipeline_logger.run_dir, "mode": "onsets_frames"},
+        )
+        pipeline_logger.finalize()
+
+        return TranscriptionResult(
+            musicxml=d_out.musicxml,
+            analysis_data=d_out.analysis_data,
+            midi_bytes=d_out.midi_bytes
+        )
+
+    # --------------------------------------------------------
     # Stage B: Feature Extraction (Detectors + Ensemble)
     # --------------------------------------------------------
     pipeline_logger.log_event(
@@ -113,6 +188,8 @@ def transcribe(
             "resolved_hop": stage_a_out.meta.hop_length,
             "resolved_window": stage_a_out.meta.window_size,
             "detectors_run": list(stage_b_out.per_detector.get("mix", {}).keys()),
+            "crepe_used": "crepe" in list(stage_b_out.per_detector.get("mix", {}).keys()),
+            "iss_layers": stage_b_out.diagnostics.get("iss", {}).get("layers_found", 0),
         },
     )
 
@@ -166,11 +243,6 @@ def transcribe(
         {"notes": len(d_out.analysis_data.notes), "run_dir": pipeline_logger.run_dir},
     )
     pipeline_logger.finalize()
-
-    # d_out contains musicxml, analysis_data, and midi_bytes.
-    # Ensure we return a TranscriptionResult with all fields.
-    # analysis_data was updated in-place by quantize_and_render (it adds beats, etc.)
-    # but d_out.analysis_data is safer to use.
 
     return TranscriptionResult(
         musicxml=d_out.musicxml,
