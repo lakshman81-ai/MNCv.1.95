@@ -58,6 +58,16 @@ def _velocity_from_rms(rms_list: List[float], vmin: int = 20, vmax: int = 105) -
     return int(max(vmin, min(vmax, v)))
 
 
+def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
+    if len(timeline) < 2:
+        return 0.01
+    dt = [timeline[i].time - timeline[i - 1].time for i in range(1, min(len(timeline), 50))]
+    if not dt:
+        return 0.01
+    hop_s = float(np.median(dt))
+    return max(1e-4, hop_s)
+
+
 def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float = 35.0) -> bool:
     """Return True when active_pitches include clearly different layers.
 
@@ -184,6 +194,104 @@ def _segment_monophonic(
     return segs
 
 
+def _viterbi_voicing_mask(
+    timeline: List[FramePitch],
+    conf_weight: float,
+    energy_weight: float,
+    transition_penalty: float,
+    stay_bonus: float,
+    silence_bias: float,
+) -> np.ndarray:
+    if len(timeline) == 0:
+        return np.zeros(0, dtype=bool)
+
+    mids = np.array([fp.midi if fp.midi is not None else -1 for fp in timeline], dtype=np.float64)
+    conf = np.clip(np.array([fp.confidence for fp in timeline], dtype=np.float64), 0.0, 1.0)
+    rms = np.array([fp.rms for fp in timeline], dtype=np.float64)
+
+    # Normalize RMS to [0,1] range to support use as a confidence prior
+    rms_norm = rms.copy()
+    if np.any(rms_norm > 0):
+        rms_norm /= float(np.percentile(rms_norm[rms_norm > 0], 95))
+    rms_norm = np.clip(rms_norm, 0.0, 1.0)
+
+    voiced_score = conf_weight * conf + energy_weight * rms_norm
+    silence_score = (1.0 - conf_weight) * (1.0 - conf) + (1.0 - energy_weight) * (1.0 - rms_norm) + silence_bias
+
+    n = len(timeline)
+    voiced_cost = np.zeros(n, dtype=np.float64)
+    silence_cost = np.zeros(n, dtype=np.float64)
+    backpointer = np.zeros((n, 2), dtype=np.int8)
+
+    voiced_cost[0] = -voiced_score[0]
+    silence_cost[0] = -silence_score[0]
+
+    for i in range(1, n):
+        # Transition into voiced
+        stay_voiced = voiced_cost[i - 1] - stay_bonus
+        switch_to_voiced = silence_cost[i - 1] + transition_penalty
+        if stay_voiced <= switch_to_voiced:
+            voiced_cost[i] = stay_voiced
+            backpointer[i, 1] = 1  # came from voiced
+        else:
+            voiced_cost[i] = switch_to_voiced
+            backpointer[i, 1] = 0  # came from silence
+        voiced_cost[i] -= voiced_score[i]
+
+        # Transition into silence
+        stay_silence = silence_cost[i - 1] - stay_bonus
+        switch_to_silence = voiced_cost[i - 1] + transition_penalty
+        if stay_silence <= switch_to_silence:
+            silence_cost[i] = stay_silence
+            backpointer[i, 0] = 0
+        else:
+            silence_cost[i] = switch_to_silence
+            backpointer[i, 0] = 1
+        silence_cost[i] -= silence_score[i]
+
+    # Backtrack
+    state = 1 if voiced_cost[-1] <= silence_cost[-1] else 0
+    mask = np.zeros(n, dtype=bool)
+    for i in range(n - 1, -1, -1):
+        mask[i] = state == 1 and mids[i] > 0
+        state = int(backpointer[i, state])
+
+    return mask
+
+
+def _segments_from_mask(
+    timeline: List[FramePitch],
+    mask: np.ndarray,
+    hop_s: float,
+    min_note_dur_s: float,
+    min_conf: float,
+    min_rms: float,
+) -> List[Tuple[int, int]]:
+    segs: List[Tuple[int, int]] = []
+    i = 0
+    n = len(timeline)
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        s = i
+        while i + 1 < n and mask[i + 1]:
+            i += 1
+        e = i
+
+        times = [timeline[j].time for j in range(s, e + 1)]
+        confs = [timeline[j].confidence for j in range(s, e + 1)]
+        rms_vals = [timeline[j].rms for j in range(s, e + 1)]
+
+        dur = float(times[-1] - times[0] + hop_s)
+        if dur >= min_note_dur_s and np.mean(confs) >= min_conf and np.mean(rms_vals) >= min_rms:
+            segs.append((s, e))
+
+        i += 1
+
+    return segs
+
+
 def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEvent]:
     """
     Convert FramePitch timelines into NoteEvent list.
@@ -268,6 +376,15 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     notes: List[NoteEvent] = []
 
+    seg_cfg = _get(config, "stage_c.segmentation_method", {}) or {}
+    seg_method = str(seg_cfg.get("method", "threshold")).lower()
+    smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", False))
+    transition_penalty = float(seg_cfg.get("transition_penalty", 0.8))
+    stay_bonus = float(seg_cfg.get("stay_bonus", 0.05))
+    silence_bias = float(seg_cfg.get("silence_bias", 0.1))
+    energy_weight = float(seg_cfg.get("energy_weight", 0.35))
+    conf_weight = max(0.0, min(1.0, 1.0 - energy_weight))
+
     for vidx, (vname, timeline) in enumerate(timelines_to_process):
         # Detect polyphonic context based on active pitch annotations
         poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
@@ -297,20 +414,37 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             # Secondary timelines without explicit poly layers still use a stricter gate.
             voice_conf_gate = max(voice_conf_gate, accomp_conf)
 
-        segs = _segment_monophonic(
-            timeline=timeline,
-            conf_thr=voice_conf_gate,
-            min_note_dur_s=voice_min_dur_s,
-            gap_tolerance_s=gap_tolerance_s,
-            semitone_stability=semitone_stability,
-            min_rms=min_rms,
-            conf_start=max(start_conf, voice_conf_gate),
-            conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
-        )
+        hop_s = _estimate_hop_seconds(timeline)
 
-        # hop estimate for end time
-        dt = [timeline[i].time - timeline[i - 1].time for i in range(1, min(len(timeline), 50))]
-        hop_s = float(np.median(dt)) if dt else 0.01
+        use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+        if use_viterbi:
+            mask = _viterbi_voicing_mask(
+                timeline,
+                conf_weight=conf_weight,
+                energy_weight=energy_weight,
+                transition_penalty=transition_penalty,
+                stay_bonus=stay_bonus,
+                silence_bias=silence_bias,
+            )
+            segs = _segments_from_mask(
+                timeline=timeline,
+                mask=mask,
+                hop_s=hop_s,
+                min_note_dur_s=voice_min_dur_s,
+                min_conf=voice_conf_gate,
+                min_rms=min_rms,
+            )
+        else:
+            segs = _segment_monophonic(
+                timeline=timeline,
+                conf_thr=voice_conf_gate,
+                min_note_dur_s=voice_min_dur_s,
+                gap_tolerance_s=gap_tolerance_s,
+                semitone_stability=semitone_stability,
+                min_rms=min_rms,
+                conf_start=max(start_conf, voice_conf_gate),
+                conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+            )
 
         for (s, e) in segs:
             mids = [timeline[i].midi for i in range(s, e + 1) if timeline[i].midi is not None and timeline[i].midi > 0]

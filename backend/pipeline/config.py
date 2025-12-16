@@ -197,8 +197,14 @@ class StageCConfig:
     # Segmentation method selection + HMM defaults
     segmentation_method: Dict[str, Any] = field(
         default_factory=lambda: {
-            "method": "hmm",  # "hmm" | "threshold" | "rms_gate"
+            "method": "hmm",  # "hmm" | "viterbi" | "threshold" | "rms_gate"
             "states": ["attack", "sustain", "silence"],
+            # Optional state smoothing; defaults to off to preserve historical behaviour
+            "use_state_smoothing": False,
+            "transition_penalty": 0.8,
+            "stay_bonus": 0.05,
+            "silence_bias": 0.1,
+            "energy_weight": 0.35,
         }
     )
 

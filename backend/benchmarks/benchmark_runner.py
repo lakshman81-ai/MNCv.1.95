@@ -27,6 +27,7 @@ from dataclasses import asdict
 from music21 import tempo, chord
 
 from backend.pipeline.config import PipelineConfig, InstrumentProfile
+from backend.pipeline.instrumentation import PipelineLogger
 from backend.pipeline.models import (
     StageAOutput, MetaData, Stem, AnalysisData, AudioType, NoteEvent
 )
@@ -34,7 +35,7 @@ from backend.pipeline.stage_a import load_and_preprocess
 from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory, quantize_notes
 from backend.pipeline.stage_d import quantize_and_render
-from backend.benchmarks.metrics import note_f1, onset_offset_mae
+from backend.benchmarks.metrics import note_f1, onset_offset_mae, dtw_note_f1, dtw_onset_error_ms
 from backend.benchmarks.run_real_songs import run_song as run_real_song
 from backend.benchmarks.ladder.generators import generate_benchmark_example
 from backend.benchmarks.ladder.synth import midi_to_wav_synth
@@ -237,6 +238,7 @@ def run_pipeline_on_audio(
     audio_type: AudioType = AudioType.MONOPHONIC,
     audio_path: Optional[str] = None,
     allow_separation: bool = False,
+    pipeline_logger: Optional[PipelineLogger] = None,
 ) -> Dict[str, Any]:
     """Run full pipeline on raw audio array."""
 
@@ -264,9 +266,20 @@ def run_pipeline_on_audio(
         crepe_cfg["use_viterbi"] = True
         config.stage_b.detectors["crepe"] = crepe_cfg
 
+    pipeline_logger = pipeline_logger or PipelineLogger()
+
     # 1. Stage A (Manual construction since we have raw audio, but let's simulate Stage A output)
     # We can skip load_and_preprocess if we already have the array, but we should fill meta correctly.
     t_start = time.perf_counter()
+    pipeline_logger.log_event(
+        "stage_a",
+        "start",
+        {
+            "audio_path": audio_path or "synthetic",
+            "audio_type": audio_type.value,
+            "detector_preferences": config.stage_b.detectors,
+        },
+    )
     meta = MetaData(
         sample_rate=sr,
         target_sr=sr,
@@ -288,17 +301,44 @@ def run_pipeline_on_audio(
 
     stage_a_out = StageAOutput(stems=stems, meta=meta, audio_type=audio_type)
     t_stage_a = time.perf_counter() - t_start
+    pipeline_logger.record_timing(
+        "stage_a",
+        t_stage_a,
+        metadata={"sample_rate": sr, "hop_length": meta.hop_length, "window_size": meta.window_size},
+    )
 
     # 2. Stage B
+    pipeline_logger.log_event(
+        "stage_b",
+        "detector_selection",
+        {
+            "detectors": config.stage_b.detectors,
+            "dependencies": PipelineLogger.dependency_snapshot(["torch", "crepe", "demucs"]),
+        },
+    )
     t_b_start = time.perf_counter()
     stage_b_out = extract_features(stage_a_out, config=config)
     t_stage_b = time.perf_counter() - t_b_start
+    pipeline_logger.record_timing(
+        "stage_b",
+        t_stage_b,
+        metadata={"detectors_run": list(stage_b_out.per_detector.get("mix", {}).keys())},
+    )
 
     # 3. Stage C
+    pipeline_logger.log_event(
+        "stage_c",
+        "segmentation",
+        {
+            "method": config.stage_c.segmentation_method.get("method"),
+            "pitch_tolerance_cents": config.stage_c.pitch_tolerance_cents,
+        },
+    )
     t_c_start = time.perf_counter()
     analysis = AnalysisData(meta=meta, stem_timelines=stage_b_out.stem_timelines)
     notes_pred = apply_theory(analysis, config=config)
     t_stage_c = time.perf_counter() - t_c_start
+    pipeline_logger.record_timing("stage_c", t_stage_c, metadata={"note_count": len(notes_pred)})
 
     # 4. Stage D (Verify it runs, though we check notes mostly)
     t_d_start = time.perf_counter()
@@ -308,6 +348,9 @@ def run_pipeline_on_audio(
         logger.warning(f"Stage D failed: {e}")
         transcription_result = None
     t_stage_d = time.perf_counter() - t_d_start
+    pipeline_logger.record_timing(
+        "stage_d", t_stage_d, metadata={"beats_detected": len(getattr(analysis, "beats", []))}
+    )
 
     stage_timings = {
         "stage_a_s": t_stage_a,
@@ -331,6 +374,17 @@ def run_pipeline_on_audio(
         "midi_bytes": bool(getattr(transcription_result, "midi_bytes", b"")),
         "timeline": bool(stage_b_out.stem_timelines),
     }
+
+    pipeline_logger.log_event(
+        "pipeline",
+        "complete",
+        {
+            "notes": len(notes_pred),
+            "run_dir": pipeline_logger.run_dir,
+            "context": "benchmark",
+        },
+    )
+    pipeline_logger.finalize()
 
     return {
         "notes": notes_pred,
@@ -481,18 +535,26 @@ class BenchmarkSuite:
         # Calculate Metrics
         f1 = note_f1(pred_list, gt, onset_tol=0.05)
         onset_mae, offset_mae = onset_offset_mae(pred_list, gt)
+        dtw_f1 = dtw_note_f1(pred_list, gt, onset_tol=0.05)
+        dtw_onset_ms = dtw_onset_error_ms(pred_list, gt)
 
         # Normalize NaNs for downstream checks/serialization
         if np.isnan(f1):
             f1 = 0.0
+        if np.isnan(dtw_f1):
+            dtw_f1 = None
         if onset_mae is not None and np.isnan(onset_mae):
             onset_mae = None
+        if dtw_onset_ms is not None and np.isnan(dtw_onset_ms):
+            dtw_onset_ms = None
 
         metrics = {
             "level": level,
             "name": name,
             "note_f1": f1,
             "onset_mae_ms": onset_mae * 1000 if onset_mae is not None else None,
+            "dtw_note_f1": dtw_f1,
+            "dtw_onset_error_ms": dtw_onset_ms,
             "predicted_count": len(pred_list),
             "gt_count": len(gt)
         }
