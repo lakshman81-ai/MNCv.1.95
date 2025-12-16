@@ -1,11 +1,19 @@
 {
   "detectors_ran": [
+    "rmvpe",
+    "crepe",
+    "swiftf0",
+    "yin",
     "sacf",
     "cqt"
   ],
   "diagnostics": {
     "polyphonic_context": true,
     "detectors_initialized": [
+      "rmvpe",
+      "crepe",
+      "swiftf0",
+      "yin",
       "sacf",
       "cqt"
     ],
@@ -24,9 +32,9 @@
       "n_harmonics": 12
     },
     "iss": {
-      "enabled": false,
-      "layers_found": 0,
-      "max_layers": 0
+      "enabled": true,
+      "layers_found": 1,
+      "max_layers": 3
     },
     "skyline_mode": "skyline_top_voice",
     "voice_tracking": {
@@ -95,7 +103,7 @@
         "crepe": 0.5
       },
       "polyphonic_peeling": {
-        "max_layers": 0,
+        "max_layers": 3,
         "mask_width": 0.03,
         "min_mask_width": 0.02,
         "max_mask_width": 0.08,
@@ -121,24 +129,24 @@
       },
       "detectors": {
         "rmvpe": {
-          "enabled": false,
+          "enabled": true,
           "fmin": 50.0,
           "fmax": 1200.0,
           "hop_length": 160,
           "silence_threshold": 0.04
         },
         "crepe": {
-          "enabled": false,
+          "enabled": true,
           "model_capacity": "full",
           "fmin": 190.0,
           "fmax": 3500.0,
           "use_viterbi": false
         },
         "swiftf0": {
-          "enabled": false
+          "enabled": true
         },
         "yin": {
-          "enabled": false
+          "enabled": true
         },
         "sacf": {
           "enabled": true
@@ -198,5 +206,27 @@
       }
     },
     "instrument_profiles": []
+  },
+  "stage_timings": {
+    "stage_a_s": 3.8808999761386076e-05,
+    "stage_b_s": 4.34844641699965,
+    "stage_c_s": 0.0032543730003453675,
+    "stage_d_s": 0.09072333499989327,
+    "total_s": 4.44246293399965
+  },
+  "detector_confidences": {
+    "mix": {
+      "rmvpe": 0.9898478388786316,
+      "crepe": 0.9898660182952881,
+      "swiftf0": 0.9898478388786316,
+      "yin": 0.9496781826019287,
+      "sacf": 0.9898478388786316,
+      "cqt": 1.0
+    }
+  },
+  "artifacts_present": {
+    "musicxml": true,
+    "midi_bytes": true,
+    "timeline": true
   }
 }
