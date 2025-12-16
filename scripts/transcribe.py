@@ -111,7 +111,10 @@ def quantize_duration(
     else:
         quantized = min(denominators, key=lambda x: abs(x - beats))
 
-    return quantized, beats, local_bpm
+    if return_local_bpm:
+        return quantized, beats, local_bpm
+
+    return quantized, beats
 
 
 def compute_tempo_curve(y, sr, hop_length):
@@ -600,6 +603,7 @@ def main():
             tempo_curve,
             params["rhythmic_denominators"],
             classifier=duration_classifier,
+            return_local_bpm=True,
         )
 
         m21_note = music21.note.Note(n["midi"])
