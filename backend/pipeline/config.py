@@ -319,6 +319,22 @@ class StageDConfig:
 
 
 # ------------------------------------------------------------
+# Segmented Transcription Config (Auto-Retry)
+# ------------------------------------------------------------
+
+@dataclass
+class SegmentedTranscriptionConfig:
+    enabled: bool = False
+    segment_sec: float = 10.0
+    overlap_sec: float = 2.0
+    retry_quality_threshold: float = 0.9
+    retry_max_candidates: int = 3
+    # Density heuristic parameters
+    density_target_notes_per_sec: float = 4.0
+    density_penalty_span: float = 6.0
+
+
+# ------------------------------------------------------------
 # Instrument Profiles
 # ------------------------------------------------------------
 
@@ -345,6 +361,7 @@ class PipelineConfig:
     stage_b: StageBConfig = field(default_factory=StageBConfig)
     stage_c: StageCConfig = field(default_factory=StageCConfig)
     stage_d: StageDConfig = field(default_factory=StageDConfig)
+    segmented_transcription: SegmentedTranscriptionConfig = field(default_factory=SegmentedTranscriptionConfig)
     instrument_profiles: List[InstrumentProfile] = field(default_factory=list)
 
     def get_profile(self, instrument_name: str) -> Optional[InstrumentProfile]:
