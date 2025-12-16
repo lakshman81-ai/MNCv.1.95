@@ -18,16 +18,6 @@ except Exception as e:  # pragma: no cover
     librosa = None  # type: ignore
     _LIBROSA_IMPORT_ERR = e  # type: ignore
 
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
-try:
-    import crepe  # type: ignore
-except Exception:  # pragma: no cover
-    crepe = None  # type: ignore
-
 
 # --------------------------------------------------------------------------------------
 # Utility
@@ -193,18 +183,21 @@ def iterative_spectral_subtraction(
     validator_min_disagree_frames: int = 2,
     max_harmonics: int = 12,
     audio_path: Optional[str] = None,
+    # Adaptive ISS params (Feature E)
+    iss_adaptive: bool = False,
+    strength_min: float = 0.8,
+    strength_max: float = 1.2,
+    flatness_thresholds: Optional[List[float]] = None,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
-    Iterative spectral subtraction ("peeling"):
-      1) Detect dominant f0 on residual
-      2) Build harmonic mask and suppress those bins
-      3) ISTFT back to residual and repeat
-
-    Returns list of (f0, conf) per extracted layer.
+    Iterative spectral subtraction ("peeling") with optional adaptive scheduling.
     """
     y = np.asarray(audio, dtype=np.float32).reshape(-1)
     if y.size == 0:
         return []
+
+    if flatness_thresholds is None:
+        flatness_thresholds = [0.3, 0.6]
 
     hop = _safe_int(getattr(primary_detector, "hop_length", 512), 512)
     n_fft = _safe_int(getattr(primary_detector, "n_fft", 2048), 2048)
@@ -239,6 +232,9 @@ def iterative_spectral_subtraction(
             lengths[i] = run
         return lengths
 
+    def _lerp(a: float, b: float, t: float) -> float:
+        return a + (b - a) * np.clip(t, 0.0, 1.0)
+
     for _layer in range(int(max_polyphony)):
         f0, conf = primary_detector.predict(residual, audio_path=audio_path)
 
@@ -247,14 +243,13 @@ def iterative_spectral_subtraction(
         f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
         conf = np.asarray(conf, dtype=np.float32).reshape(-1)
 
-        # Optional validator gate with temporal smoothing
+        # Optional validator gate
         if validator_detector is not None:
             try:
                 vf0, vconf = validator_detector.predict(residual, audio_path=audio_path)
                 vf0 = np.asarray(vf0, dtype=np.float32).reshape(-1)
                 vconf = np.asarray(vconf, dtype=np.float32).reshape(-1)
 
-                # If validator mostly unvoiced, stop early
                 if np.mean((vf0 > 0.0).astype(np.float32)) < 0.05:
                     break
 
@@ -272,13 +267,11 @@ def iterative_spectral_subtraction(
                 gate = agree_smooth + (1.0 - agree_smooth) * float(validator_disagree_decay)
                 gate = np.clip(gate, 0.0, 1.0)
 
-                # Require consensus before fully accepting/rejecting
                 gate = np.where(stable_disagree, gate * float(validator_disagree_decay), gate)
                 gate = np.where(~stable_agree & ~stable_disagree, gate * 0.8, gate)
 
                 conf = conf * gate.astype(np.float32)
             except Exception:
-                # Validator should never crash peeling
                 pass
 
         voiced_ratio = float(np.mean((conf > 0.1).astype(np.float32)))
@@ -298,10 +291,8 @@ def iterative_spectral_subtraction(
                 boundary="zeros",
                 padded=True,
             )
-            # Ensure frame alignment (f0 length must match STFT time frames)
             n_frames = Z.shape[1]
             if f0.shape[0] != n_frames:
-                # pad/trim f0/conf to n_frames
                 if f0.shape[0] < n_frames:
                     pad = n_frames - f0.shape[0]
                     f0 = np.pad(f0, (0, pad))
@@ -310,26 +301,48 @@ def iterative_spectral_subtraction(
                     f0 = f0[:n_frames]
                     conf = conf[:n_frames]
 
-            # Adapt harmonics based on current F0 distribution and FFT
+            # Adaptive Schedule (Feature E)
+            magnitude = np.abs(Z).astype(np.float32)
+            flatness = _spectral_flatness(magnitude)
+
+            eff_mask_width = current_mask_width
+            eff_strength_scale = 1.0
+
+            if iss_adaptive:
+                # E2) Adapt mask/subtraction schedule
+                # If flatness high (noisy): widen mask and increase subtraction slowly
+                # If harmonic energy high (stable): narrow mask and reduce subtraction (protect melody)
+
+                # Normalize flatness to [0, 1] relative to thresholds
+                f_norm = (flatness - flatness_thresholds[0]) / (flatness_thresholds[1] - flatness_thresholds[0] + 1e-9)
+                f_norm = np.clip(f_norm, 0.0, 1.0)
+
+                # Widen mask for noisy content
+                eff_mask_width = _lerp(float(min_mask_width), float(max_mask_width), f_norm)
+
+                # Strength adaptation
+                # (Logic inverted from flatness: low flatness = high harmonicity)
+                harmonicity = 1.0 - f_norm
+                eff_strength_scale = _lerp(float(strength_max), float(strength_min), harmonicity)
+            else:
+                eff_mask_width = np.clip(current_mask_width, min_mask_width, max_mask_width)
+
             f0_valid = f0[f0 > 0.0]
             median_f0 = float(np.median(f0_valid)) if f0_valid.size else 0.0
             max_possible_h = int(float(sr) / 2.0 / max(median_f0, 1e-6)) if median_f0 > 0 else 1
             adaptive_harmonics = int(max(1, min(int(max_harmonics), max_possible_h)))
 
-            # adapt mask width to FFT bin spacing and current mask schedule
-            effective_mask_width = float(np.clip(current_mask_width, min_mask_width, max_mask_width))
-            min_band = max(bin_hz, float(effective_mask_width) * max(median_f0, 1.0) * 0.5)
+            min_band = max(bin_hz, float(eff_mask_width) * max(median_f0, 1.0) * 0.5)
 
             mask = create_harmonic_mask(
                 f0_hz=f0,
                 sr=sr,
                 n_fft=n_fft,
-                mask_width=effective_mask_width,
+                mask_width=float(eff_mask_width),
                 n_harmonics=adaptive_harmonics,
                 min_band_hz=min_band,
             )
 
-            magnitude = np.abs(Z).astype(np.float32)
             harmonic_energy = float(np.mean(magnitude * (1.0 - mask)))
             residual_energy = float(np.mean(magnitude * mask))
             harmonic_snr = 10.0 * np.log10((harmonic_energy + 1e-9) / (residual_energy + 1e-9))
@@ -339,8 +352,8 @@ def iterative_spectral_subtraction(
 
             layers.append((f0, conf))
 
-            # Apply mask softly based on conf (avoid over-subtraction)
-            strength = np.clip(conf, 0.0, 1.0).reshape(1, -1)
+            # Apply mask
+            strength = np.clip(conf, 0.0, 1.0).reshape(1, -1) * eff_strength_scale
             soft_mask = 1.0 - (1.0 - mask) * strength
             Z2 = Z * soft_mask
 
@@ -361,17 +374,16 @@ def iterative_spectral_subtraction(
             if residual_rms / base_rms < float(residual_rms_stop_ratio):
                 break
 
-            flatness = _spectral_flatness(magnitude)
             if flatness > float(residual_flatness_stop):
                 break
 
-            # Adapt mask width for the next iteration (widen when SNR drops)
-            if harmonic_snr < float(harmonic_snr_stop_db) + 3.0:
-                current_mask_width = min(float(max_mask_width), float(current_mask_width) * float(mask_growth))
-            else:
-                current_mask_width = max(float(min_mask_width), float(current_mask_width) * float(mask_shrink))
+            # Adapt base mask width for next iter if standard schedule used (fallback/concurrent)
+            if not iss_adaptive:
+                if harmonic_snr < float(harmonic_snr_stop_db) + 3.0:
+                    current_mask_width = min(float(max_mask_width), float(current_mask_width) * float(mask_growth))
+                else:
+                    current_mask_width = max(float(min_mask_width), float(current_mask_width) * float(mask_shrink))
         except Exception:
-            # If STFT fails, stop peeling (but keep what we extracted)
             break
 
     return layers
@@ -409,6 +421,7 @@ class BasePitchDetector:
         self.fmax = float(fmax)
         self.threshold = float(threshold)
         self._warned: Dict[str, bool] = {}
+        self.kwargs = kwargs # Store extra config
 
     def _warn_once(self, key: str, msg: str) -> None:
         if not self._warned.get(key, False):
@@ -422,43 +435,124 @@ class BasePitchDetector:
 class YinDetector(BasePitchDetector):
     """
     Prefers librosa.pyin when available; otherwise falls back to lightweight ACF tracker.
+    Supports Multi-Resolution F0 and Octave Error Correction (Feature C).
     """
 
     def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        # Config options (Feature C)
+        enable_multires = self.kwargs.get("enable_multires_f0", False)
+        enable_octave_corr = self.kwargs.get("enable_octave_correction", False)
+        octave_penalty = float(self.kwargs.get("octave_jump_penalty", 0.35))
+
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
         if y.size == 0:
             return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-        # librosa path
-        if librosa is not None:
-            try:
-                f0, voiced_flag, voiced_prob = librosa.pyin(
-                    y=y,
-                    fmin=float(self.fmin),
-                    fmax=float(self.fmax),
-                    sr=int(self.sr),
-                    frame_length=int(self.n_fft),
-                    hop_length=int(self.hop_length),
-                    fill_na=0.0,
-                )
-                f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
-                voiced_prob = np.asarray(voiced_prob, dtype=np.float32).reshape(-1)
-                f0 = np.where(np.isfinite(f0), f0, 0.0).astype(np.float32)
-                conf = np.where(f0 > 0.0, voiced_prob, 0.0).astype(np.float32)
-                conf = np.clip(conf, 0.0, 1.0)
-                conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-                f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
-                return f0, conf
-            except Exception:
-                # fall back below
-                pass
+        # Helper to run one pass
+        def _run_pass(frame_len: int) -> Tuple[np.ndarray, np.ndarray]:
+            if librosa is not None:
+                try:
+                    f0, _, voiced_prob = librosa.pyin(
+                        y=y,
+                        fmin=float(self.fmin),
+                        fmax=float(self.fmax),
+                        sr=int(self.sr),
+                        frame_length=int(frame_len),
+                        hop_length=int(self.hop_length),
+                        fill_na=0.0,
+                    )
+                    f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
+                    conf = np.asarray(voiced_prob, dtype=np.float32).reshape(-1)
+                    f0 = np.where(np.isfinite(f0), f0, 0.0).astype(np.float32)
+                    conf = np.where(f0 > 0.0, conf, 0.0).astype(np.float32)
+                    return f0, conf
+                except Exception:
+                    pass
+            # Fallback
+            frames = _frame_audio(y, frame_length=frame_len, hop_length=self.hop_length)
+            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+            return f0, conf
 
-        # fallback: ACF per frame
-        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
-        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+        if enable_multires:
+            # Short + Long windows
+            win_short = int(self.n_fft)
+            win_long = int(self.n_fft * 2)
+
+            f0_s, conf_s = _run_pass(win_short)
+            f0_l, conf_l = _run_pass(win_long)
+
+            # Fuse per frame
+            n = min(len(f0_s), len(f0_l))
+            f0_s, conf_s = f0_s[:n], conf_s[:n]
+            f0_l, conf_l = f0_l[:n], conf_l[:n]
+
+            final_f0 = np.zeros(n, dtype=np.float32)
+            final_conf = np.zeros(n, dtype=np.float32)
+
+            for i in range(n):
+                # Prefer candidate with higher confidence
+                # Tie-break: short window usually better for timing, long for bass pitch
+                if conf_s[i] >= conf_l[i]:
+                    final_f0[i] = f0_s[i]
+                    final_conf[i] = conf_s[i]
+                else:
+                    final_f0[i] = f0_l[i]
+                    final_conf[i] = conf_l[i]
+
+            f0, conf = final_f0, final_conf
+        else:
+            f0, conf = _run_pass(self.n_fft)
+
+        # Octave Error Correction
+        if enable_octave_corr:
+            f0 = self._apply_octave_correction(f0, conf, octave_penalty)
+
+        # Final thresholding
+        conf = np.clip(conf, 0.0, 1.0)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
         f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
         return f0, conf
+
+    def _apply_octave_correction(self, f0: np.ndarray, conf: np.ndarray, penalty: float) -> np.ndarray:
+        # Simple heuristic: for each frame, consider 0.5*f, 1.0*f, 2.0*f.
+        # Choose the one that minimizes jump from previous frame.
+        # This acts like a greedy Viterbi with a lookback of 1.
+        out_f0 = f0.copy()
+        prev = 0.0
+
+        for i in range(len(f0)):
+            curr = f0[i]
+            if curr <= 0:
+                prev = 0.0
+                continue
+
+            if prev <= 0:
+                prev = curr
+                continue
+
+            candidates = [curr, curr * 0.5, curr * 2.0]
+            best_c = curr
+            min_cost = float("inf")
+
+            for cand in candidates:
+                if cand < self.fmin or cand > self.fmax:
+                    continue
+                # Continuity cost: cents diff
+                diff_cents = abs(1200.0 * np.log2(cand / prev))
+                # Bias towards original detection (0 penalty for 1.0*f)
+                cand_penalty = 0.0
+                if cand != curr:
+                    cand_penalty = penalty * 1200.0 # moderate penalty for switching octave
+
+                cost = diff_cents + cand_penalty
+                if cost < min_cost:
+                    min_cost = cost
+                    best_c = cand
+
+            out_f0[i] = best_c
+            prev = best_c
+
+        return out_f0
 
 
 class SACFDetector(BasePitchDetector):
@@ -499,12 +593,15 @@ class SACFDetector(BasePitchDetector):
 class CQTDetector(BasePitchDetector):
     """
     CQT-based dominant pitch (requires librosa). If librosa missing, returns zeros with warning.
+    Supports Morphological Filtering (Feature D).
     """
 
     def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
         super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
         self.bins_per_octave = _safe_int(kwargs.get("bins_per_octave", 36), 36)
         self.n_bins = _safe_int(kwargs.get("n_bins", 7 * self.bins_per_octave), 7 * self.bins_per_octave)
+        self.enable_morphology = kwargs.get("enable_salience_morphology", False)
+        self.morph_kernel = int(kwargs.get("morph_kernel", 3))
 
     def predict(
         self,
@@ -564,6 +661,20 @@ class CQTDetector(BasePitchDetector):
             M = np.abs(C).astype(np.float32)  # (bins, frames)
             if M.size == 0:
                 return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+            # Feature D: Morphological Filtering
+            if self.enable_morphology:
+                try:
+                    import scipy.ndimage as ndimage
+                except Exception:
+                    ndimage = None
+
+                if ndimage is not None:
+                    # Apply grey_closing (dilation then erosion) along time axis primarily, or 2D?
+                    # Usually we want to connect ridges in time.
+                    # Kernel shape: (freq_bins, time_frames) -> (1, k)
+                    k = max(1, self.morph_kernel)
+                    M = ndimage.grey_closing(M, size=(1, k))
 
             freqs = librosa.cqt_frequencies(
                 n_bins=int(self.n_bins), fmin=float(self.fmin), bins_per_octave=int(self.bins_per_octave)
@@ -628,9 +739,18 @@ class SwiftF0Detector(BasePitchDetector):
 
     def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
         super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
-        self.enabled = torch is not None
+        # Check enabled lazily in predict to avoid import here?
+        # But we need to know if enabled to register it.
+        # Original code used 'import torch' top level.
+        # We can check availability via a util or just try import in predict.
+        self.enabled = True # Assume enabled config-wise, check dep later.
 
     def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            import torch
+        except Exception:
+            torch = None
+
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
         frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
         n = frames.shape[0]
@@ -654,9 +774,14 @@ class RMVPEDetector(BasePitchDetector):
 
     def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
         super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
-        self.enabled = torch is not None
+        self.enabled = True
 
     def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            import torch
+        except Exception:
+            torch = None
+
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
         frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
         n = frames.shape[0]
@@ -668,38 +793,77 @@ class RMVPEDetector(BasePitchDetector):
         # Replace with actual RMVPE inference later.
         f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+        f0 = where(conf > 0.0, f0, 0.0).astype(np.float32)
         return f0, conf
 
 
 class CREPEDetector(BasePitchDetector):
     """
-    CREPE wrapper. If crepe missing, returns zeros.
-    Note: CREPE expects sr=16000 typically; you can resample in Stage B if needed.
+    CREPE wrapper. (Feature A)
     """
 
     def __init__(self, sr: int, hop_length: int, n_fft: int = 2048, **kwargs: Any):
         super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
-        self.model_capacity = str(kwargs.get("model_capacity", "full"))
+        self.model_capacity = str(kwargs.get("model_capacity", "small"))
+        self.step_ms = int(kwargs.get("step_ms", 10))
+        self.conf_threshold = float(kwargs.get("conf_threshold", 0.5))
 
     def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            import crepe
+        except Exception:
+            crepe = None
+
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+        # Determine number of frames expected by pipeline
         frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
-        n = frames.shape[0]
+        n_frames = frames.shape[0]
 
         if crepe is None:
             self._warn_once("no_crepe", "CREPE disabled: crepe not available.")
-            return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
+            return np.zeros((n_frames,), dtype=np.float32), np.zeros((n_frames,), dtype=np.float32)
 
-        # Minimal safe stub: fall back to ACF unless you explicitly wire CREPE
-        f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
-        conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
-        return f0, conf
+        try:
+            # CREPE runs at 16k usually, handle internally?
+            # crepe.predict automatically resamples if needed.
+            # step_size in ms.
 
-# Alias for backwards compatibility with older code/tests.  Some
-# unit tests import CQTPeaksDetector from detectors.py, expecting it
-# to behave identically to CQTDetector.  Provide an alias so that
-# ``from detectors import CQTPeaksDetector`` works without modifying
-# those tests.
+            # Note: crepe.predict outputs (time, frequency, confidence, activation)
+            # We need to suppress print output from crepe if possible, but it's verbose.
+            # verbose=0 is default in newer versions but let's check.
+
+            time, frequency, confidence, _ = crepe.predict(
+                y,
+                self.sr,
+                viterbi=False, # We do our own smoothing or allow pipeline to handle it
+                step_size=self.step_ms,
+                model_capacity=self.model_capacity,
+                verbose=0
+            )
+
+            # Resample/Interp to match our pipeline grid (hop_length)
+            # Pipeline grid: t = i * hop_length / sr
+            pipeline_times = np.arange(n_frames) * self.hop_length / self.sr
+
+            # CREPE output might be shorter/longer. Interpolate.
+            f0_interp = np.interp(pipeline_times, time, frequency, left=0.0, right=0.0)
+            conf_interp = np.interp(pipeline_times, time, confidence, left=0.0, right=0.0)
+
+            # Apply threshold
+            conf_out = np.where(conf_interp >= self.conf_threshold, conf_interp, 0.0).astype(np.float32)
+            f0_out = np.where(conf_out > 0.0, f0_interp, 0.0).astype(np.float32)
+
+            # Filter range
+            f0_out = np.where((f0_out >= self.fmin) & (f0_out <= self.fmax), f0_out, 0.0)
+            conf_out = np.where(f0_out > 0.0, conf_out, 0.0)
+
+            return f0_out, conf_out
+
+        except Exception as e:
+            self._warn_once("crepe_error", f"CREPE inference failed: {e}")
+            return np.zeros((n_frames,), dtype=np.float32), np.zeros((n_frames,), dtype=np.float32)
+
+
+# Alias for backwards compatibility
 CQTPeaksDetector = CQTDetector  # type: ignore
