@@ -1,3 +1,3 @@
-benchmark,separator,voicing_f1,polyphony_f1,frame_l2,note_f1,notes
-l2_synthetic,htdemucs,0.87,0.61,0.142,0.78,Baseline regeneration using stock HTDemucs.
-l2_synthetic,synthetic_mdx,0.91,0.69,0.117,0.83,Procedural sine/saw/square/FM-tuned separator with improved harmonic isolation.
+level,name,note_f1,onset_mae_ms,predicted_count,gt_count
+L2,melody_plus_bass_synthetic_sep,0.6,0.0,7,3
+L2,melody_plus_bass_crepe_rmvpe,0.6,0.0,7,3
