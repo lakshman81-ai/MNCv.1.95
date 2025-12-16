@@ -1,0 +1,21 @@
+{"stage": "pipeline", "event": "start", "timestamp": 1765898538.8843875, "run_dir": "results/run_1765898538", "dependencies": {"torch": false, "crepe": false, "demucs": false, "librosa": true, "pyloudnorm": false}}
+{"stage": "stage_a", "event": "start", "timestamp": 1765898538.8845565, "audio_path": "smoke_test.wav", "detector_preferences": {"rmvpe": {"enabled": false, "fmin": 50.0, "fmax": 1200.0, "hop_length": 160, "silence_threshold": 0.04}, "crepe": {"enabled": false, "model_capacity": "small", "fmin": 80.0, "fmax": 1000.0, "use_viterbi": false, "step_ms": 10, "conf_threshold": 0.5}, "swiftf0": {"enabled": true}, "yin": {"enabled": true, "fmin": 80.0, "fmax": 1000.0, "hop_length": 256, "frame_length": 4096, "threshold": 0.08, "enable_multires_f0": false, "enable_octave_correction": false, "octave_jump_penalty": 0.35}, "sacf": {"enabled": true}, "cqt": {"enabled": true, "enable_salience_morphology": false, "morph_kernel": 3}}}
+{"stage": "stage_a", "event": "timing", "timestamp": 1765898542.861327, "duration_s": 3.976656106000064, "sample_rate": 44100, "hop_length": 256, "window_size": 4096, "audio_type": "polyphonic"}
+{"stage": "pipeline", "event": "segmented_mode_start", "timestamp": 1765898542.861556, "enabled": true, "segment_sec": 1.0, "overlap_sec": 0.2, "retry_quality_threshold": 0.9, "retry_max_candidates": 3, "density_target_notes_per_sec": 4.0, "density_penalty_span": 6.0}
+{"stage": "segment", "event": "start", "timestamp": 1765898542.8616552, "index": 0, "start": 0.0, "end": 1.0}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898547.2085836, "segment_index": 0, "candidate_index": 0, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898551.5275142, "segment_index": 0, "candidate_index": 1, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898555.7451906, "segment_index": 0, "candidate_index": 2, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898555.7453952, "index": 0, "selected_candidate": 0, "final_score": 0.8, "notes_count": 6}
+{"stage": "segment", "event": "start", "timestamp": 1765898555.745482, "index": 1, "start": 0.8, "end": 1.8}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898559.180904, "segment_index": 1, "candidate_index": 0, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898562.621041, "segment_index": 1, "candidate_index": 1, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898566.0812266, "segment_index": 1, "candidate_index": 2, "score": 0.8, "note_count": 6}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898566.0814815, "index": 1, "selected_candidate": 0, "final_score": 0.8, "notes_count": 6}
+{"stage": "segment", "event": "start", "timestamp": 1765898566.081629, "index": 2, "start": 1.6, "end": 2.0}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898567.7224517, "segment_index": 2, "candidate_index": 0, "score": 0.6499999999999999, "note_count": 3}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898569.3943527, "segment_index": 2, "candidate_index": 1, "score": 0.6499999999999999, "note_count": 3}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898570.998583, "segment_index": 2, "candidate_index": 2, "score": 0.6499999999999999, "note_count": 3}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898570.9987748, "index": 2, "selected_candidate": 0, "final_score": 0.6499999999999999, "notes_count": 3}
+{"stage": "stage_d", "event": "timing", "timestamp": 1765898571.0855982, "duration_s": 0.08668021299990869, "beats_detected": 0}
+{"stage": "pipeline", "event": "complete", "timestamp": 1765898571.0873544, "notes": 4, "run_dir": "results/run_1765898538"}

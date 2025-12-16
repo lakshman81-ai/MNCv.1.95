@@ -167,7 +167,7 @@ def warped_linear_prediction(audio: np.ndarray, sr: int, pre_emphasis: float = 0
             order = max(2, min(16, len(y) // 8))
             coeffs = librosa.lpc(y, order=order)
             if "scipy" in globals() and hasattr(scipy, "signal"):
-                return scipy.signal.lfilter([1.0], coeffs, y).astype(np.float32)
+                return scipy.signal.lfilter(coeffs, [1.0], y).astype(np.float32)
         except Exception:
             pass
 
@@ -322,6 +322,12 @@ def load_and_preprocess(
         raise ValueError("Audio too short (empty)")
 
     original_duration = float(len(audio)) / float(sr)
+
+    # 1b. Transient Emphasis (Optional)
+    # Applied after loading but before silence trimming/norm
+    tpe_conf = a_conf.transient_pre_emphasis
+    if tpe_conf.get("enabled", True):
+        audio = warped_linear_prediction(audio, sr=sr, pre_emphasis=float(tpe_conf.get("alpha", 0.97)))
 
     # 2. Trim Silence
     if a_conf.silence_trimming.get("enabled", True):

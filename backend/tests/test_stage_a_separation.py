@@ -47,7 +47,8 @@ def test_stage_a_monophonic_flow(mock_get_model, mock_apply_model, mock_detect, 
 
 @patch("backend.pipeline.stage_a.apply_model")
 @patch("backend.pipeline.stage_a.pretrained.get_model")
-def test_stage_a_polyphonic_flow(mock_get_model, mock_apply_model, mock_audio_file):
+@patch("backend.pipeline.stage_a.torch", new_callable=MagicMock)
+def test_stage_a_polyphonic_flow(mock_torch, mock_get_model, mock_apply_model, mock_audio_file):
     """
     Test that a Polyphonic signal triggers Demucs and returns multiple stems.
     """

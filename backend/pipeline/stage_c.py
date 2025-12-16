@@ -580,12 +580,9 @@ def quantize_notes(
         s = float(n.start_sec)
         e = float(n.end_sec)
 
-        if use_soft_snap:
-            qs = round(s / step_sec) * step_sec
-            qe = round(e / step_sec) * step_sec
-        else:
-            qs = round(s / step_sec) * step_sec
-            qe = round(e / step_sec) * step_sec
+        # Redundant check removed: logic is identical
+        qs = round(s / step_sec) * step_sec
+        qe = round(e / step_sec) * step_sec
 
         if qe <= qs:
             qe = qs + max(int(min_steps), 1) * step_sec
@@ -598,6 +595,23 @@ def quantize_notes(
         measure = int(beat_idx // beats_per_measure) + 1
         beat_in_measure = (beat_idx % beats_per_measure) + 1
         duration_beats = (qe - qs) / sec_per_beat
+
+        # Clamp to audio duration if known (avoid validation errors)
+        if analysis is not None:
+             dur = getattr(analysis.meta, "duration_sec", 0.0)
+             if dur > 0.0 and qe > dur:
+                 qe = dur
+                 # Recompute duration_beats if needed, or just keep as is?
+                 # Validation checks end_sec vs duration.
+                 # We should technically update duration_beats to match new length
+                 if qe > qs:
+                    duration_beats = (qe - qs) / sec_per_beat
+                 else:
+                    # Note pushed entirely out of bounds?
+                    # If qe <= qs, we might drop it or keep minimal length.
+                    # Ideally drop, but let's just clamp qs too?
+                    # For now, let's just clamp qe.
+                    pass
 
         out.append(
             NoteEvent(

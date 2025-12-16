@@ -4,6 +4,7 @@ import os
 import soundfile as sf
 from unittest.mock import MagicMock, patch
 from backend.pipeline.stage_a import load_and_preprocess, TARGET_LUFS, SILENCE_THRESHOLD_DB
+from backend.pipeline.config import StageAConfig
 
 # Use a real file or create one for testing
 @pytest.fixture
@@ -59,7 +60,11 @@ def test_load_fallback_soundfile(tmp_path):
 def test_silence_trimming(silence_padded_wav_file):
     # The file has 0.5s silence at start/end.
     # trimming should remove most of it.
-    stage_a_out = load_and_preprocess(silence_padded_wav_file)
+    # Disable TPE to avoid attenuating the 440Hz test tone
+    conf = StageAConfig()
+    conf.transient_pre_emphasis = {"enabled": False}
+
+    stage_a_out = load_and_preprocess(silence_padded_wav_file, config=conf)
     meta = stage_a_out.meta
 
     # Original length was 2.0s. Trimmed should be around 1.0s.
