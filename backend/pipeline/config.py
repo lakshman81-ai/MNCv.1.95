@@ -188,7 +188,7 @@ class StageCConfig:
     min_note_duration_ms: float = 30.0
 
     # Polyphonic-specific minimum duration to suppress bass-induced flutter
-    min_note_duration_ms_poly: float = 80.0
+    min_note_duration_ms_poly: float = 120.0
 
     # HMM frame stability (used in HMMProcessor)
     frame_stability: Dict[str, Any] = field(
@@ -205,7 +205,7 @@ class StageCConfig:
 
     # Confidence gates for polyphonic timelines (melody vs accompaniment)
     polyphonic_confidence: Dict[str, float] = field(
-        default_factory=lambda: {"melody": 0.45, "accompaniment": 0.48}
+        default_factory=lambda: {"melody": 0.55, "accompaniment": 0.6}
     )
 
     # RMS → MIDI velocity mapping
