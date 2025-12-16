@@ -83,13 +83,49 @@ class DurationClassifier:
 
 def quantize_duration(
     seconds,
-    start_time,
-    tempo_times,
-    tempo_curve,
-    denominators,
+    *args,
+    bpm: Optional[float] = None,
+    denominators: Optional[List[float]] = None,
+    start_time: Optional[float] = None,
+    tempo_times=None,
+    tempo_curve=None,
     classifier=None,
+    return_local_bpm: bool = False,
 ):
-    local_bpm = float(np.interp(start_time, tempo_times, tempo_curve))
+    """Quantize a duration in seconds to the nearest rhythmic denominator.
+
+    The function supports two calling conventions for backward compatibility:
+
+    1) Constant tempo: ``quantize_duration(seconds, bpm=120, denominators=[...])``
+       or positional ``quantize_duration(seconds, 120, [...])``.
+    2) Tempo curve: ``quantize_duration(seconds, start_time, tempo_times, tempo_curve, denominators, ...)``.
+
+    Set ``return_local_bpm=True`` when the caller needs the resolved BPM.
+    """
+
+    # Handle legacy positional arguments
+    if args:
+        if len(args) == 2 and bpm is None and denominators is None:
+            bpm, denominators = args
+        elif len(args) >= 4 and bpm is None:
+            start_time, tempo_times, tempo_curve = args[:3]
+            if denominators is None:
+                denominators = args[3]
+        elif len(args) == 1 and denominators is None:
+            denominators = args[0]
+
+    if denominators is None:
+        raise ValueError("denominators must be provided")
+
+    if bpm is not None:
+        local_bpm = float(bpm)
+    elif tempo_times is not None and tempo_curve is not None:
+        if start_time is None:
+            raise ValueError("start_time is required when using tempo_curve")
+        local_bpm = float(np.interp(start_time, tempo_times, tempo_curve))
+    else:
+        raise ValueError("Either bpm or tempo_curve must be provided")
+
     beats = seconds * (local_bpm / 60.0)
 
     if classifier is not None:
@@ -97,7 +133,10 @@ def quantize_duration(
     else:
         quantized = min(denominators, key=lambda x: abs(x - beats))
 
-    return quantized, beats, local_bpm
+    if return_local_bpm:
+        return quantized, beats, local_bpm
+
+    return quantized, beats
 
 
 def compute_tempo_curve(y, sr, hop_length):
@@ -582,6 +621,7 @@ def main():
             tempo_curve,
             params["rhythmic_denominators"],
             classifier=duration_classifier,
+            return_local_bpm=True,
         )
 
         m21_note = music21.note.Note(n["midi"])
