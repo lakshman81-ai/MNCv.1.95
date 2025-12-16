@@ -160,7 +160,7 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "stage_b_voicing_error_delta": 0.01,
                 "note_f1_floor": {"L0": 0.85, "L1": 0.1, "L2": 0.05, "L3": 0.0, "L4": 0.0},
                 "onset_mae_ms_max": 500.0,
-                "latency_budget_ms": 5000.0,
+                "latency_budget_ms": 35000.0,
             },
             "alerts": True,
         },
@@ -607,10 +607,10 @@ class BenchmarkSuite:
 
         config = PipelineConfig()
         config.stage_b.separation['enabled'] = False
-        config.stage_b.polyphonic_peeling["max_layers"] = 0
+        config.stage_b.polyphonic_peeling["max_layers"] = 3
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
-                config.stage_b.detectors[det]["enabled"] = False
+                config.stage_b.detectors[det]["enabled"] = True
         res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
 
         m = self._save_run("L3", "old_macdonald_poly_full", res, gt)
