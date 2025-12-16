@@ -90,7 +90,7 @@ def quantize_duration(
     tempo_times=None,
     tempo_curve=None,
     classifier=None,
-    return_local_bpm: bool = False,
+    return_local_bpm: Optional[bool] = None,
 ):
     """Quantize a duration in seconds to the nearest rhythmic denominator.
 
@@ -100,7 +100,9 @@ def quantize_duration(
        or positional ``quantize_duration(seconds, 120, [...])``.
     2) Tempo curve: ``quantize_duration(seconds, start_time, tempo_times, tempo_curve, denominators, ...)``.
 
-    Set ``return_local_bpm=True`` when the caller needs the resolved BPM.
+    Set ``return_local_bpm=True`` to always include the resolved BPM. If left as
+    ``None``, the function includes local BPM only for tempo-curve calls to match
+    the legacy three-value return shape.
     """
 
     # Handle legacy positional arguments
@@ -133,7 +135,13 @@ def quantize_duration(
     else:
         quantized = min(denominators, key=lambda x: abs(x - beats))
 
-    if return_local_bpm:
+    include_local_bpm = (
+        return_local_bpm
+        if return_local_bpm is not None
+        else tempo_times is not None and tempo_curve is not None
+    )
+
+    if include_local_bpm:
         return quantized, beats, local_bpm
 
     return quantized, beats
