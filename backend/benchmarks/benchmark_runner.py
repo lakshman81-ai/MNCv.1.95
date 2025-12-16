@@ -393,13 +393,14 @@ class BenchmarkSuite:
     def _apply_poly_dominant_segmentation(self, config: PipelineConfig) -> None:
         config.stage_c.segmentation_method["preset"] = "poly_dominant_strict"
         config.stage_c.min_note_duration_ms_poly = max(
-            float(config.stage_c.min_note_duration_ms_poly), 95.0
+            float(config.stage_c.min_note_duration_ms_poly), 120.0
         )
         config.stage_c.polyphonic_confidence["melody"] = max(
-            float(config.stage_c.polyphonic_confidence.get("melody", 0.0)), 0.5
+            float(config.stage_c.polyphonic_confidence.get("melody", 0.0)), 0.55
         )
         config.stage_c.polyphonic_confidence["accompaniment"] = max(
             float(config.stage_c.polyphonic_confidence.get("accompaniment", 0.0)),
+            0.6,
             config.stage_c.polyphonic_confidence["melody"],
         )
 
