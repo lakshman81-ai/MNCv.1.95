@@ -31,7 +31,7 @@ def load_ground_truth(xml_path: str, hop_length: int = 512, sr: int = 22050, pol
 
     # Estimate duration
     bpm = 120.0
-    mm = score.flat.getElementsByClass('MetronomeMark')
+    mm = score.flatten().getElementsByClass('MetronomeMark')
     if mm:
         bpm = mm[0].number
 
@@ -49,7 +49,7 @@ def load_ground_truth(xml_path: str, hop_length: int = 512, sr: int = 22050, pol
 
     times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop_length)
 
-    notes = score.flat.notes
+    notes = score.flatten().notes
 
     for n in notes:
         if n.isRest: continue

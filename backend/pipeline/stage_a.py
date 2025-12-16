@@ -31,8 +31,14 @@ try:  # pragma: no cover - optional heavy dependency
     from demucs import pretrained
     from demucs.apply import apply_model
 except Exception:
-    pretrained = None
-    apply_model = None
+    class _DemucsPretrainedStub:
+        def get_model(self, *_, **__):
+            raise ImportError("demucs not installed")
+
+    def apply_model(*_, **__):  # type: ignore
+        raise ImportError("demucs not installed")
+
+    pretrained = _DemucsPretrainedStub()
 
 try:
     import scipy.io.wavfile
@@ -152,7 +158,20 @@ def warped_linear_prediction(audio: np.ndarray, sr: int, pre_emphasis: float = 0
     """Simple LPC-inspired whitening via pre-emphasis."""
     if len(audio) == 0:
         return audio
-    emphasized = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1])
+
+    y = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    # Only attempt LPC-style whitening on short clips to avoid long runtimes
+    if len(y) <= max(int(sr * 2), 4096) and librosa is not None:
+        try:
+            order = max(2, min(16, len(y) // 8))
+            coeffs = librosa.lpc(y, order=order)
+            if "scipy" in globals() and hasattr(scipy, "signal"):
+                return scipy.signal.lfilter([1.0], coeffs, y).astype(np.float32)
+        except Exception:
+            pass
+
+    emphasized = np.append(y[0], y[1:] - pre_emphasis * y[:-1])
     return emphasized.astype(np.float32)
 
 def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_length: int = 512) -> Tuple[float, float]:
@@ -186,9 +205,14 @@ def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[
         return None, []
 
     try:
-        tempo_est, beat_frames = librosa.beat.beat_track(y=audio, sr=sr)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tempo_est, beat_frames = librosa.beat.beat_track(y=audio, sr=sr)
         beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
-        tempo_val = float(tempo_est) if tempo_est is not None else None
+        tempo_val = tempo_est
+        if tempo_val is not None and hasattr(tempo_val, "__len__"):
+            tempo_val = tempo_val[0] if len(tempo_val) else None
+        tempo_val = float(tempo_val) if tempo_val and np.isfinite(tempo_val) and tempo_val > 0 else None
         return tempo_val, beat_times
     except Exception as exc:  # pragma: no cover - defensive
         warnings.warn(f"Beat tracking failed: {exc}")
@@ -252,7 +276,9 @@ def load_and_preprocess(
     try:
         if librosa:
             # librosa.load handles resampling and mono conversion (mono=True by default)
-            audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
         else:
             audio, sr = _load_audio_fallback(audio_path, target_sr)
     except Exception as e:

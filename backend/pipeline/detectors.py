@@ -287,13 +287,16 @@ def iterative_spectral_subtraction(
 
         # STFT -> apply harmonic mask -> iSTFT
         try:
+            n_fft_eff = int(min(n_fft, max(32, len(residual))))
+            hop_eff = int(max(1, min(hop, n_fft_eff // 2)))
+
             f, t, Z = scipy.signal.stft(
                 residual,
                 fs=sr,
-                nperseg=n_fft,
-                noverlap=max(0, n_fft - hop),
-                boundary=None,
-                padded=False,
+                nperseg=n_fft_eff,
+                noverlap=max(0, n_fft_eff - hop_eff),
+                boundary="zeros",
+                padded=True,
             )
             # Ensure frame alignment (f0 length must match STFT time frames)
             n_frames = Z.shape[1]
@@ -344,10 +347,10 @@ def iterative_spectral_subtraction(
             _, residual2 = scipy.signal.istft(
                 Z2,
                 fs=sr,
-                nperseg=n_fft,
-                noverlap=max(0, n_fft - hop),
+                nperseg=n_fft_eff,
+                noverlap=max(0, n_fft_eff - hop_eff),
                 input_onesided=True,
-                boundary=None,
+                boundary="zeros",
             )
             residual = np.asarray(residual2, dtype=np.float32).reshape(-1)
             if residual.size < y.size:
@@ -487,9 +490,10 @@ class SACFDetector(BasePitchDetector):
             return 0.0
 
         agreement = np.abs(f0_curve[:n] - pred_f0[:n])
-        weights = np.where(pred_conf[:n] > 0.0, pred_conf[:n], 0.0)
-        score = float(np.mean(weights * (agreement < 5.0))) if np.sum(weights) > 0 else 0.0
-        return score
+        weights = np.where(pred_conf[:n] > 0.0, pred_conf[:n], 0.1)
+        matches = (agreement < 5.0).astype(np.float32)
+        weighted = float(np.average(matches, weights=weights)) if np.sum(weights) > 0 else float(np.mean(matches))
+        return weighted
 
 
 class CQTDetector(BasePitchDetector):
@@ -513,10 +517,38 @@ class CQTDetector(BasePitchDetector):
         if y.size == 0:
             return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
+        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+
+        def _fft_peaks(frame_mag: np.ndarray) -> Tuple[List[float], List[float]]:
+            if frame_mag.size == 0:
+                return [], []
+            mean_val = float(np.mean(frame_mag)) + 1e-9
+            ordered_bins = np.argsort(frame_mag)[::-1]
+            freqs = np.fft.rfftfreq(frame_mag.size * 2 - 2, 1.0 / float(self.sr))
+            found_pitch: List[float] = []
+            found_conf: List[float] = []
+            for b in ordered_bins:
+                freq_val = float(freqs[b])
+                if any(abs(freq_val - existing) < 5.0 for existing in found_pitch):
+                    continue
+                found_pitch.append(freq_val)
+                found_conf.append(float(np.clip((frame_mag[b] / mean_val - 1.0) / 4.0, 0.0, 1.0)))
+                if len(found_pitch) >= max_peaks:
+                    break
+            return found_pitch, found_conf
+
         if librosa is None:
             self._warn_once("no_librosa", "CQTDetector disabled: librosa not available.")
-            # match expected frame count approximately
-            frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+            if polyphony:
+                pitches_list: List[List[float]] = []
+                confs_list: List[List[float]] = []
+                for frame in frames:
+                    spectrum = np.abs(np.fft.rfft(frame))
+                    p, c = _fft_peaks(spectrum)
+                    pitches_list.append(p)
+                    confs_list.append(c)
+                return pitches_list, confs_list
+
             n = frames.shape[0]
             return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
@@ -571,8 +603,17 @@ class CQTDetector(BasePitchDetector):
             f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
             return f0, conf
         except Exception:
-            # fallback to ACF
-            frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+            # fallback to FFT-based peak picking or ACF
+            if polyphony:
+                pitches_list = []
+                confs_list = []
+                for frame in frames:
+                    spectrum = np.abs(np.fft.rfft(frame))
+                    p, c = _fft_peaks(spectrum)
+                    pitches_list.append(p)
+                    confs_list.append(c)
+                return pitches_list, confs_list
+
             f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
             conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
             f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)

@@ -8,7 +8,9 @@ from __future__ import annotations
 from typing import List, Dict, Tuple, Any, Optional
 import numpy as np
 import warnings
+import logging
 import importlib.util
+import sys
 try:
     from scipy.optimize import linear_sum_assignment
 except Exception:  # pragma: no cover - optional dependency
@@ -23,6 +25,8 @@ from .detectors import (
     _frame_audio,
     BasePitchDetector
 )
+
+logger = logging.getLogger(__name__)
 
 # Re-export for tests
 __all__ = [
@@ -39,10 +43,18 @@ if importlib.util.find_spec("scipy.signal"):
 
 def _module_available(module_name: str) -> bool:
     """Helper to avoid importing heavy optional deps when missing."""
-    try:
-        return importlib.util.find_spec(module_name) is not None
-    except ModuleNotFoundError:
+    mod = sys.modules.get(module_name)
+    if mod is not None and getattr(mod, "__spec__", None) is None:
         return False
+
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ModuleNotFoundError, ValueError):
+        spec = None
+
+    if spec is None and module_name in sys.modules:
+        return True
+    return spec is not None
 
 
 def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.ndarray:
@@ -157,7 +169,7 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
         or not _module_available("demucs.apply")
         or not _module_available("torch")
     ):
-        warnings.warn("Demucs not available; skipping neural separation.")
+        logger.warning("Demucs not available; skipping neural separation.")
         return None
 
     from demucs.pretrained import get_model
@@ -167,7 +179,7 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     try:
         model = get_model(model_name)
     except Exception as exc:
-        warnings.warn(f"HTDemucs unavailable ({exc}); skipping neural separation.")
+        logger.warning(f"HTDemucs unavailable ({exc}); skipping neural separation.")
         return None
 
     model_sr = getattr(model, "samplerate", sr)
@@ -185,7 +197,7 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
         with torch.no_grad():
             demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
     except Exception as exc:
-        warnings.warn(f"HTDemucs inference failed ({exc}); skipping neural separation.")
+        logger.warning(f"HTDemucs inference failed ({exc}); skipping neural separation.")
         return None
 
     sources = getattr(model, "sources", ["vocals", "drums", "bass", "other"])
@@ -241,7 +253,9 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, An
                     for name, audio in synthetic_stems.items()
                 } | {"mix": mix_stem}, diag
         except Exception as exc:
-            warnings.warn(f"Synthetic separator failed; falling back to {sep_conf.get('model', 'htdemucs')}: {exc}")
+            logger.warning(
+                f"Synthetic separator failed; falling back to {sep_conf.get('model', 'htdemucs')}: {exc}"
+            )
             diag["fallback"] = True
 
     separated = _run_htdemucs(
@@ -315,7 +329,7 @@ def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) ->
         elif name == "crepe":
             return CREPEDetector(sr, hop_length, **kwargs)
     except Exception as e:
-        warnings.warn(f"Failed to init detector {name}: {e}")
+        logger.warning(f"Failed to init detector {name}: {e}")
         return None
     return None
 
@@ -425,14 +439,16 @@ def _augment_with_harmonic_masks(
         f0, conf = prior_detector.predict(audio, audio_path=audio_path)
         hop = getattr(prior_detector, "hop_length", 512)
         n_fft = getattr(prior_detector, "n_fft", 2048)
+        n_fft_eff = int(min(n_fft, max(32, len(audio))))
+        hop_eff = int(max(1, min(hop, n_fft_eff // 2)))
 
         f, t, Z = scipy.signal.stft(
             audio,
             fs=stem.sr,
-            nperseg=n_fft,
-            noverlap=max(0, n_fft - hop),
-            boundary=None,
-            padded=False,
+            nperseg=n_fft_eff,
+            noverlap=max(0, n_fft_eff - hop_eff),
+            boundary="zeros",
+            padded=True,
         )
 
         n_frames = Z.shape[1]
@@ -464,18 +480,18 @@ def _augment_with_harmonic_masks(
         _, melody_audio = scipy.signal.istft(
             Z_melody,
             fs=stem.sr,
-            nperseg=n_fft,
-            noverlap=max(0, n_fft - hop),
+            nperseg=n_fft_eff,
+            noverlap=max(0, n_fft_eff - hop_eff),
             input_onesided=True,
-            boundary=None,
+            boundary="zeros",
         )
         _, residual_audio = scipy.signal.istft(
             Z_resid,
             fs=stem.sr,
-            nperseg=n_fft,
-            noverlap=max(0, n_fft - hop),
+            nperseg=n_fft_eff,
+            noverlap=max(0, n_fft_eff - hop_eff),
             input_onesided=True,
-            boundary=None,
+            boundary="zeros",
         )
 
         melody_audio = np.asarray(melody_audio, dtype=np.float32)
@@ -638,7 +654,7 @@ def extract_features(
 
     # Ensure baseline fallback if no detectors enabled/working
     if not detectors:
-        warnings.warn("No detectors enabled or initialized in Stage B. Falling back to default YIN/ACF.")
+        logger.warning("No detectors enabled or initialized in Stage B. Falling back to default YIN/ACF.")
         detectors["yin"] = YinDetector(sr, hop_length)
 
     stem_timelines: Dict[str, List[FramePitch]] = {}
@@ -693,7 +709,7 @@ def extract_features(
                 stem_results[name] = (f0, conf)
                 per_detector[stem_name][name] = (f0, conf)
             except Exception as e:
-                warnings.warn(f"Detector {name} failed on stem {stem_name}: {e}")
+                logger.warning(f"Detector {name} failed on stem {stem_name}: {e}")
 
         # Ensemble Merge with disagreement and SwiftF0 priority floor
         if stem_results:
@@ -739,7 +755,7 @@ def extract_features(
                     all_layers.extend([f0 for f0, _ in iss_layers])
                     iss_total_layers += len(iss_layers)
                 except Exception as e:
-                    warnings.warn(f"ISS peeling failed for stem {stem_name}: {e}")
+                    logger.warning(f"ISS peeling failed for stem {stem_name}: {e}")
 
         # Calculate RMS
         n_fft = stage_a_out.meta.window_size if stage_a_out.meta.window_size else 2048
@@ -864,6 +880,12 @@ def extract_features(
         },
     }
 
+    primary_timeline = (
+        stem_timelines.get("vocals")
+        or stem_timelines.get("mix")
+        or (next(iter(stem_timelines.values())) if stem_timelines else [])
+    )
+
     return StageBOutput(
         time_grid=time_grid,
         f0_main=f0_main,
@@ -872,4 +894,5 @@ def extract_features(
         stem_timelines=stem_timelines,
         meta=stage_a_out.meta,
         diagnostics=diagnostics,
+        timeline=primary_timeline or [],
     )
