@@ -64,22 +64,18 @@ def quantize_and_render(
     part_treble.append(clef.TrebleClef())
     part_bass.append(clef.BassClef())
 
-    # Time Signature
-    ts_obj = meter.TimeSignature(ts_str)
-    part_treble.append(ts_obj)
-    part_bass.append(ts_obj)
+    # Time Signature / Tempo / Key: use distinct elements per staff to avoid shared state
+    part_treble.append(meter.TimeSignature(ts_str))
+    part_bass.append(meter.TimeSignature(ts_str))
 
-    # Tempo
-    mm = tempo.MetronomeMark(number=float(bpm))
-    part_treble.append(mm)
-    part_bass.append(mm)
+    part_treble.append(tempo.MetronomeMark(number=float(bpm)))
+    part_bass.append(tempo.MetronomeMark(number=float(bpm)))
 
     # Key (if detected)
     if analysis_data.meta.detected_key:
         try:
-            k = key.Key(analysis_data.meta.detected_key)
-            part_treble.append(k)
-            part_bass.append(k)
+            part_treble.append(key.Key(analysis_data.meta.detected_key))
+            part_bass.append(key.Key(analysis_data.meta.detected_key))
         except Exception:
             pass
 
@@ -183,6 +179,26 @@ def quantize_and_render(
         else:
             part_treble.insert(offset, m21_obj)
 
+    # Pad to ensure each staff can produce measures
+    treble_dur = float(part_treble.highestTime or 0.0)
+    bass_dur = float(part_bass.highestTime or 0.0)
+    target_duration = max(treble_dur, bass_dur)
+
+    def _pad_part(p: stream.Part, duration: float):
+        existing = float(p.highestTime or 0.0)
+        if existing <= 0.0 and duration <= 0.0:
+            p.insert(0.0, note.Rest(quarterLength=1.0))
+            return
+        if existing <= 0.0:
+            p.insert(0.0, note.Rest(quarterLength=max(duration, 1.0)))
+            return
+        gap = duration - existing
+        if gap > 0.0:
+            p.insert(existing, note.Rest(quarterLength=gap))
+
+    _pad_part(part_treble, target_duration)
+    _pad_part(part_bass, target_duration)
+
     s.append(part_treble)
     s.append(part_bass)
 
@@ -190,13 +206,20 @@ def quantize_and_render(
     # 4. Make Measures, Rests, Ties, and layout
     # --------------------------------------------------------
 
-    try:
-        s_quant = s.makeMeasures(inPlace=False)
-        s_quant.makeRests(inPlace=True)
-        s_quant.makeTies(inPlace=True)
-    except Exception as e:
-        print(f"[Stage D] makeMeasures/makeRests/makeTies failed: {e}")
-        s_quant = s
+    quantized_parts = []
+    for p in (part_treble, part_bass):
+        try:
+            p_quant = p.makeMeasures(inPlace=False)
+            p_quant.makeRests(inPlace=True)
+            p_quant.makeTies(inPlace=True)
+        except Exception as e:
+            print(f"[Stage D] makeMeasures/makeRests/makeTies failed for part {p.id}: {e}")
+            p_quant = p
+        quantized_parts.append(p_quant)
+
+    s_quant = stream.Score()
+    for qp in quantized_parts:
+        s_quant.append(qp)
 
     # --------------------------------------------------------
     # 5. Export to MusicXML string and MIDI bytes
@@ -229,6 +252,9 @@ def quantize_and_render(
             os.unlink(tmp_path)
     except Exception as e:
         print(f"[Stage D] MIDI export failed: {e}")
+    finally:
+        if not isinstance(midi_bytes, (bytes, bytearray)):
+            midi_bytes = bytes(midi_bytes or b"")
 
     return TranscriptionResult(
         musicxml=musicxml_str,
@@ -241,6 +267,11 @@ def _snap_ql(x: float, eps: float = 0.02) -> float:
     """Snap a quarterLength to MusicXML-friendly values."""
     if x is None or not np.isfinite(x):
         return 0.0
+    if isinstance(x, (list, tuple)):
+        try:
+            x = x[0]
+        except Exception:
+            return 0.0
     x = float(x)
     for denom in (1, 2, 4, 8, 16, 32):
         y = round(x * denom) / denom

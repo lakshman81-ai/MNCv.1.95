@@ -209,13 +209,13 @@ def _load_musicxml_notes(xml_path: str) -> List[Tuple[int, float, float]]:
     """Parse a MusicXML into note tuples (midi, start_sec, end_sec)."""
     score = music21.converter.parse(xml_path)
     bpm = 120.0
-    mm = score.flat.getElementsByClass('MetronomeMark')
+    mm = score.flatten().getElementsByClass('MetronomeMark')
     if mm:
         bpm = mm[0].number
 
     sec_per_beat = 60.0 / bpm
     gt: List[Tuple[int, float, float]] = []
-    for n in score.flat.notes:
+    for n in score.flatten().notes:
         if n.isRest:
             continue
         start_sec = float(n.offset * sec_per_beat)
@@ -456,12 +456,12 @@ class BenchmarkSuite:
 
     @staticmethod
     def _score_to_gt(score) -> List[Tuple[int, float, float]]:
-        tempo_marks = score.flat.getElementsByClass(tempo.MetronomeMark)
+        tempo_marks = score.flatten().getElementsByClass(tempo.MetronomeMark)
         bpm = float(tempo_marks[0].number) if tempo_marks else 100.0
         sec_per_quarter = 60.0 / bpm if bpm else 0.6
 
         gt: List[Tuple[int, float, float]] = []
-        for el in score.flat.notes:
+        for el in score.flatten().notes:
             start = float(el.offset) * sec_per_quarter
             dur = float(el.quarterLength) * sec_per_quarter
             end = start + dur

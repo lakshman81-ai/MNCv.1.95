@@ -106,6 +106,11 @@ class StageBOutput:
     stem_timelines: Dict[str, List["FramePitch"]] = field(default_factory=dict)
     meta: Optional[MetaData] = None         # Passed through from Stage A
     diagnostics: Dict[str, Any] = field(default_factory=dict)  # Separation/masking/ISS flags
+    timeline: List["FramePitch"] = field(default_factory=list)
+
+    def __iter__(self):
+        # Legacy tuple-style unpacking support
+        return iter((self.time_grid, self.f0_main, self.f0_layers))
 
 
 @dataclass

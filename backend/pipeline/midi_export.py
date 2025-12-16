@@ -132,4 +132,4 @@ def notes_to_midi_bytes(notes: List[NoteEvent], meta: MetaData) -> bytes:
         mf.close()
         midi_bytes = buf.getvalue()
 
-    return midi_bytes
+    return bytes(midi_bytes or b"")
