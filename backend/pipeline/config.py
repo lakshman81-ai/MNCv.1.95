@@ -74,8 +74,9 @@ class StageBConfig:
             "shifts": 1,      # number of shifts (test-time augmentation)
             # Polyphonic-dominant preset: heavier overlap + more TTA to peel melody
             "polyphonic_dominant_preset": {
-                "overlap": 0.5,
-                "shift_range": [2, 4],
+                "overlap": 0.75,
+                "shift_range": [2, 5],
+                "overlap_candidates": [0.5, 0.75],
             },
             # Optional harmonic masking guided by a fast F0 prior
             "harmonic_masking": {

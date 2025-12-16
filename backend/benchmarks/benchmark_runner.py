@@ -382,8 +382,9 @@ class BenchmarkSuite:
             config.stage_b.separation["harmonic_masking"]["mask_width"] = mask_width
         config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
         config.stage_b.separation["polyphonic_dominant_preset"].update({
-            "overlap": 0.5,
-            "shift_range": [2, 4],
+            "overlap": 0.75,
+            "shift_range": [2, 5],
+            "overlap_candidates": [0.5, 0.75],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
         if use_poly_dominant_segmentation:
@@ -635,31 +636,46 @@ class BenchmarkSuite:
         logger.info(f"L2 CREPE/RMVPE Complete. F1: {m_exp['note_f1']}")
 
         # Harmonic masking sweep to measure melody isolation sensitivity
-        mask_widths = [0.02, 0.04, 0.06]
+        mask_widths = [0.01, 0.015, 0.02, 0.04, 0.06]
+        overlap_candidates = baseline_config.stage_b.separation.get(
+            "polyphonic_dominant_preset", {}
+        ).get("overlap_candidates", [baseline_config.stage_b.separation.get("overlap", 0.25)])
         sweep_results = []
-        for width in mask_widths:
-            sweep_config = self._poly_config(use_harmonic_masking=True, mask_width=width)
-            sweep_res = run_pipeline_on_audio(
-                mix,
-                sr,
-                sweep_config,
-                AudioType.POLYPHONIC_DOMINANT,
-                allow_separation=True,
-            )
-            sweep_metric = self._save_run(
-                "L2",
-                f"melody_plus_bass_mask_{width:.2f}",
-                sweep_res,
-                gt_melody,
-            )
-            sweep_results.append((width, sweep_metric.get("note_f1", 0.0)))
+        for overlap in overlap_candidates:
+            for width in mask_widths:
+                sweep_config = self._poly_config(use_harmonic_masking=True, mask_width=width)
+                sweep_config.stage_b.separation["polyphonic_dominant_preset"]["overlap"] = overlap
+                sweep_res = run_pipeline_on_audio(
+                    mix,
+                    sr,
+                    sweep_config,
+                    AudioType.POLYPHONIC_DOMINANT,
+                    allow_separation=True,
+                )
+                sweep_metric = self._save_run(
+                    "L2",
+                    f"melody_plus_bass_mask_{width:.3f}_ovl_{overlap:.2f}",
+                    sweep_res,
+                    gt_melody,
+                )
+                sweep_results.append(
+                    {
+                        "width": width,
+                        "overlap": overlap,
+                        "note_f1": sweep_metric.get("note_f1", 0.0),
+                    }
+                )
 
         if sweep_results:
-            best_width, best_f1 = max(sweep_results, key=lambda x: x[1])
+            best_combo = max(sweep_results, key=lambda x: x["note_f1"])
             logger.info(
-                "L2 harmonic masking sweep complete. Best width %.2f -> F1 %.3f (baseline %.3f)",
-                best_width,
-                best_f1,
+                (
+                    "L2 harmonic masking sweep complete. Best overlap %.2f width %.3f -> "
+                    "F1 %.3f (baseline %.3f)"
+                ),
+                best_combo.get("overlap"),
+                best_combo.get("width"),
+                best_combo.get("note_f1"),
                 m.get("note_f1", 0.0),
             )
 
