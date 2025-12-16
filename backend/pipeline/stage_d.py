@@ -65,17 +65,25 @@ def quantize_and_render(
     part_bass.append(clef.BassClef())
 
     # Time Signature / Tempo / Key: use distinct elements per staff to avoid shared state
-    part_treble.append(meter.TimeSignature(ts_str))
-    part_bass.append(meter.TimeSignature(ts_str))
+    ts_treble = meter.TimeSignature(ts_str)
+    ts_bass = meter.TimeSignature(ts_str)
+    part_treble.append(ts_treble)
+    part_bass.append(ts_bass)
 
-    part_treble.append(tempo.MetronomeMark(number=float(bpm)))
-    part_bass.append(tempo.MetronomeMark(number=float(bpm)))
+    beats_per_measure = float(ts_treble.numerator) * (4.0 / float(ts_treble.denominator))
+
+    tempo_treble = tempo.MetronomeMark(number=float(bpm))
+    tempo_bass = tempo.MetronomeMark(number=float(bpm))
+    part_treble.append(tempo_treble)
+    part_bass.append(tempo_bass)
 
     # Key (if detected)
     if analysis_data.meta.detected_key:
         try:
-            part_treble.append(key.Key(analysis_data.meta.detected_key))
-            part_bass.append(key.Key(analysis_data.meta.detected_key))
+            key_treble = key.Key(analysis_data.meta.detected_key)
+            key_bass = key.Key(analysis_data.meta.detected_key)
+            part_treble.append(key_treble)
+            part_bass.append(key_bass)
         except Exception:
             pass
 
@@ -86,19 +94,30 @@ def quantize_and_render(
 
     def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
         dur_beats = getattr(e, "duration_beats", None)
-        if dur_beats is None:
+        if dur_beats is None or not np.isfinite(dur_beats):
             dur_beats = (e.end_sec - e.start_sec) / quarter_dur
-        start_beats = getattr(e, "start_beats", None)
-        if start_beats is None:
-            start_beats = getattr(e, "beat", None)
-        if start_beats is None:
-            start_beats = e.start_sec / quarter_dur
+
+        start_beats_val = getattr(e, "start_beats", None)
+        if start_beats_val is not None and np.isfinite(start_beats_val):
+            start_beats = float(start_beats_val)
+        else:
+            measure = getattr(e, "measure", None)
+            beat = getattr(e, "beat", None)
+            if (
+                measure is not None
+                and beat is not None
+                and np.isfinite(measure)
+                and np.isfinite(beat)
+            ):
+                start_beats = (float(measure) - 1.0) * beats_per_measure + (float(beat) - 1.0)
+            else:
+                start_beats = e.start_sec / quarter_dur
 
         return float(start_beats), float(dur_beats)
 
     events_sorted = sorted(events, key=lambda e: (e.start_sec, e.midi_note))
 
-    staff_groups: Dict[Tuple[str, float], List[NoteEvent]] = {}
+    staff_groups: Dict[Tuple[str, float], Dict[str, Any]] = {}
 
     for e in events_sorted:
         staff_name = getattr(e, "staff", None)
@@ -110,8 +129,11 @@ def quantize_and_render(
 
         key_tuple = (staff_name, start_key)
         if key_tuple not in staff_groups:
-            staff_groups[key_tuple] = []
-        staff_groups[key_tuple].append(e)
+            staff_groups[key_tuple] = {"events": [], "start_beats": start_beats}
+        staff_groups[key_tuple]["events"].append(e)
+        staff_groups[key_tuple]["start_beats"] = min(
+            staff_groups[key_tuple]["start_beats"], start_beats
+        )
 
     # --------------------------------------------------------
     # 3. Create music21 Notes / Chords from grouped events
@@ -119,8 +141,8 @@ def quantize_and_render(
 
     staccato_thresh = d_conf.staccato_marking.get("threshold_beats", 0.25)
 
-    def build_m21_from_group(group: List[NoteEvent]):
-        start_beats, dur_beats_first = get_event_beats(group[0])
+    def build_m21_from_group(group: List[NoteEvent], start_beats_value: float):
+        _, dur_beats_first = get_event_beats(group[0])
 
         dur_beats_candidates: List[float] = []
         for e in group:
@@ -168,11 +190,13 @@ def quantize_and_render(
         if q_len < float(staccato_thresh):
             m21_obj.articulations.append(articulations.Staccato())
 
-        return m21_obj, float(start_beats)
+        return m21_obj, float(start_beats_value)
 
-    for (staff_name, start_key), group in sorted(staff_groups.items(), key=lambda x: x[0]):
-        m21_obj, _start_beats = build_m21_from_group(group)
-        offset = float(start_key)
+    for (staff_name, _start_key), group_dict in sorted(staff_groups.items(), key=lambda x: x[0]):
+        m21_obj, start_beats_value = build_m21_from_group(
+            group_dict["events"], group_dict["start_beats"]
+        )
+        offset = float(start_beats_value)
 
         if staff_name == "bass":
             part_bass.insert(offset, m21_obj)
@@ -187,14 +211,24 @@ def quantize_and_render(
     def _pad_part(p: stream.Part, duration: float):
         existing = float(p.highestTime or 0.0)
         if existing <= 0.0 and duration <= 0.0:
-            p.insert(0.0, note.Rest(quarterLength=1.0))
+            p.insert(0.0, note.Rest(quarterLength=beats_per_measure))
             return
         if existing <= 0.0:
-            p.insert(0.0, note.Rest(quarterLength=max(duration, 1.0)))
+            p.insert(0.0, note.Rest(quarterLength=max(duration, beats_per_measure)))
             return
         gap = duration - existing
         if gap > 0.0:
             p.insert(existing, note.Rest(quarterLength=gap))
+
+    def _ensure_nonempty_part(p: stream.Part):
+        notes_and_chords = [
+            el for el in p.recurse().notesAndRests if isinstance(el, (note.Note, chord.Chord))
+        ]
+        if not notes_and_chords:
+            p.insert(0.0, note.Rest(quarterLength=beats_per_measure))
+
+    _ensure_nonempty_part(part_treble)
+    _ensure_nonempty_part(part_bass)
 
     _pad_part(part_treble, target_duration)
     _pad_part(part_bass, target_duration)

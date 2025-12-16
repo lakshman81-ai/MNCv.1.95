@@ -222,6 +222,8 @@ def load_and_preprocess(
     audio_path: str,
     config: Optional[Union[PipelineConfig, StageAConfig]] = None,
     target_sr: Optional[int] = None,
+    start_offset: float = 0.0,
+    max_duration: Optional[float] = None,
 ) -> StageAOutput:
     """
     Stage A main entry point.
@@ -278,9 +280,20 @@ def load_and_preprocess(
             # librosa.load handles resampling and mono conversion (mono=True by default)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+                audio, sr = librosa.load(
+                    audio_path,
+                    sr=target_sr,
+                    mono=True,
+                    offset=max(0.0, float(start_offset or 0.0)),
+                    duration=max_duration,
+                )
         else:
             audio, sr = _load_audio_fallback(audio_path, target_sr)
+            # Manual offset/duration handling for fallback path
+            if start_offset or max_duration:
+                offset_samples = int(max(0.0, float(start_offset or 0.0)) * sr)
+                end = int(offset_samples + (max_duration * sr if max_duration else len(audio)))
+                audio = audio[offset_samples:end]
     except Exception as e:
         raise RuntimeError(f"Stage A failed to load audio: {e}")
 

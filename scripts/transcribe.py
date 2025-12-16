@@ -83,50 +83,26 @@ class DurationClassifier:
 
 def quantize_duration(
     seconds,
-    *args,
-    bpm: Optional[float] = None,
-    denominators: Optional[List[float]] = None,
-    start_time: Optional[float] = None,
+    start_time=None,
     tempo_times=None,
     tempo_curve=None,
+    denominators=None,
     classifier=None,
-    return_local_bpm: Optional[bool] = None,
+    bpm=None,
 ):
-    """Quantize a duration in seconds to the nearest rhythmic denominator.
-
-    The function supports two calling conventions for backward compatibility:
-
-    1) Constant tempo: ``quantize_duration(seconds, bpm=120, denominators=[...])``
-       or positional ``quantize_duration(seconds, 120, [...])``.
-    2) Tempo curve: ``quantize_duration(seconds, start_time, tempo_times, tempo_curve, denominators, ...)``.
-
-    Set ``return_local_bpm=True`` to always include the resolved BPM. If left as
-    ``None``, the function includes local BPM only for tempo-curve calls to match
-    the legacy three-value return shape.
-    """
-
-    # Handle legacy positional arguments
-    if args:
-        if len(args) == 2 and bpm is None and denominators is None:
-            bpm, denominators = args
-        elif len(args) >= 4 and bpm is None:
-            start_time, tempo_times, tempo_curve = args[:3]
-            if denominators is None:
-                denominators = args[3]
-        elif len(args) == 1 and denominators is None:
-            denominators = args[0]
-
     if denominators is None:
         raise ValueError("denominators must be provided")
 
     if bpm is not None:
         local_bpm = float(bpm)
     elif tempo_times is not None and tempo_curve is not None:
-        if start_time is None:
-            raise ValueError("start_time is required when using tempo_curve")
-        local_bpm = float(np.interp(start_time, tempo_times, tempo_curve))
+        start_time_val = 0.0 if start_time is None else float(start_time)
+        local_bpm = float(np.interp(start_time_val, tempo_times, tempo_curve))
+    elif start_time is not None:
+        # Backward compatibility: treat start_time as a constant bpm when tempo curve is absent
+        local_bpm = float(start_time)
     else:
-        raise ValueError("Either bpm or tempo_curve must be provided")
+        local_bpm = 120.0
 
     beats = seconds * (local_bpm / 60.0)
 
@@ -376,7 +352,11 @@ def assign_to_voices(notes: List[Dict], tempo: float, params: Dict) -> Tuple[mus
     def _place_note(part_voices, span_map, staff_name, note_dict):
         start_beat = note_dict["start_sec"] * (tempo / 60.0)
         end_beat = note_dict["end_sec"] * (tempo / 60.0)
-        q_dur, _ = quantize_duration(note_dict["end_sec"] - note_dict["start_sec"], tempo, params["rhythmic_denominators"])
+        q_dur, _, _ = quantize_duration(
+            note_dict["end_sec"] - note_dict["start_sec"],
+            bpm=tempo,
+            denominators=params["rhythmic_denominators"],
+        )
         m21_note = music21.note.Note(note_dict["midi"])
         m21_note.quarterLength = q_dur
 
