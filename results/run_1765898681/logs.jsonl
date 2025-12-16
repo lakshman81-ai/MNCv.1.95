@@ -1,0 +1,15 @@
+{"stage": "pipeline", "event": "start", "timestamp": 1765898681.0166001, "run_dir": "results/run_1765898681", "dependencies": {"torch": false, "crepe": false, "demucs": false, "librosa": true, "pyloudnorm": false}}
+{"stage": "stage_a", "event": "start", "timestamp": 1765898681.016784, "audio_path": "smoke_test.wav", "detector_preferences": {"rmvpe": {"enabled": false, "fmin": 50.0, "fmax": 1200.0, "hop_length": 160, "silence_threshold": 0.04}, "crepe": {"enabled": false, "model_capacity": "small", "fmin": 80.0, "fmax": 1000.0, "use_viterbi": false, "step_ms": 10, "conf_threshold": 0.5}, "swiftf0": {"enabled": true}, "yin": {"enabled": true, "fmin": 80.0, "fmax": 1000.0, "hop_length": 256, "frame_length": 4096, "threshold": 0.08, "enable_multires_f0": false, "enable_octave_correction": false, "octave_jump_penalty": 0.35}, "sacf": {"enabled": true}, "cqt": {"enabled": true, "enable_salience_morphology": false, "morph_kernel": 3}}}
+{"stage": "stage_a", "event": "timing", "timestamp": 1765898684.9795287, "duration_s": 3.962630519999948, "sample_rate": 44100, "hop_length": 256, "window_size": 4096, "audio_type": "monophonic"}
+{"stage": "pipeline", "event": "segmented_mode_start", "timestamp": 1765898684.9797573, "enabled": true, "segment_sec": 2.0, "overlap_sec": 0.5, "retry_quality_threshold": 0.9, "retry_max_candidates": 3, "density_target_notes_per_sec": 4.0, "density_penalty_span": 6.0}
+{"stage": "segment", "event": "start", "timestamp": 1765898684.9798548, "index": 0, "start": 0.0, "end": 2.0}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898688.770322, "segment_index": 0, "candidate_index": 0, "score": 1.0, "note_count": 4}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898688.7705607, "index": 0, "selected_candidate": 0, "final_score": 1.0, "notes_count": 4}
+{"stage": "segment", "event": "start", "timestamp": 1765898688.770656, "index": 1, "start": 1.5, "end": 3.5}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898691.0713694, "segment_index": 1, "candidate_index": 0, "score": 1.0, "note_count": 4}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898691.071587, "index": 1, "selected_candidate": 0, "final_score": 1.0, "notes_count": 4}
+{"stage": "segment", "event": "start", "timestamp": 1765898691.0717008, "index": 2, "start": 3.0, "end": 4.0}
+{"stage": "segment", "event": "candidate_evaluated", "timestamp": 1765898692.2450378, "segment_index": 2, "candidate_index": 0, "score": 1.0, "note_count": 2}
+{"stage": "segment", "event": "segment_complete", "timestamp": 1765898692.2452316, "index": 2, "selected_candidate": 0, "final_score": 1.0, "notes_count": 2}
+{"stage": "stage_d", "event": "timing", "timestamp": 1765898692.3223276, "duration_s": 0.07697165500007941, "beats_detected": 7}
+{"stage": "pipeline", "event": "complete", "timestamp": 1765898692.3237946, "notes": 8, "run_dir": "results/run_1765898681"}

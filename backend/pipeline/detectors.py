@@ -793,7 +793,7 @@ class RMVPEDetector(BasePitchDetector):
         # Replace with actual RMVPE inference later.
         f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-        f0 = where(conf > 0.0, f0, 0.0).astype(np.float32)
+        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
         return f0, conf
 
 

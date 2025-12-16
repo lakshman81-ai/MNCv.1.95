@@ -247,6 +247,41 @@ def quantize_and_render(
     s.append(part_treble)
     s.append(part_bass)
 
+    # 3b. Glissando (Optional)
+    if gliss_conf.get("enabled", False):
+        min_semitones = float(gliss_conf.get("min_semitones", 2.0))
+        max_time_ms = float(gliss_conf.get("max_time_ms", 500.0))
+        from music21 import spanner
+
+        for p in (part_treble, part_bass):
+            # Sort by offset to ensure sequence
+            # Filter only Note objects (skip chords)
+            p_notes = [n for n in p.flat.notes if isinstance(n, note.Note)]
+            p_notes.sort(key=lambda n: n.offset)
+
+            for i in range(len(p_notes) - 1):
+                n1 = p_notes[i]
+                n2 = p_notes[i+1]
+
+                # Semitone check
+                if abs(n2.pitch.ps - n1.pitch.ps) < min_semitones:
+                    continue
+
+                # Time gap check
+                # n1_end in beats
+                n1_end = n1.offset + n1.quarterLength
+                n2_start = n2.offset
+                gap_beats = n2_start - n1_end
+
+                # Convert to ms
+                # bpm is defined earlier
+                gap_sec = gap_beats * (60.0 / float(bpm))
+                gap_ms = max(0.0, gap_sec * 1000.0)
+
+                if gap_ms <= max_time_ms:
+                    gliss = spanner.Glissando(n1, n2)
+                    p.insert(n1.offset, gliss)
+
     # --------------------------------------------------------
     # 4. Make Measures, Rests, Ties, and layout
     # --------------------------------------------------------
@@ -286,12 +321,14 @@ def quantize_and_render(
         if hasattr(mf, 'writestr'):
             midi_bytes = mf.writestr()
         else:
-            # Fallback to temp file
-            with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as tmp:
-                tmp_path = tmp.name
+            # Fallback to temp file (Windows-safe approach)
+            fd, tmp_path = tempfile.mkstemp(suffix=".mid")
+            os.close(fd) # Close handle immediately so music21 can open it
+
             mf.open(tmp_path, 'wb')
             mf.write()
             mf.close()
+
             with open(tmp_path, 'rb') as f:
                 midi_bytes = f.read()
             os.unlink(tmp_path)

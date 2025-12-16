@@ -82,10 +82,21 @@ def _slice_stage_a_output(
     new_meta = replace(stage_a_out.meta)
     new_meta.duration_sec = (end_idx - start_idx) / sr
 
-    # Adjust beats if needed (shift time)
-    # Stage B doesn't strictly need shifted beats unless beat-tracking
-    # is re-run. Here we are just slicing audio for pitch detection.
-    # We will ignore beats in the slice for now as we use global grid.
+    # Adjust beats (shift time to slice-relative)
+    # Priority: stage_a_out.beats > stage_a_out.meta.beats > []
+    src_beats = stage_a_out.beats if stage_a_out.beats else getattr(stage_a_out.meta, "beats", [])
+    sliced_beats = []
+    if src_beats:
+        # Filter beats within [start_sec, end_sec]
+        # and shift by -start_sec
+        sliced_beats = [
+            b - start_sec
+            for b in src_beats
+            if start_sec <= b <= end_sec
+        ]
+
+    # Sync meta beats as well
+    new_meta.beats = sliced_beats
 
     return StageAOutput(
         stems=new_stems,
@@ -93,7 +104,7 @@ def _slice_stage_a_output(
         audio_type=stage_a_out.audio_type,
         noise_floor_rms=stage_a_out.noise_floor_rms,
         noise_floor_db=stage_a_out.noise_floor_db,
-        beats=[]
+        beats=sliced_beats
     )
 
 def _score_segment(
@@ -568,11 +579,13 @@ def transcribe(
         # because Stage D mostly consumes `notes` (except for visualization).
 
         # Note: Stage D `quantize_and_render` takes `notes` as first arg.
+        # FIX: Ensure global beats are passed to Stage D to avoid fallback to default BPM
         analysis_data = AnalysisData(
             meta=stage_a_out.meta,
             timeline=[],
             stem_timelines={}, # We don't stitch timelines yet, only notes.
-            notes=accumulated_notes
+            notes=accumulated_notes,
+            beats=stage_a_out.beats if stage_a_out.beats else getattr(stage_a_out.meta, "beats", [])
         )
 
         # Use the last run's Stage B output for invariants/logging
