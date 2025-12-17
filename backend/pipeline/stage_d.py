@@ -140,26 +140,46 @@ def quantize_and_render(
     quarter_dur = 60.0 / float(bpm)
     grid_res_beats = 4.0 / float(grid_val) # e.g. 4/16 = 0.25 beats for 16th note
 
-    def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
-        dur_beats = getattr(e, "duration_beats", None)
-        if dur_beats is None or not np.isfinite(dur_beats):
-            dur_beats = (e.end_sec - e.start_sec) / quarter_dur
+    # Use beat grid if available
+    beat_times = getattr(analysis_data, "beats", []) or []
+    use_beat_grid = len(beat_times) > 1
 
-        start_beats_val = getattr(e, "start_beats", None)
-        if start_beats_val is not None and np.isfinite(start_beats_val):
-            start_beats = float(start_beats_val)
+    def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
+        start_beats = 0.0
+        dur_beats = 0.0
+
+        # Calculate start_beats
+        if use_beat_grid:
+            # Interpolate beat position from time
+            # beat_times are timestamps of beats 0, 1, 2...
+            # We assume linear tempo between beat markers
+            # np.interp returns extrapolated values for times outside [min, max]
+            start_beats = float(np.interp(e.start_sec, beat_times, np.arange(len(beat_times))))
+
+            # For duration, we calculate end_beat and subtract
+            end_beats = float(np.interp(e.end_sec, beat_times, np.arange(len(beat_times))))
+            dur_beats = end_beats - start_beats
         else:
-            measure = getattr(e, "measure", None)
-            beat = getattr(e, "beat", None)
-            if (
-                measure is not None
-                and beat is not None
-                and np.isfinite(measure)
-                and np.isfinite(beat)
-            ):
-                start_beats = (float(measure) - 1.0) * beats_per_measure + (float(beat) - 1.0)
+            # Fallback to constant tempo
+            dur_beats = getattr(e, "duration_beats", None)
+            if dur_beats is None or not np.isfinite(dur_beats):
+                dur_beats = (e.end_sec - e.start_sec) / quarter_dur
+
+            start_beats_val = getattr(e, "start_beats", None)
+            if start_beats_val is not None and np.isfinite(start_beats_val):
+                start_beats = float(start_beats_val)
             else:
-                start_beats = e.start_sec / quarter_dur
+                measure = getattr(e, "measure", None)
+                beat = getattr(e, "beat", None)
+                if (
+                    measure is not None
+                    and beat is not None
+                    and np.isfinite(measure)
+                    and np.isfinite(beat)
+                ):
+                    start_beats = (float(measure) - 1.0) * beats_per_measure + (float(beat) - 1.0)
+                else:
+                    start_beats = e.start_sec / quarter_dur
 
         # D2: Quantize to grid
         # Round start and duration to nearest grid unit
