@@ -72,6 +72,9 @@ class MetaData:
     audio_path: Optional[str] = None
     n_channels: int = 1
     normalization_gain_db: float = 0.0
+    loudness_measurement: str = "unmeasured"
+    loudness_or_rms: float = -float("inf")     # measured before normalization
+    loudness_post_norm: float = -float("inf")  # measured after normalization
     rms_db: float = -float("inf")
     noise_floor_rms: float = 0.0            # from Stage A percentile RMS
     noise_floor_db: float = -80.0           # log version of noise_floor_rms

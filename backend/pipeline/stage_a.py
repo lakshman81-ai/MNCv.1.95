@@ -119,39 +119,49 @@ def _trim_silence(audio: np.ndarray, top_db: float, frame_length: int = 2048, ho
     # Simple calculation of RMS per frame
     return audio # TODO: implement manual trim if needed, for now return as is if librosa fails
 
-def _normalize_loudness(audio: np.ndarray, sr: int, target_lufs: float) -> Tuple[np.ndarray, float]:
-    """Normalize audio to target LUFS using pyloudnorm or RMS fallback."""
-    gain_db = 0.0
+def _measure_loudness(audio: np.ndarray, sr: int) -> Tuple[Optional[float], str]:
+    """Measure loudness using pyloudnorm (LUFS) or RMS fallback."""
 
-    # Method 1: pyloudnorm
     if pyloudnorm:
         try:
-            meter = pyloudnorm.Meter(sr)  # create BS.1770 meter
+            meter = pyloudnorm.Meter(sr)
             loudness = meter.integrated_loudness(audio)
-
-            # If loudness is -inf, don't normalize
             if not math.isinf(loudness):
-                delta_lufs = target_lufs - loudness
-                gain_lin = 10.0 ** (delta_lufs / 20.0)
-                audio_norm = audio * gain_lin
-
-                # Check for clipping? (Peak limiter config is in StageAConfig but applied later?)
-                # For now just return normalized
-                return audio_norm, delta_lufs
+                return float(loudness), "lufs"
         except Exception:
             pass
 
-    # Method 2: RMS-based fallback
-    # Assume -23 LUFS is roughly -23 dB RMS (sine wave) but K-weighting differs.
-    # Simple RMS normalization to -20 dB RMS as a proxy for -23 LUFS
     rms = np.sqrt(np.mean(audio**2))
     if rms > 1e-9:
-        target_rms = 10.0 ** (-20.0 / 20.0) # -20 dB
-        gain_lin = target_rms / rms
-        gain_db = 20.0 * np.log10(gain_lin)
-        return audio * gain_lin, gain_db
+        return float(20.0 * math.log10(rms + 1e-12)), "rms_db"
 
-    return audio, 0.0
+    return None, "unmeasured"
+
+
+def _normalize_loudness(
+    audio: np.ndarray, sr: int, target_lufs: float
+) -> Tuple[np.ndarray, float, Optional[float], Optional[float], str]:
+    """Normalize audio to target LUFS using pyloudnorm or RMS fallback."""
+    gain_db = 0.0
+    measured_before, measurement_type = _measure_loudness(audio, sr)
+    audio_out = audio
+
+    if measurement_type == "lufs" and measured_before is not None:
+        delta_lufs = target_lufs - measured_before
+        gain_db = delta_lufs
+        gain_lin = 10.0 ** (gain_db / 20.0)
+        audio_out = audio * gain_lin
+    elif measurement_type == "rms_db" and measured_before is not None:
+        target_rms_db = -20.0
+        gain_db = target_rms_db - measured_before
+        gain_lin = 10.0 ** (gain_db / 20.0)
+        audio_out = audio * gain_lin
+
+    measured_after, post_type = _measure_loudness(audio_out, sr)
+    if post_type != "unmeasured":
+        measurement_type = post_type
+
+    return audio_out, gain_db, measured_before, measured_after, measurement_type
 
 
 def warped_linear_prediction(audio: np.ndarray, sr: int, pre_emphasis: float = 0.97) -> np.ndarray:
@@ -335,8 +345,14 @@ def load_and_preprocess(
 
     # 3. Loudness Normalization
     gain_db = 0.0
+    loudness_before = None
+    loudness_after = None
+    loudness_measurement = "unmeasured"
     if a_conf.loudness_normalization.get("enabled", True):
-        audio, gain_db = _normalize_loudness(audio, sr, target_lufs)
+        audio, gain_db, loudness_before, loudness_after, loudness_measurement = _normalize_loudness(audio, sr, target_lufs)
+    else:
+        loudness_before, loudness_measurement = _measure_loudness(audio, sr)
+        loudness_after = loudness_before
 
     # 4. Noise Floor
     nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
@@ -400,6 +416,9 @@ def load_and_preprocess(
         original_duration_sec=float(original_duration),
         n_channels=1, # we forced mono
         lufs=target_lufs, # assumed target
+        loudness_measurement=loudness_measurement,
+        loudness_or_rms=loudness_before if loudness_before is not None else -float("inf"),
+        loudness_post_norm=loudness_after if loudness_after is not None else -float("inf"),
         normalization_gain_db=gain_db,
         rms_db=20.0 * np.log10(np.sqrt(np.mean(audio**2)) + 1e-9),
         noise_floor_rms=nf_rms,
