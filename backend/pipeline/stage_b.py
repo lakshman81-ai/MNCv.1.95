@@ -875,10 +875,28 @@ def extract_features(
         )
 
         # Build timeline with optional skyline selection from poly layers
-        voicing_thr = float(b_conf.confidence_voicing_threshold)
-        if polyphonic_context:
-            voicing_thr = max(0.0, voicing_thr - float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0)))
-        voicing_thr = min(voicing_thr, float(filter_conf.get("voiced_prob_threshold", voicing_thr)))
+        voicing_thr_global = float(b_conf.confidence_voicing_threshold)
+
+        # Apply polyphonic relaxation (if any) to the GLOBAL gate only
+        poly_relax = float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0) or 0.0)
+        voicing_thr_effective = voicing_thr_global - poly_relax
+
+        # Melody filter threshold stays a *post-filter* knob (do not silently lower global gate)
+        melody_voiced_thr = float(filter_conf.get("voiced_prob_threshold", voicing_thr_effective))
+
+        # Use voicing_thr_effective for deciding voiced/unvoiced frames
+        voicing_thr = voicing_thr_effective
+
+        # Record into diagnostics (no schema change if diagnostics already exists)
+        diagnostics = locals().get("diagnostics", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["voicing_thresholds"] = {
+                "global": voicing_thr_global,
+                "poly_relax": poly_relax,
+                "effective": voicing_thr_effective,
+                "melody_filter_voiced_thr": melody_voiced_thr,
+            }
+
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
 

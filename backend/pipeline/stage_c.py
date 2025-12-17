@@ -353,7 +353,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # previous behaviour (~0.60 semitones * 12 = 7.2 semitones).
     pitch_tol_cents = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
     try:
-        semitone_stability = max(0.01, pitch_tol_cents / 100.0 / 12.0)
+        # 100 cents = 1 semitone
+        semitone_stability = max(0.01, pitch_tol_cents / 100.0)
     except Exception:
         semitone_stability = 0.60  # fallback
 

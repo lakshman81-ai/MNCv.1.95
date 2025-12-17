@@ -58,25 +58,15 @@ class OnsetsFramesModel:
 _MODEL_CACHE: Optional[OnsetsFramesModel] = None
 
 
-def load_model(device: str = "cpu") -> Optional[OnsetsFramesModel]:
-    global _MODEL_CACHE
-    if not _safe_import_torch():
-        return None
+def load_model(config: PipelineConfig):
+    conf = getattr(config.stage_b, "onsets_and_frames", {}) or {}
+    ckpt = conf.get("checkpoint_path")
+    if not ckpt:
+        return None, {"run": False, "reason": "no_checkpoint"}
 
-    # Ensure torch is imported locally for use if needed
-    try:
-        import torch
-    except ImportError:
-        return None
-
-    if _MODEL_CACHE is None:
-        try:
-            # Here we would load weights. For now, just instantiate stub.
-            _MODEL_CACHE = OnsetsFramesModel(device=device)
-        except Exception as e:
-            logger.warning(f"Failed to load Onsets & Frames model: {e}")
-            return None
-    return _MODEL_CACHE
+    # If you later add checkpoint loading, do it here.
+    # For now, still return None until real loading exists.
+    return None, {"run": False, "reason": "checkpoint_loading_not_implemented"}
 
 
 def decode_notes(
@@ -167,10 +157,9 @@ def transcribe_onsets_frames(
         diag["reason"] = "no_torch"
         return [], diag
 
-    model = load_model()
+    model, load_diag = load_model(config)
     if model is None:
-        diag["reason"] = "model_load_failed"
-        return [], diag
+        return [], load_diag
 
     # Run inference
     # Note: Model usually expects 16k mono. We should resample if needed.

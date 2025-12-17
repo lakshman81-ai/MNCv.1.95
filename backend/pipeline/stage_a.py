@@ -403,39 +403,18 @@ def load_and_preprocess(
         beats=beat_times,
     )
 
-    # Stems: for now just 'mix' since we don't do separation in Stage A
-    # (Separation is typically start of Stage B or pre-B)
-    # The requirement says Stage A output has "stems (mix / vocals ... depending on separation availability)"
-    # But usually separation is a heavy process. If explicit separation is not in Stage A logic (it's in Stage B config),
-    # we just provide 'mix'.
-    # Ensure canonical stems exist for downstream consistency
-    if detected_type == AudioType.MONOPHONIC:
-        target_vocal_sr = 16000
-        if sr != target_vocal_sr:
-            ratio = float(target_vocal_sr) / float(sr)
-            indices = np.arange(0, len(audio) * ratio) / ratio
-            vocals_audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
-        else:
-            vocals_audio = audio
-        stems["vocals"] = Stem(audio=vocals_audio, sr=target_vocal_sr, type="vocals")
-    else:
-        stems.setdefault("vocals", Stem(audio=audio, sr=sr, type="vocals"))
-        stems.setdefault("bass", Stem(audio=(0.5 * audio).astype(np.float32), sr=sr, type="bass"))
-        sr_other = max(sr, 44100)
-        if sr_other != sr:
-            ratio = float(sr_other) / float(sr)
-            indices = np.arange(0, len(audio) * ratio) / ratio
-            resampled_other = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
-        else:
-            resampled_other = audio
-        stems.setdefault("other", Stem(audio=resampled_other, sr=sr_other, type="other"))
+    # Always provide only the true mix by default.
+    stems = {"mix": Stem(audio=audio, sr=sr, type="mix")}
 
-    if "vocals" in stems and stems["vocals"].sr != 16000:
-        v_audio = stems["vocals"].audio
-        ratio = 16000.0 / float(stems["vocals"].sr)
-        indices = np.arange(0, len(v_audio) * ratio) / ratio
-        resampled = np.interp(indices, np.arange(len(v_audio)), v_audio).astype(np.float32)
-        stems["vocals"] = Stem(audio=resampled, sr=16000, type="vocals")
+    # If (and only if) real separation produced stems, merge them here.
+    # Expect a dict like {"vocals": np.ndarray, "bass": ..., "other": ...} or {"vocals": Stem, ...}
+    # In this function, 'separated' (if populated above) already contains Stem objects.
+    if locals().get("separated") and isinstance(separated, dict):
+        for k, v in separated.items():
+            if isinstance(v, Stem):
+                stems[k] = v
+            elif isinstance(v, np.ndarray):
+                stems[k] = Stem(audio=v.astype(np.float32), sr=sr, type=str(k))
 
     return StageAOutput(
         stems=stems,
