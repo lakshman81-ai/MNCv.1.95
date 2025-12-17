@@ -579,7 +579,6 @@ def transcribe(
         # because Stage D mostly consumes `notes` (except for visualization).
 
         # Note: Stage D `quantize_and_render` takes `notes` as first arg.
-        # FIX: Ensure global beats are passed to Stage D to avoid fallback to default BPM
         analysis_data = AnalysisData(
             meta=stage_a_out.meta,
             timeline=[],
