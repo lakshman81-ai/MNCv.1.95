@@ -116,8 +116,47 @@ def _trim_silence(audio: np.ndarray, top_db: float, frame_length: int = 2048, ho
             pass
 
     # Fallback trim: RMS threshold
-    # Simple calculation of RMS per frame
-    return audio # TODO: implement manual trim if needed, for now return as is if librosa fails
+    n_samples = len(audio)
+    if n_samples < frame_length:
+        return audio
+
+    # Ensure contiguous array for striding
+    if not audio.flags['C_CONTIGUOUS']:
+        audio = np.ascontiguousarray(audio)
+
+    num_frames = (n_samples - frame_length) // hop_length + 1
+    if num_frames <= 0:
+        return audio
+
+    shape = (num_frames, frame_length)
+    strides = (audio.strides[0] * hop_length, audio.strides[0])
+
+    try:
+        frames = np.lib.stride_tricks.as_strided(audio, shape=shape, strides=strides)
+        # RMS over the frame (axis=1)
+        rms = np.sqrt(np.mean(frames**2, axis=1))
+    except Exception:
+        return audio
+
+    max_rms = np.max(rms)
+    if max_rms <= 1e-9:
+        return audio
+
+    # Threshold relative to max (top_db)
+    threshold_linear = max_rms * (10.0 ** (-top_db / 20.0))
+
+    mask = rms >= threshold_linear
+    if not np.any(mask):
+        return audio
+
+    non_silent = np.where(mask)[0]
+    start_frame = non_silent[0]
+    end_frame = non_silent[-1]
+
+    start_sample = start_frame * hop_length
+    end_sample = min(n_samples, end_frame * hop_length + frame_length)
+
+    return audio[start_sample:end_sample]
 
 def _normalize_loudness(audio: np.ndarray, sr: int, target_lufs: float) -> Tuple[np.ndarray, float]:
     """Normalize audio to target LUFS using pyloudnorm or RMS fallback."""
