@@ -22,6 +22,8 @@ Contract (as used in tests/test_pipeline_flow.py):
 """
 
 import time
+import csv
+import math
 from typing import Optional
 
 from .config import PIANO_61KEY_CONFIG, PipelineConfig
@@ -385,6 +387,7 @@ def transcribe(
         config = PIANO_61KEY_CONFIG
 
     pipeline_logger = pipeline_logger or PipelineLogger()
+    stage_metrics: dict[str, dict[str, float]] = {}
 
     # Log missing optional module exactly once per process.
     if not _VALIDATION_AVAILABLE and not getattr(transcribe, "_logged_missing_validation", False):
@@ -431,6 +434,30 @@ def transcribe(
             "audio_type": stage_a_out.audio_type.value,
         },
     )
+    original_duration = getattr(stage_a_out.meta, "original_duration_sec", stage_a_out.meta.duration_sec)
+    trim_reduction = max(0.0, float(original_duration) - float(stage_a_out.meta.duration_sec))
+    pipeline_logger.log_event(
+        "pipeline",
+        "params_resolved",
+        {
+            "sample_rate": stage_a_out.meta.sample_rate,
+            "hop_length": stage_a_out.meta.hop_length,
+            "window_size": stage_a_out.meta.window_size,
+            "fmin": getattr(config.stage_b, "fmin", None) if hasattr(config, "stage_b") else None,
+            "fmax": getattr(config.stage_b, "fmax", None) if hasattr(config, "stage_b") else None,
+            "source": "stage_a.detector_resolution",
+        },
+    )
+    stage_metrics["stage_a"] = {
+        "duration_in_sec": float(original_duration),
+        "duration_out_sec": float(stage_a_out.meta.duration_sec),
+        "trim_reduction_sec": float(trim_reduction),
+        "trim_offset_sec": float(trim_reduction) / 2.0,
+        "sr_out": float(stage_a_out.meta.sample_rate),
+        "loudness_target_lufs": float(stage_a_out.meta.lufs),
+        "normalization_gain_db": float(stage_a_out.meta.normalization_gain_db),
+        "noise_floor_db": float(stage_a_out.meta.noise_floor_db),
+    }
 
     # --------------------------------------------------------
     # Pipeline Branch: Onsets & Frames (Feature B)
@@ -751,6 +778,46 @@ def transcribe(
         pipeline_logger.record_timing("stage_c", time.perf_counter() - t_c, metadata={"note_count": len(notes)})
 
     # --------------------------------------------------------
+    # Stage B/C diagnostics (common)
+    # --------------------------------------------------------
+    timeline_source = list(stage_b_out.timeline or [])
+    if not timeline_source and getattr(stage_b_out, "time_grid", None) is not None:
+        for t, f0 in zip(getattr(stage_b_out, "time_grid", []), getattr(stage_b_out, "f0_main", [])):
+            timeline_source.append(
+                FramePitch(time=float(t), pitch_hz=float(f0), midi=int(round(69 + 12 * math.log2(f0 / 440.0)))) if f0 > 0 else FramePitch(time=float(t), pitch_hz=0.0, midi=None, confidence=0.0)
+            )
+    total_frames = len(timeline_source) or int(getattr(stage_b_out, "f0_main", np.array([])).size)
+    voiced_frames = [fp for fp in timeline_source if getattr(fp, "pitch_hz", 0.0) > 0]
+    mean_conf = float(np.mean([getattr(fp, "confidence", 0.0) for fp in timeline_source])) if timeline_source else 0.0
+    zero_ratio = 1.0 - (len(voiced_frames) / total_frames) if total_frames else 1.0
+    midi_series = [fp.midi for fp in timeline_source if fp.midi is not None]
+    octave_jumps = 0
+    for a, b in zip(midi_series, midi_series[1:]):
+        if a is None or b is None:
+            continue
+        if abs(a - b) >= 12:
+            octave_jumps += 1
+    voiced_ratio = (len(voiced_frames) / total_frames) if total_frames else 0.0
+    stage_metrics["stage_b"] = {
+        "voiced_ratio": float(voiced_ratio),
+        "mean_confidence": float(mean_conf),
+        "octave_jump_rate": float(octave_jumps / max(1, len(midi_series))) if midi_series else 0.0,
+        "f0_zero_ratio": float(zero_ratio),
+        "timeline_frames": int(total_frames),
+    }
+
+    # Stage C fragmentation statistics
+    note_durations = [max(0.0, float(n.end_sec) - float(n.start_sec)) for n in notes or [] if getattr(n, "end_sec", 0.0) > getattr(n, "start_sec", 0.0)]
+    short_notes = sum(1 for d in note_durations if d < 0.08)
+    duration_sec = float(getattr(stage_a_out.meta, "duration_sec", 0.0) or 0.0)
+    stage_metrics["stage_c"] = {
+        "note_count": len(notes or []),
+        "note_count_per_10s": (len(notes or []) / (duration_sec / 10.0)) if duration_sec else 0.0,
+        "median_note_len_ms": float(np.median(note_durations) * 1000.0) if note_durations else 0.0,
+        "fragmentation_score": float(short_notes / max(1, len(notes or []))) if notes else 0.0,
+    }
+
+    # --------------------------------------------------------
     # Stage D: Quantization + MusicXML Rendering
     # --------------------------------------------------------
     t_d = time.perf_counter()
@@ -758,6 +825,7 @@ def transcribe(
         notes,
         analysis_data,
         config=config,
+        pipeline_logger=pipeline_logger,
     )
     validate_invariants(d_out, config)
     pipeline_logger.record_timing(
@@ -765,6 +833,11 @@ def transcribe(
         time.perf_counter() - t_d,
         metadata={"beats_detected": len(d_out.analysis_data.beats)},
     )
+    stage_metrics["stage_d"] = {
+        "quantization_mean_shift_ms": 0.0,
+        "quantization_p95_shift_ms": 0.0,
+        "rendered_notes": len(getattr(d_out.analysis_data, "notes", []) or []),
+    }
 
     # Save resolved configuration for debugging parity with API path
     dump_resolved_config(config, stage_a_out.meta, stage_b_out)
@@ -811,9 +884,50 @@ def transcribe(
             "duration_sec": getattr(stage_a_out.meta, "duration_sec", None),
         }
         pipeline_logger.write_json("resolved_config.json", resolved)
+        pipeline_logger.write_json("stage_metrics.json", stage_metrics)
+        pipeline_logger.write_text("rendered.musicxml", d_out.musicxml or "")
+
+        # summary.csv (append)
+        summary_path = os.path.join(pipeline_logger.base_dir, "summary.csv")
+        os.makedirs(pipeline_logger.base_dir, exist_ok=True)
+        summary_fields = [
+            "run_dir",
+            "note_count",
+            "duration_sec",
+            "voiced_ratio",
+            "mean_confidence",
+        ]
+        write_header = not os.path.exists(summary_path)
+        with open(summary_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "run_dir": pipeline_logger.run_dir,
+                "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
+                "duration_sec": stage_metrics.get("stage_a", {}).get("duration_out_sec", 0.0),
+                "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
+                "mean_confidence": stage_metrics.get("stage_b", {}).get("mean_confidence", 0.0),
+            })
+
+        # leaderboard.json (best-effort)
+        leaderboard_path = os.path.join(pipeline_logger.base_dir, "leaderboard.json")
+        leaderboard_data = {}
+        if os.path.exists(leaderboard_path):
+            try:
+                with open(leaderboard_path, "r", encoding="utf-8") as f:
+                    leaderboard_data = json.load(f) or {}
+            except Exception:
+                leaderboard_data = {}
+        leaderboard_data[pipeline_logger.run_name] = {
+            "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
+            "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
+        }
+        with open(leaderboard_path, "w", encoding="utf-8") as f:
+            json.dump(leaderboard_data, f, indent=2)
 
         pipeline_logger.log_event(stage="pipeline", event="artifact_export",
-                                  payload={"files": ["timeline.json", "predicted_notes.json", "resolved_config.json"]})
+                                  payload={"files": ["timeline.json", "predicted_notes.json", "resolved_config.json", "stage_metrics.json", "rendered.musicxml"]})
     except Exception as e:
         pipeline_logger.log_event(stage="pipeline", event="artifact_export_failed",
                                   payload={"error": str(e)})

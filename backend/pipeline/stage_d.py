@@ -2,20 +2,25 @@ from typing import List, Optional, Dict, Tuple, Any
 import numpy as np
 import tempfile
 import os
-import music21
-from music21 import (
-    stream,
-    note,
-    chord,
-    tempo,
-    meter,
-    key,
-    dynamics,
-    articulations,
-    layout,
-    clef,
-    midi,
-)
+try:
+    import music21
+    from music21 import (
+        stream,
+        note,
+        chord,
+        tempo,
+        meter,
+        key,
+        dynamics,
+        articulations,
+        layout,
+        clef,
+        midi,
+    )
+    MUSIC21_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    music21 = None  # type: ignore
+    MUSIC21_AVAILABLE = False
 
 # Import models and config from the package or the top level.  This makes stage_d
 # usable both as ``backend.pipeline.stage_d`` and as a top‑level module ``stage_d``.
@@ -31,12 +36,26 @@ def quantize_and_render(
     events: List[NoteEvent],
     analysis_data: AnalysisData,
     config: PipelineConfig = PIANO_61KEY_CONFIG,
+    pipeline_logger: Optional[Any] = None,
 ) -> TranscriptionResult:
     """
     Stage D: Render Sheet Music (MusicXML) and MIDI using music21.
 
     Returns TranscriptionResult containing musicxml string and midi bytes.
     """
+
+    if not MUSIC21_AVAILABLE:
+        if pipeline_logger:
+            pipeline_logger.log_event(
+                "stage_d",
+                "feature_disabled",
+                {"feature": "music21", "reason": "missing"},
+            )
+        return TranscriptionResult(
+            musicxml="",
+            analysis_data=analysis_data,
+            midi_bytes=b"",
+        )
 
     d_conf = config.stage_d
 
