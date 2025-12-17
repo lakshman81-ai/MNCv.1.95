@@ -720,6 +720,7 @@ class MultiVoiceTracker:
 def extract_features(
     stage_a_out: StageAOutput,
     config: Optional[PipelineConfig] = None,
+    pipeline_logger: Optional[Any] = None,
     **kwargs
 ) -> StageBOutput:
     """
@@ -789,6 +790,9 @@ def extract_features(
     polyphonic_context = polyphonic_context or len(stems_for_processing) > 1 or b_conf.polyphonic_peeling.get("force_on_mix", False)
 
     # 2. Process Stems
+    mix_stem_ref = stage_a_out.stems.get("mix") or next(iter(stage_a_out.stems.values()))
+    canonical_n_frames = int(np.ceil(len(mix_stem_ref.audio) / hop_length))
+
     for stem_name, stem in stems_for_processing.items():
         audio = stem.audio
         per_detector[stem_name] = {}
@@ -815,6 +819,28 @@ def extract_features(
         else:
             merged_f0 = np.zeros(1, dtype=np.float32)
             merged_conf = np.zeros(1, dtype=np.float32)
+
+        # TP2 Fix: Pad/Trim merged outputs to canonical length before downstream processing
+        if len(merged_f0) != canonical_n_frames:
+            if pipeline_logger:
+                pipeline_logger.log_event(
+                    "stage_b",
+                    "detector_output_len_mismatch",
+                    payload={
+                        "stem": stem_name,
+                        "expected": canonical_n_frames,
+                        "got": len(merged_f0),
+                        "action": "pad_or_trim"
+                    }
+                )
+
+            if len(merged_f0) < canonical_n_frames:
+                pad_len = canonical_n_frames - len(merged_f0)
+                merged_f0 = np.pad(merged_f0, (0, pad_len), constant_values=0.0)
+                merged_conf = np.pad(merged_conf, (0, pad_len), constant_values=0.0)
+            else:
+                merged_f0 = merged_f0[:canonical_n_frames]
+                merged_conf = merged_conf[:canonical_n_frames]
 
         # Polyphonic peeling (ISS) – optional and gated by config + context
         iss_layers: List[Tuple[np.ndarray, np.ndarray]] = []
@@ -859,7 +885,7 @@ def extract_features(
         frames = _frame_audio(audio, n_fft, hop_length)
         rms_vals = np.sqrt(np.mean(frames**2, axis=1))
 
-        # Pad/Trim RMS to match dominant F0
+        # Pad/Trim RMS to match dominant F0 (which is now canonical length)
         if len(rms_vals) < len(merged_f0):
             rms_vals = np.pad(rms_vals, (0, len(merged_f0) - len(rms_vals)))
         elif len(rms_vals) > len(merged_f0):

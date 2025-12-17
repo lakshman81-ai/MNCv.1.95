@@ -864,6 +864,7 @@ def transcribe(
         stage_b_out = extract_features(
             stage_a_out,
             config=config,
+            pipeline_logger=pipeline_logger,
         )
         validate_invariants(stage_b_out, config)
         pipeline_logger.record_timing(
