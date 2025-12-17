@@ -802,8 +802,21 @@ class RMVPEDetector(BasePitchDetector):
         # Replace with actual RMVPE inference later.
         f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-        f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
-        return f0, conf
+
+        try:
+            # placeholder post-filter: keep only frames with confidence
+            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            conf = conf.astype(np.float32)
+            return f0, conf
+        except Exception as e:
+            # Never crash: return zeros
+            n = int(len(getattr(conf, "__len__", lambda: [])()) or 0)
+            if n == 0:
+                # best-effort length inference
+                n = int(len(f0)) if "f0" in locals() and hasattr(f0, "__len__") else 0
+            if hasattr(self, "warn_once"):
+                self.warn_once("rmvpe_error", f"RMVPE placeholder failed: {e}")
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
 
 
 class CREPEDetector(BasePitchDetector):

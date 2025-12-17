@@ -98,3 +98,57 @@ class PipelineLogger:
         if extras:
             payload.update(extras)
         self.log_event(stage, "config", payload)
+
+    def _safe_json_default(self, o):
+        try:
+            import numpy as _np
+            if isinstance(o, (_np.floating,)):
+                return float(o)
+            if isinstance(o, (_np.integer,)):
+                return int(o)
+            if isinstance(o, _np.ndarray):
+                return o.tolist()
+        except Exception:
+            pass
+
+        # dataclasses
+        try:
+            from dataclasses import asdict as _asdict, is_dataclass as _isdc
+            if _isdc(o):
+                return _asdict(o)
+        except Exception:
+            pass
+
+        # enums
+        v = getattr(o, "value", None)
+        if v is not None:
+            return v
+
+        return str(o)
+
+    def write_json(self, filename: str, obj) -> None:
+        try:
+            path = os.path.join(self.run_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2, default=self._safe_json_default)
+        except Exception as e:
+            self.log_event(stage="logger", event="artifact_write_failed",
+                           payload={"filename": filename, "error": str(e)})
+
+    def write_text(self, filename: str, text: str) -> None:
+        try:
+            path = os.path.join(self.run_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            self.log_event(stage="logger", event="artifact_write_failed",
+                           payload={"filename": filename, "error": str(e)})
+
+    def write_bytes(self, filename: str, data: bytes) -> None:
+        try:
+            path = os.path.join(self.run_dir, filename)
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            self.log_event(stage="logger", event="artifact_write_failed",
+                           payload={"filename": filename, "error": str(e)})

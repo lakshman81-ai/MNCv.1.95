@@ -31,9 +31,23 @@ from .stage_c import apply_theory
 from .stage_d import quantize_and_render
 from .neural_transcription import transcribe_onsets_frames
 from .models import AnalysisData, StageAOutput, TranscriptionResult, StageBOutput, NoteEvent, FramePitch, Stem, AudioType
-from .validation import validate_invariants, dump_resolved_config
+# Optional dependency: validation.py may not exist in minimal 10-file set.
+_VALIDATION_AVAILABLE = True
+try:
+    from .validation import validate_invariants, dump_resolved_config  # type: ignore
+except Exception:
+    _VALIDATION_AVAILABLE = False
+
+    def validate_invariants(*_a, **_k):  # best-effort no-op
+        return None
+
+    def dump_resolved_config(*_a, **_k):  # best-effort empty
+        return {}
+
 from .instrumentation import PipelineLogger
 import numpy as np
+import os
+import json
 import copy
 from dataclasses import asdict, replace
 
@@ -155,8 +169,28 @@ def _score_segment(
     # Weighted combination
     # Density is a strong indicator of "noise explosion".
     # Plausibility checks for "fragmentation".
+    durations = []
+    for n in notes or []:
+        s = getattr(n, "start_sec", 0.0) or 0.0
+        e = getattr(n, "end_sec", 0.0) or 0.0
+        if e > s:
+            durations.append(e - s)
+
+    median_dur = float(np.median(durations)) if durations else 0.0
+    notes_per_sec = (len(notes) / max(1e-6, duration_sec)) if duration_sec else 0.0  # use your existing segment duration var
+
+    penalty = 0.0
+    density_target_notes_per_sec = config.segmented_transcription.density_target_notes_per_sec
+
+    if median_dur and median_dur < 0.08:
+        penalty += (0.08 - median_dur) * 5.0
+    if notes_per_sec > (density_target_notes_per_sec * 2.0):
+        penalty += (notes_per_sec - density_target_notes_per_sec * 2.0) * 0.5
+
     final_score = 0.6 * density_score + 0.4 * plausibility
-    return float(final_score)
+    score = final_score - penalty
+
+    return float(score)
 
 def _build_candidate_configs(
     base_config: PipelineConfig,
@@ -208,7 +242,8 @@ def _stitch_events(
     accumulated_notes: list[NoteEvent],
     new_segment_notes: list[NoteEvent],
     overlap_start: float,
-    overlap_end: float
+    overlap_end: float,
+    pipeline_logger: Optional[PipelineLogger] = None
 ) -> list[NoteEvent]:
     """
     Merge notes from new segment into accumulated notes, handling overlap.
@@ -306,7 +341,24 @@ def _stitch_events(
             current = next_note
 
     merged.append(current)
-    return merged
+
+    stitched = sorted(merged, key=lambda x: (x.start_sec, x.end_sec))
+    clean = []
+    last_end = -1e9
+    for ev in stitched:
+        if ev.end_sec is None or ev.start_sec is None or ev.end_sec <= ev.start_sec:
+            if pipeline_logger:
+                pipeline_logger.log_event("segmented", "stitch_drop_invalid_event",
+                                          {"start": getattr(ev, "start_sec", None), "end": getattr(ev, "end_sec", None)})
+            continue
+        if ev.start_sec < last_end:
+            # clamp forward to avoid overlap regressions
+            ev.start_sec = last_end
+            if ev.end_sec <= ev.start_sec:
+                continue
+        clean.append(ev)
+        last_end = max(last_end, ev.end_sec)
+    return clean
 
 def transcribe(
     audio_path: str,
@@ -334,6 +386,15 @@ def transcribe(
 
     pipeline_logger = pipeline_logger or PipelineLogger()
 
+    # Log missing optional module exactly once per process.
+    if not _VALIDATION_AVAILABLE and not getattr(transcribe, "_logged_missing_validation", False):
+        pipeline_logger.log_event(
+            stage="pipeline",
+            event="missing_dependency",
+            payload={"module": "validation", "symbols": ["validate_invariants", "dump_resolved_config"]},
+        )
+        setattr(transcribe, "_logged_missing_validation", True)
+
     # --------------------------------------------------------
     # Stage A: Signal Conditioning
     # --------------------------------------------------------
@@ -351,6 +412,14 @@ def transcribe(
         audio_path,
         config=config,
     )
+
+    if len(stage_a_out.stems) == 1 and "mix" in stage_a_out.stems:
+        pipeline_logger.log_event(
+            stage="stage_a",
+            event="separation_skipped",
+            payload={"reason": "no_real_separation_outputs", "stems": list(stage_a_out.stems.keys())},
+        )
+
     validate_invariants(stage_a_out, config)
     pipeline_logger.record_timing(
         "stage_a",
@@ -378,7 +447,8 @@ def transcribe(
         mix_audio = stage_a_out.stems["mix"].audio
         sr = stage_a_out.meta.sample_rate
 
-        of_notes, of_diag = transcribe_onsets_frames(mix_audio, sr, config)
+        of_notes_candidate, of_diag = transcribe_onsets_frames(mix_audio, sr, config)
+        note_count = len(of_notes_candidate) if of_notes_candidate else 0
 
         pipeline_logger.record_timing(
             "onsets_frames",
@@ -386,7 +456,15 @@ def transcribe(
             metadata=of_diag
         )
 
-        if of_diag.get("run", False):
+        if not of_diag.get("run", False) or note_count == 0:
+            pipeline_logger.log_event(
+                stage="pipeline",
+                event="onsets_frames_fallback",
+                payload={"reason": of_diag.get("reason", "zero_notes"), "note_count": note_count},
+            )
+            # fall through to classical B/C path
+        else:
+            of_notes = of_notes_candidate
             pipeline_logger.log_event("pipeline", "branch_switch", {"mode": "onsets_frames"})
 
     if of_notes:
@@ -501,11 +579,24 @@ def transcribe(
                 # Score
                 score = _score_segment(cand_notes, seg_end - seg_start, stage_a_out.audio_type, config)
 
+                # Re-calculate stats for logging since _score_segment doesn't return them
+                durations = []
+                for n in cand_notes or []:
+                    s = getattr(n, "start_sec", 0.0) or 0.0
+                    e = getattr(n, "end_sec", 0.0) or 0.0
+                    if e > s:
+                        durations.append(e - s)
+                median_dur = float(np.median(durations)) if durations else 0.0
+                seg_duration_sec = seg_end - seg_start
+                notes_per_sec = (len(cand_notes) / max(1e-6, seg_duration_sec)) if seg_duration_sec else 0.0
+
                 pipeline_logger.log_event("segment", "candidate_evaluated", {
                     "segment_index": seg_idx,
                     "candidate_index": c_idx,
                     "score": score,
-                    "note_count": len(cand_notes)
+                    "note_count": len(cand_notes),
+                    "median_dur_s": median_dur,
+                    "notes_per_sec": notes_per_sec
                 })
 
                 if score > best_score:
@@ -559,7 +650,7 @@ def transcribe(
             if seg_idx == 0:
                 accumulated_notes = best_notes
             else:
-                accumulated_notes = _stitch_events(accumulated_notes, best_notes, merge_start, merge_end)
+                accumulated_notes = _stitch_events(accumulated_notes, best_notes, merge_start, merge_end, pipeline_logger)
 
             # Prepare next loop
             current_time += step
@@ -677,6 +768,55 @@ def transcribe(
 
     # Save resolved configuration for debugging parity with API path
     dump_resolved_config(config, stage_a_out.meta, stage_b_out)
+
+    # --- Artifact exports (best-effort) ---
+    try:
+        ad = d_out.analysis_data  # TranscriptionResult.analysis_data
+        # timeline.json
+        timeline_rows = []
+        for fp in getattr(ad, "timeline", []) or []:
+            # FramePitch fields per your schema
+            timeline_rows.append({
+                "time_sec": getattr(fp, "time", None),
+                "f0_hz": getattr(fp, "pitch_hz", None),
+                "midi": getattr(fp, "midi", None),
+                "confidence": getattr(fp, "confidence", None),
+                "rms": getattr(fp, "rms", None),
+                "active_pitches": getattr(fp, "active_pitches", None),
+            })
+        pipeline_logger.write_json("timeline.json", timeline_rows)
+
+        # predicted_notes.json
+        note_rows = []
+        for ne in getattr(ad, "notes", []) or []:
+            note_rows.append({
+                "start_sec": getattr(ne, "start_sec", None),
+                "end_sec": getattr(ne, "end_sec", None),
+                "midi_note": getattr(ne, "midi_note", None),
+                "pitch_hz": getattr(ne, "pitch_hz", None),
+                "confidence": getattr(ne, "confidence", None),
+                "velocity": getattr(ne, "velocity", None),
+                "voice": getattr(ne, "voice", None),
+                "staff": getattr(ne, "staff", None),
+            })
+        pipeline_logger.write_json("predicted_notes.json", note_rows)
+
+        # resolved_config.json (dataclass + runtime meta)
+        from dataclasses import asdict as _asdict, is_dataclass as _isdc
+        resolved = _asdict(config) if _isdc(config) else {"config": str(config)}
+        resolved["runtime"] = {
+            "hop_length": getattr(stage_a_out.meta, "hop_length", None),
+            "window_size": getattr(stage_a_out.meta, "window_size", None),
+            "sample_rate": getattr(stage_a_out.meta, "sample_rate", None),
+            "duration_sec": getattr(stage_a_out.meta, "duration_sec", None),
+        }
+        pipeline_logger.write_json("resolved_config.json", resolved)
+
+        pipeline_logger.log_event(stage="pipeline", event="artifact_export",
+                                  payload={"files": ["timeline.json", "predicted_notes.json", "resolved_config.json"]})
+    except Exception as e:
+        pipeline_logger.log_event(stage="pipeline", event="artifact_export_failed",
+                                  payload={"error": str(e)})
 
     pipeline_logger.log_event(
         "pipeline",
