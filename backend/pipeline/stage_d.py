@@ -141,7 +141,12 @@ def quantize_and_render(
     grid_res_beats = 4.0 / float(grid_val) # e.g. 4/16 = 0.25 beats for 16th note
 
     # Use beat grid if available
-    beat_times = getattr(analysis_data, "beats", []) or []
+    beat_times = list(getattr(analysis_data, "beats", []) or [])
+    if not beat_times:
+        meta = getattr(analysis_data, "meta", None)
+        if meta is not None:
+            beat_times = list(getattr(meta, "beat_times", []) or getattr(meta, "beats", []) or [])
+
     use_beat_grid = len(beat_times) > 1
 
     def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
