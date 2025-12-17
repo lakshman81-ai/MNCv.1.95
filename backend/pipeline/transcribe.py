@@ -388,6 +388,115 @@ def transcribe(
 
     pipeline_logger = pipeline_logger or PipelineLogger()
     stage_metrics: dict[str, dict[str, float]] = {}
+    stage_b_out: Optional[StageBOutput] = None
+
+    def _finalize_and_return(d_out: TranscriptionResult, mode: Optional[str] = None) -> TranscriptionResult:
+        """Export artifacts/metrics, finalize logging, and return the result."""
+
+        # Save resolved configuration for debugging parity with API path
+        dump_resolved_config(config, stage_a_out.meta, stage_b_out)
+
+        # --- Artifact exports (best-effort) ---
+        try:
+            ad = d_out.analysis_data  # TranscriptionResult.analysis_data
+            # timeline.json
+            timeline_rows = []
+            for fp in getattr(ad, "timeline", []) or []:
+                # FramePitch fields per your schema
+                timeline_rows.append({
+                    "time_sec": getattr(fp, "time", None),
+                    "f0_hz": getattr(fp, "pitch_hz", None),
+                    "midi": getattr(fp, "midi", None),
+                    "confidence": getattr(fp, "confidence", None),
+                    "rms": getattr(fp, "rms", None),
+                    "active_pitches": getattr(fp, "active_pitches", None),
+                })
+            pipeline_logger.write_json("timeline.json", timeline_rows)
+
+            # predicted_notes.json
+            note_rows = []
+            for ne in getattr(ad, "notes", []) or []:
+                note_rows.append({
+                    "start_sec": getattr(ne, "start_sec", None),
+                    "end_sec": getattr(ne, "end_sec", None),
+                    "midi_note": getattr(ne, "midi_note", None),
+                    "pitch_hz": getattr(ne, "pitch_hz", None),
+                    "confidence": getattr(ne, "confidence", None),
+                    "velocity": getattr(ne, "velocity", None),
+                    "voice": getattr(ne, "voice", None),
+                    "staff": getattr(ne, "staff", None),
+                })
+            pipeline_logger.write_json("predicted_notes.json", note_rows)
+
+            # resolved_config.json (dataclass + runtime meta)
+            from dataclasses import asdict as _asdict, is_dataclass as _isdc
+            resolved = _asdict(config) if _isdc(config) else {"config": str(config)}
+            resolved["runtime"] = {
+                "hop_length": getattr(stage_a_out.meta, "hop_length", None),
+                "window_size": getattr(stage_a_out.meta, "window_size", None),
+                "sample_rate": getattr(stage_a_out.meta, "sample_rate", None),
+                "duration_sec": getattr(stage_a_out.meta, "duration_sec", None),
+            }
+            pipeline_logger.write_json("resolved_config.json", resolved)
+            pipeline_logger.write_json("stage_metrics.json", stage_metrics)
+            pipeline_logger.write_text("rendered.musicxml", d_out.musicxml or "")
+
+            # summary.csv (append)
+            summary_path = os.path.join(pipeline_logger.base_dir, "summary.csv")
+            os.makedirs(pipeline_logger.base_dir, exist_ok=True)
+            summary_fields = [
+                "run_dir",
+                "note_count",
+                "duration_sec",
+                "voiced_ratio",
+                "mean_confidence",
+            ]
+            write_header = not os.path.exists(summary_path)
+            with open(summary_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=summary_fields)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({
+                    "run_dir": pipeline_logger.run_dir,
+                    "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
+                    "duration_sec": stage_metrics.get("stage_a", {}).get("duration_out_sec", 0.0),
+                    "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
+                    "mean_confidence": stage_metrics.get("stage_b", {}).get("mean_confidence", 0.0),
+                })
+
+            # leaderboard.json (best-effort)
+            leaderboard_path = os.path.join(pipeline_logger.base_dir, "leaderboard.json")
+            leaderboard_data = {}
+            if os.path.exists(leaderboard_path):
+                try:
+                    with open(leaderboard_path, "r", encoding="utf-8") as f:
+                        leaderboard_data = json.load(f) or {}
+                except Exception:
+                    leaderboard_data = {}
+            leaderboard_data[pipeline_logger.run_name] = {
+                "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
+                "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
+            }
+            with open(leaderboard_path, "w", encoding="utf-8") as f:
+                json.dump(leaderboard_data, f, indent=2)
+
+            pipeline_logger.log_event(stage="pipeline", event="artifact_export",
+                                      payload={"files": ["timeline.json", "predicted_notes.json", "resolved_config.json", "stage_metrics.json", "rendered.musicxml"]})
+        except Exception as e:
+            pipeline_logger.log_event(stage="pipeline", event="artifact_export_failed",
+                                      payload={"error": str(e)})
+
+        payload = {"notes": len(d_out.analysis_data.notes), "run_dir": pipeline_logger.run_dir}
+        if mode:
+            payload["mode"] = mode
+        pipeline_logger.log_event("pipeline", "complete", payload)
+        pipeline_logger.finalize()
+
+        return TranscriptionResult(
+            musicxml=d_out.musicxml,
+            analysis_data=d_out.analysis_data,
+            midi_bytes=d_out.midi_bytes
+        )
 
     # Log missing optional module exactly once per process.
     if not _VALIDATION_AVAILABLE and not getattr(transcribe, "_logged_missing_validation", False):
@@ -525,24 +634,38 @@ def transcribe(
             config=config,
         )
 
+        validate_invariants(d_out, config)
+
         pipeline_logger.record_timing(
             "stage_d",
             time.perf_counter() - t_d,
             metadata={"beats_detected": len(d_out.analysis_data.beats), "mode": "onsets_frames"},
         )
 
-        pipeline_logger.log_event(
-            "pipeline",
-            "complete",
-            {"notes": len(d_out.analysis_data.notes), "run_dir": pipeline_logger.run_dir, "mode": "onsets_frames"},
-        )
-        pipeline_logger.finalize()
+        stage_metrics["stage_b"] = {
+            "voiced_ratio": 0.0,
+            "mean_confidence": 0.0,
+            "octave_jump_rate": 0.0,
+            "f0_zero_ratio": 0.0,
+            "timeline_frames": len(getattr(analysis_data, "timeline", []) or []),
+        }
 
-        return TranscriptionResult(
-            musicxml=d_out.musicxml,
-            analysis_data=d_out.analysis_data,
-            midi_bytes=d_out.midi_bytes
-        )
+        note_durations = [max(0.0, float(n.end_sec) - float(n.start_sec)) for n in of_notes or [] if getattr(n, "end_sec", 0.0) > getattr(n, "start_sec", 0.0)]
+        duration_sec = float(getattr(stage_a_out.meta, "duration_sec", 0.0) or 0.0)
+        stage_metrics["stage_c"] = {
+            "note_count": len(of_notes or []),
+            "note_count_per_10s": (len(of_notes or []) / (duration_sec / 10.0)) if duration_sec else 0.0,
+            "median_note_len_ms": float(np.median(note_durations) * 1000.0) if note_durations else 0.0,
+            "fragmentation_score": float(sum(1 for d in note_durations if d < 0.08) / max(1, len(of_notes or []))) if of_notes else 0.0,
+        }
+
+        stage_metrics["stage_d"] = {
+            "quantization_mean_shift_ms": 0.0,
+            "quantization_p95_shift_ms": 0.0,
+            "rendered_notes": len(getattr(d_out.analysis_data, "notes", []) or []),
+        }
+
+        return _finalize_and_return(d_out, mode="onsets_frames")
 
     # --------------------------------------------------------
     # SEGMENTED TRANSCRIPTION LOGIC (Optional)
@@ -842,108 +965,4 @@ def transcribe(
         "rendered_notes": len(getattr(d_out.analysis_data, "notes", []) or []),
     }
 
-    # Save resolved configuration for debugging parity with API path
-    dump_resolved_config(config, stage_a_out.meta, stage_b_out)
-
-    # --- Artifact exports (best-effort) ---
-    try:
-        ad = d_out.analysis_data  # TranscriptionResult.analysis_data
-        # timeline.json
-        timeline_rows = []
-        for fp in getattr(ad, "timeline", []) or []:
-            # FramePitch fields per your schema
-            timeline_rows.append({
-                "time_sec": getattr(fp, "time", None),
-                "f0_hz": getattr(fp, "pitch_hz", None),
-                "midi": getattr(fp, "midi", None),
-                "confidence": getattr(fp, "confidence", None),
-                "rms": getattr(fp, "rms", None),
-                "active_pitches": getattr(fp, "active_pitches", None),
-            })
-        pipeline_logger.write_json("timeline.json", timeline_rows)
-
-        # predicted_notes.json
-        note_rows = []
-        for ne in getattr(ad, "notes", []) or []:
-            note_rows.append({
-                "start_sec": getattr(ne, "start_sec", None),
-                "end_sec": getattr(ne, "end_sec", None),
-                "midi_note": getattr(ne, "midi_note", None),
-                "pitch_hz": getattr(ne, "pitch_hz", None),
-                "confidence": getattr(ne, "confidence", None),
-                "velocity": getattr(ne, "velocity", None),
-                "voice": getattr(ne, "voice", None),
-                "staff": getattr(ne, "staff", None),
-            })
-        pipeline_logger.write_json("predicted_notes.json", note_rows)
-
-        # resolved_config.json (dataclass + runtime meta)
-        from dataclasses import asdict as _asdict, is_dataclass as _isdc
-        resolved = _asdict(config) if _isdc(config) else {"config": str(config)}
-        resolved["runtime"] = {
-            "hop_length": getattr(stage_a_out.meta, "hop_length", None),
-            "window_size": getattr(stage_a_out.meta, "window_size", None),
-            "sample_rate": getattr(stage_a_out.meta, "sample_rate", None),
-            "duration_sec": getattr(stage_a_out.meta, "duration_sec", None),
-        }
-        pipeline_logger.write_json("resolved_config.json", resolved)
-        pipeline_logger.write_json("stage_metrics.json", stage_metrics)
-        pipeline_logger.write_text("rendered.musicxml", d_out.musicxml or "")
-
-        # summary.csv (append)
-        summary_path = os.path.join(pipeline_logger.base_dir, "summary.csv")
-        os.makedirs(pipeline_logger.base_dir, exist_ok=True)
-        summary_fields = [
-            "run_dir",
-            "note_count",
-            "duration_sec",
-            "voiced_ratio",
-            "mean_confidence",
-        ]
-        write_header = not os.path.exists(summary_path)
-        with open(summary_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=summary_fields)
-            if write_header:
-                writer.writeheader()
-            writer.writerow({
-                "run_dir": pipeline_logger.run_dir,
-                "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
-                "duration_sec": stage_metrics.get("stage_a", {}).get("duration_out_sec", 0.0),
-                "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
-                "mean_confidence": stage_metrics.get("stage_b", {}).get("mean_confidence", 0.0),
-            })
-
-        # leaderboard.json (best-effort)
-        leaderboard_path = os.path.join(pipeline_logger.base_dir, "leaderboard.json")
-        leaderboard_data = {}
-        if os.path.exists(leaderboard_path):
-            try:
-                with open(leaderboard_path, "r", encoding="utf-8") as f:
-                    leaderboard_data = json.load(f) or {}
-            except Exception:
-                leaderboard_data = {}
-        leaderboard_data[pipeline_logger.run_name] = {
-            "note_count": stage_metrics.get("stage_c", {}).get("note_count", 0),
-            "voiced_ratio": stage_metrics.get("stage_b", {}).get("voiced_ratio", 0.0),
-        }
-        with open(leaderboard_path, "w", encoding="utf-8") as f:
-            json.dump(leaderboard_data, f, indent=2)
-
-        pipeline_logger.log_event(stage="pipeline", event="artifact_export",
-                                  payload={"files": ["timeline.json", "predicted_notes.json", "resolved_config.json", "stage_metrics.json", "rendered.musicxml"]})
-    except Exception as e:
-        pipeline_logger.log_event(stage="pipeline", event="artifact_export_failed",
-                                  payload={"error": str(e)})
-
-    pipeline_logger.log_event(
-        "pipeline",
-        "complete",
-        {"notes": len(d_out.analysis_data.notes), "run_dir": pipeline_logger.run_dir},
-    )
-    pipeline_logger.finalize()
-
-    return TranscriptionResult(
-        musicxml=d_out.musicxml,
-        analysis_data=d_out.analysis_data,
-        midi_bytes=d_out.midi_bytes
-    )
+    return _finalize_and_return(d_out)
