@@ -138,8 +138,9 @@ def create_harmonic_mask(
     n_frames = int(f0_hz.shape[0])
     n_bins = n_fft // 2 + 1
 
-    freqs = np.linspace(0.0, float(sr) / 2.0, n_bins, dtype=np.float32)
     mask = np.ones((n_bins, n_frames), dtype=np.float32)
+    # Frequency per bin
+    bin_hz = float(sr) / float(n_fft)
 
     for t in range(n_frames):
         f0 = float(f0_hz[t])
@@ -155,9 +156,17 @@ def create_harmonic_mask(
             lo = fh - bw
             hi = fh + bw
 
-            idx = np.where((freqs >= lo) & (freqs <= hi))[0]
-            if idx.size:
-                mask[idx, t] = 0.0
+            # Vectorized index calculation
+            # lo <= i * bin_hz <= hi  =>  lo/bin_hz <= i <= hi/bin_hz
+            idx_lo = int(np.ceil(lo / bin_hz))
+            idx_hi = int(np.floor(hi / bin_hz))
+
+            # Clamp to valid range
+            idx_lo = max(0, idx_lo)
+            idx_hi = min(n_bins - 1, idx_hi)
+
+            if idx_lo <= idx_hi:
+                mask[idx_lo : idx_hi + 1, t] = 0.0
 
     return mask
 
