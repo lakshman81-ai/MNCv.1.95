@@ -63,6 +63,7 @@ class MetaData:
     original_sr: Optional[int] = None
     target_sr: int = 44100
     duration_sec: float = 0.0
+    original_duration_sec: float = 0.0
 
     # Optional beat grid (seconds)
     beats: List[float] = field(default_factory=list)
