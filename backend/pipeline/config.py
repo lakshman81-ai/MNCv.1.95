@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 
 
@@ -10,14 +10,19 @@ from dataclasses import dataclass, field
 class StageAConfig:
     target_sample_rate: int = 44100
     channel_handling: str = "mono_sum"  # "mono_sum", "left_only", "right_only"
-    dc_offset_removal: bool = True
+
+    # Preprocessing flags/dicts (updated for 61-key flexibility)
+    dc_offset_removal: Union[bool, Dict[str, Any]] = True
 
     # Transient emphasis (hammer clicks)
     transient_pre_emphasis: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "alpha": 0.97}
     )
 
-    # High-pass filter (protect C2 ≈ 65.4 Hz)
+    # High-pass filter (can be used as dict in PIANO_61KEY_CONFIG or legacy separate fields)
+    high_pass_filter: Dict[str, Any] = field(default_factory=dict)
+
+    # Legacy fields kept for backward compatibility (defaults align with legacy behavior)
     high_pass_filter_cutoff: Dict[str, Any] = field(
         default_factory=lambda: {"value": 55.0}
     )
@@ -97,7 +102,7 @@ class StageBConfig:
     confidence_priority_floor: float = 0.5
 
     # Cross-detector disagreement tolerance (cents)
-    pitch_disagreement_cents: float = 45.0
+    pitch_disagreement_cents: float = 70.0  # WI: 70 cents
 
     # Ensemble weights (WI-aligned core)
     #   Piano: SwiftF0 dominates, SACF/CQT support.
@@ -293,6 +298,9 @@ class StageDConfig:
     # MusicXML divisions per quarter note (24 = 1/24 quarter)
     divisions_per_quarter: int = 24
 
+    # Quantization grid (e.g. 16 for 1/16th)
+    quantization_grid: int = 16
+
     # Staff split point (MIDI pitch)
     staff_split_point: Dict[str, Any] = field(
         default_factory=lambda: {"pitch": 60}  # C4
@@ -316,6 +324,10 @@ class StageDConfig:
     glissando_handling_piano: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": False}
     )
+
+    # Tempo/Time signature defaults
+    tempo_bpm: float = 120.0
+    time_signature: str = "4/4"
 
 
 # ------------------------------------------------------------
@@ -502,6 +514,50 @@ _profiles: List[InstrumentProfile] = [
 # Default Pipeline Config instance
 # ------------------------------------------------------------
 
+# 61-key preset with all enabled preprocessing and detector defaults
 PIANO_61KEY_CONFIG = PipelineConfig(
+    stage_a=StageAConfig(
+        target_sample_rate=22050,
+        silence_trimming={"enabled": True, "top_db": 40.0},
+        high_pass_filter={"enabled": True, "cutoff_hz": 60.0, "order": 4},
+        dc_offset_removal=True,
+        peak_limiter={"enabled": True, "ceiling_db": -1.0, "mode": "tanh", "drive": 2.5},
+        bpm_detection={"enabled": True, "tightness": 100},
+    ),
+    stage_b=StageBConfig(
+        confidence_voicing_threshold=0.5,
+        confidence_priority_floor=0.5,
+        pitch_disagreement_cents=70.0,
+        ensemble_weights={"swiftf0": 0.5, "sacf": 0.3, "cqt": 0.2, "yin": 0.1},
+        detectors={
+            "swiftf0": {"enabled": True, "fmin": 60.0, "fmax": 2000.0, "confidence_threshold": 0.9},
+            "sacf":    {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "window_size": 4096, "threshold": 0.3},
+            "cqt":     {"enabled": True, "fmin": 60.0, "fmax": 4000.0, "bins_per_octave": 48, "n_bins": 240, "max_peaks": 8},
+            "yin":     {"enabled": False, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1},
+            "rmvpe":   {"enabled": False},
+            "crepe":   {"enabled": False},
+        },
+        melody_filtering={
+             "median_window": 7,
+             "voiced_prob_threshold": 0.0,
+             "rms_gate_db": -40.0,
+        },
+    ),
+    stage_c=StageCConfig(
+        min_note_duration_ms=50.0,
+        segmentation_method={
+            "method": "hmm",
+            "min_onset_frames": 3,
+            "release_frames": 2,
+            "time_merge_frames": 1,
+            "split_semitone": 0.7,
+        },
+        pitch_tolerance_cents=50.0,
+    ),
+    stage_d=StageDConfig(
+        quantization_grid=16,
+        tempo_bpm=120.0,
+        time_signature="4/4",
+    ),
     instrument_profiles=_profiles
 )

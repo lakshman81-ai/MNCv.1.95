@@ -67,6 +67,7 @@ class MetaData:
 
     # Optional beat grid (seconds)
     beats: List[float] = field(default_factory=list)
+    beat_times: List[float] = field(default_factory=list)  # Alias for beats
 
     # Extended robust fields
     audio_path: Optional[str] = None
@@ -150,7 +151,7 @@ class NoteEvent:
     velocity: float = 0.8                   # normalized 0.0–1.0, NOT MIDI 0–127
     rms_value: float = 0.0                  # Raw RMS energy (linear)
     is_grace: bool = False
-    dynamic: str = "mf"                     # "p", "mf", "f", etc.
+    dynamic: Optional[str] = "mf"           # "p", "mf", "f", etc.
     voice: int = 1                          # Voice index
     staff: str = "treble"                   # "treble" or "bass"
 

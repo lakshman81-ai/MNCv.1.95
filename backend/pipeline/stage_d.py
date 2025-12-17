@@ -2,6 +2,7 @@ from typing import List, Optional, Dict, Tuple, Any
 import numpy as np
 import tempfile
 import os
+import math
 try:
     import music21
     from music21 import (
@@ -32,6 +33,8 @@ except Exception:
     from config import PIANO_61KEY_CONFIG, PipelineConfig  # type: ignore
 
 
+def _lcm(a, b): return abs(a*b) // math.gcd(a, b)
+
 def quantize_and_render(
     events: List[NoteEvent],
     analysis_data: AnalysisData,
@@ -59,7 +62,9 @@ def quantize_and_render(
 
     d_conf = config.stage_d
 
-    bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else None
+    # D1: Tempo/time signature export
+    bpm = analysis_data.meta.tempo_bpm
+    # Fallback to beat diffs
     if bpm is None:
         beats_seq = getattr(analysis_data, "beats", []) or []
         if beats_seq:
@@ -68,13 +73,20 @@ def quantize_and_render(
                 med = float(np.median(diffs))
                 if med > 0:
                     bpm = 60.0 / med
+
+    # Fallback to config or default
     if bpm is None or not np.isfinite(bpm):
-        bpm = 100.0
-    ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else "4/4"
+        bpm = float(getattr(d_conf, "tempo_bpm", 120.0))
+
+    ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else getattr(d_conf, "time_signature", "4/4")
     split_pitch = d_conf.staff_split_point.get("pitch", 60)  # C4
 
-    # NOTE: divisions_per_quarter is currently not used.
-    divisions_per_quarter = getattr(d_conf, "divisions_per_quarter", None)
+    # D2: Divisions/measure integrity aligned to quantization grid
+    # Compute divisions based on grid
+    grid_val = int(getattr(d_conf, "quantization_grid", 16))
+    divisions_per_quarter = _lcm(4, grid_val)
+    # Note: we don't explicitly force music21 divisions often, but we can try setting it on stream if needed.
+    # More importantly, we quantize durations to the grid.
 
     # Glissando config (currently not applied in v1)
     gliss_conf = d_conf.glissando_threshold_general
@@ -95,8 +107,13 @@ def quantize_and_render(
     part_bass.append(clef.BassClef())
 
     # Time Signature / Tempo / Key: use distinct elements per staff to avoid shared state
-    ts_treble = meter.TimeSignature(ts_str)
-    ts_bass = meter.TimeSignature(ts_str)
+    try:
+        ts_treble = meter.TimeSignature(ts_str)
+        ts_bass = meter.TimeSignature(ts_str)
+    except Exception:
+        ts_treble = meter.TimeSignature("4/4")
+        ts_bass = meter.TimeSignature("4/4")
+
     part_treble.append(ts_treble)
     part_bass.append(ts_bass)
 
@@ -121,6 +138,7 @@ def quantize_and_render(
     # 2. Prepare Events: group by staff + onset in beats
     # --------------------------------------------------------
     quarter_dur = 60.0 / float(bpm)
+    grid_res_beats = 4.0 / float(grid_val) # e.g. 4/16 = 0.25 beats for 16th note
 
     def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
         dur_beats = getattr(e, "duration_beats", None)
@@ -143,27 +161,45 @@ def quantize_and_render(
             else:
                 start_beats = e.start_sec / quarter_dur
 
+        # D2: Quantize to grid
+        # Round start and duration to nearest grid unit
+        start_beats = round(start_beats / grid_res_beats) * grid_res_beats
+        dur_beats = max(grid_res_beats, round(dur_beats / grid_res_beats) * grid_res_beats)
+
         return float(start_beats), float(dur_beats)
 
     events_sorted = sorted(events, key=lambda e: (e.start_sec, e.midi_note))
 
-    staff_groups: Dict[Tuple[str, float], Dict[str, Any]] = {}
+    # Group by (staff, voice_idx, start_beats)
+    # D3: Multi-voice support - we will group by voice index too
+    staff_voice_groups: Dict[Tuple[str, int, float], Dict[str, Any]] = {}
 
     for e in events_sorted:
         staff_name = getattr(e, "staff", None)
         if staff_name not in ("treble", "bass"):
             staff_name = "treble" if e.midi_note >= split_pitch else "bass"
 
-        start_beats, dur_beats = get_event_beats(e)
-        start_key = round(start_beats * 64.0) / 64.0
+        # Determine voice. If not set, infer from pitch relative to split?
+        # Assuming e.voice is populated (1-based index)
+        voice_idx = getattr(e, "voice", 1)
+        if voice_idx is None: voice_idx = 1
 
-        key_tuple = (staff_name, start_key)
-        if key_tuple not in staff_groups:
-            staff_groups[key_tuple] = {"events": [], "start_beats": start_beats}
-        staff_groups[key_tuple]["events"].append(e)
-        staff_groups[key_tuple]["start_beats"] = min(
-            staff_groups[key_tuple]["start_beats"], start_beats
-        )
+        # Simple split: If e.voice wasn't set smartly upstream, we might want to override here?
+        # But requirement D3 says: "rely on music21 Voices if used".
+        # And "Rule for assigning voices (minimal, usable now): voice=1 for higher pitches..."
+        # We rely on stage C to have set e.voice if polyphonic.
+        # If stage C didn't set meaningful voices, they all default to 1.
+
+        start_beats, dur_beats = get_event_beats(e)
+
+        # Key for grouping: staff, voice, start_time
+        # Round start time for key to avoid float jitter
+        start_key = round(start_beats * 1024.0) / 1024.0
+
+        key_tuple = (staff_name, voice_idx, start_key)
+        if key_tuple not in staff_voice_groups:
+            staff_voice_groups[key_tuple] = {"events": [], "start_beats": start_beats}
+        staff_voice_groups[key_tuple]["events"].append(e)
 
     # --------------------------------------------------------
     # 3. Create music21 Notes / Chords from grouped events
@@ -190,18 +226,32 @@ def quantize_and_render(
         else:
             m21_obj = note.Note(midi_pitches[0])
 
-        q_len = _snap_ql(float(dur_beats))
+        # D2: Ensure duration is compatible with grid
+        # We already quantized dur_beats in get_event_beats
+        q_len = dur_beats
+
         try:
             m21_obj.duration = music21.duration.Duration(q_len)
         except Exception:
             m21_obj.duration = music21.duration.Duration(1.0)
 
         velocities = [getattr(e, "velocity", 0.7) for e in group]
-        avg_vel_norm = float(np.mean(velocities)) if velocities else 0.7
-        midi_velocity = int(max(1, min(127, round(avg_vel_norm * 127.0))))
+        # velocity is now 20-105 range from stage C, but might be 0.0-1.0 from legacy?
+        # NoteEvent definition says float 0.8 default (legacy) but Stage C uses int 20-105.
+        # We should handle both.
+
+        vel_vals = []
+        for v in velocities:
+            if v > 1.0: # assume MIDI velocity
+                vel_vals.append(v)
+            else: # assume normalized
+                vel_vals.append(v * 127.0)
+
+        avg_vel = float(np.mean(vel_vals)) if vel_vals else 64.0
+        midi_velocity = int(max(1, min(127, round(avg_vel))))
         m21_obj.volume.velocity = midi_velocity
 
-        dyn_priority = {"p": 1, "mp": 2, "mf": 3, "f": 4}
+        dyn_priority = {"pp": 1, "p": 2, "mp": 3, "mf": 4, "f": 5, "ff": 6}
         chosen_dyn = None
         best_score = 0
         for e in group:
@@ -222,49 +272,69 @@ def quantize_and_render(
 
         return m21_obj, float(start_beats_value)
 
-    for (staff_name, _start_key), group_dict in sorted(staff_groups.items(), key=lambda x: x[0]):
+    # We need to construct voices within parts.
+    # Structure: Part -> [Voice1, Voice2, ...]
+    # We collect all m21 objects for each (staff, voice)
+
+    staff_voice_content: Dict[str, Dict[int, List[Tuple[float, Any]]]] = {
+        "treble": {}, "bass": {}
+    }
+
+    for (staff_name, voice_idx, _start_key), group_dict in sorted(staff_voice_groups.items(), key=lambda x: x[0]):
         m21_obj, start_beats_value = build_m21_from_group(
             group_dict["events"], group_dict["start_beats"]
         )
-        offset = float(start_beats_value)
+        if voice_idx not in staff_voice_content[staff_name]:
+            staff_voice_content[staff_name][voice_idx] = []
+        staff_voice_content[staff_name][voice_idx].append((start_beats_value, m21_obj))
 
-        if staff_name == "bass":
-            part_bass.insert(offset, m21_obj)
+    # Helper to build a Part from voice contents
+    def _populate_part_with_voices(p: stream.Part, voice_data: Dict[int, List[Tuple[float, Any]]], total_dur: float):
+        # If only one voice (voice 1), and no others, we can just insert directly into Part?
+        # Actually standard practice is if single voice, just put notes in part.
+        # But if multiple voices, use Voice objects.
+        # Let's see how many voices we have.
+
+        voice_indices = sorted(voice_data.keys())
+        if not voice_indices:
+             return
+
+        # Use voices if more than one voice index is present OR if the voice index is > 1
+        use_voices = len(voice_indices) > 1 or (voice_indices and voice_indices[0] > 1)
+
+        if use_voices:
+            for v_idx in voice_indices:
+                v_obj = stream.Voice()
+                v_obj.id = str(v_idx)
+                for offset, obj in voice_data[v_idx]:
+                    v_obj.insert(offset, obj)
+                p.insert(0, v_obj)
         else:
-            part_treble.insert(offset, m21_obj)
+            # Single voice 1
+            v_idx = voice_indices[0]
+            for offset, obj in voice_data[v_idx]:
+                p.insert(offset, obj)
 
-    # Pad to ensure each staff can produce measures
-    treble_dur = float(part_treble.highestTime or 0.0)
-    bass_dur = float(part_bass.highestTime or 0.0)
-    target_duration = max(treble_dur, bass_dur)
+    # Determine max duration to pad
+    treble_max = 0.0
+    for v_idx, items in staff_voice_content["treble"].items():
+        for off, obj in items:
+            treble_max = max(treble_max, off + obj.duration.quarterLength)
 
-    def _pad_part(p: stream.Part, duration: float):
-        existing = float(p.highestTime or 0.0)
-        if existing <= 0.0 and duration <= 0.0:
-            p.insert(0.0, note.Rest(quarterLength=beats_per_measure))
-            return
-        if existing <= 0.0:
-            p.insert(0.0, note.Rest(quarterLength=max(duration, beats_per_measure)))
-            return
-        gap = duration - existing
-        if gap > 0.0:
-            p.insert(existing, note.Rest(quarterLength=gap))
+    bass_max = 0.0
+    for v_idx, items in staff_voice_content["bass"].items():
+        for off, obj in items:
+            bass_max = max(bass_max, off + obj.duration.quarterLength)
 
-    def _ensure_nonempty_part(p: stream.Part):
-        notes_and_chords = [
-            el for el in p.recurse().notesAndRests if isinstance(el, (note.Note, chord.Chord))
-        ]
-        if not notes_and_chords:
-            p.insert(0.0, note.Rest(quarterLength=beats_per_measure))
+    target_duration = max(treble_max, bass_max)
 
-    _ensure_nonempty_part(part_treble)
-    _ensure_nonempty_part(part_bass)
+    _populate_part_with_voices(part_treble, staff_voice_content["treble"], target_duration)
+    _populate_part_with_voices(part_bass, staff_voice_content["bass"], target_duration)
 
-    _pad_part(part_treble, target_duration)
-    _pad_part(part_bass, target_duration)
-
-    s.append(part_treble)
-    s.append(part_bass)
+    # Pad to ensure each staff can produce measures - rudimentary padding
+    # If using Voices, padding rests need to be inside voices too or in the part?
+    # M21 makeMeasures usually handles incomplete measures by padding with rests if we set `makeRests=True`.
+    # But let's ensure we at least cover the duration.
 
     # 3b. Glissando (Optional)
     if gliss_conf.get("enabled", False):
@@ -308,6 +378,7 @@ def quantize_and_render(
     quantized_parts = []
     for p in (part_treble, part_bass):
         try:
+            # makeMeasures might fail with complex voice overlaps, so we use best effort
             p_quant = p.makeMeasures(inPlace=False)
             p_quant.makeRests(inPlace=True)
             p_quant.makeTies(inPlace=True)

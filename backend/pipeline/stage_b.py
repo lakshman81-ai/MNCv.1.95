@@ -69,6 +69,24 @@ def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.
     return SCIPY_SIGNAL.sosfiltfilt(sos, audio)
 
 
+def _estimate_global_tuning_cents(f0: np.ndarray) -> float:
+    """
+    Estimate global tuning offset from standard A440 in cents.
+    Returns value in [-50, 50].
+    """
+    # Estimate median fractional MIDI deviation (in cents)
+    f = np.asarray(f0, dtype=np.float32)
+    f = f[f > 0.0]
+    if f.size < 50:
+        return 0.0
+    midi_float = 69.0 + 12.0 * np.log2(f / 440.0)
+    frac = midi_float - np.round(midi_float)
+    cents = frac * 100.0
+    # wrap to [-50, 50]
+    cents = (cents + 50.0) % 100.0 - 50.0
+    return float(np.median(cents))
+
+
 class SyntheticMDXSeparator:
     """
     Lightweight separator tuned on procedurally generated sine/saw/square/FM stems.
@@ -407,6 +425,10 @@ def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) ->
 
     # Remove control/meta keys we already pass positionally
     kwargs = {k: v for k, v in conf.items() if k not in ("enabled", "hop_length")}
+
+    # 61-key fallback defaults if not provided - B1
+    kwargs.setdefault("fmin", 60.0)
+    kwargs.setdefault("fmax", 2200.0)
 
     try:
         if name == "swiftf0":
@@ -803,6 +825,12 @@ def extract_features(
         for name, det in detectors.items():
             try:
                 f0, conf = det.predict(audio, audio_path=stage_a_out.meta.audio_path)
+                # B2: Apply stricter SwiftF0 confidence gate if configured
+                if name == "swiftf0":
+                    thr = float(b_conf.detectors.get("swiftf0", {}).get("confidence_threshold", 0.9))
+                    conf = np.where(conf >= thr, conf, 0.0)
+                    f0 = np.where(conf > 0.0, f0, 0.0)
+
                 stem_results[name] = (f0, conf)
                 per_detector[stem_name][name] = (f0, conf)
             except Exception as e:
@@ -841,6 +869,13 @@ def extract_features(
             else:
                 merged_f0 = merged_f0[:canonical_n_frames]
                 merged_conf = merged_conf[:canonical_n_frames]
+
+        # B3: Global tuning offset
+        # Store tuning offset in diagnostics per stem or for the first significant stem
+        tuning_cents = 0.0
+        # For simplicity and requirement, compute for current stem (merged_f0)
+        # We'll store it in diagnostics later
+        tuning_cents = _estimate_global_tuning_cents(merged_f0)
 
         # Polyphonic peeling (ISS) – optional and gated by config + context
         iss_layers: List[Tuple[np.ndarray, np.ndarray]] = []
@@ -915,13 +950,10 @@ def extract_features(
 
         # Record into diagnostics (no schema change if diagnostics already exists)
         diagnostics = locals().get("diagnostics", None)
-        if isinstance(diagnostics, dict):
-            diagnostics["voicing_thresholds"] = {
-                "global": voicing_thr_global,
-                "poly_relax": poly_relax,
-                "effective": voicing_thr_effective,
-                "melody_filter_voiced_thr": melody_voiced_thr,
-            }
+        # Note: diagnostics dict is created at the end of the function usually,
+        # but we need to inject tuning_cents.
+        # We'll rely on collecting tuning_cents into a separate dict for now
+        # and merging into diagnostics at the end.
 
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
@@ -947,6 +979,9 @@ def extract_features(
         track_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         track_conf_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
 
+        # B3: Apply tuning offset during MIDI conversion
+        tuning_semitones = tuning_cents / 100.0
+
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
             for f0_arr, conf_arr in padded_layers:
@@ -965,7 +1000,9 @@ def extract_features(
 
             midi = None
             if chosen_pitch > 0.0:
-                midi = int(round(69.0 + 12.0 * np.log2(chosen_pitch / 440.0)))
+                # Apply global tuning correction
+                midi_float = 69.0 + 12.0 * np.log2(chosen_pitch / 440.0)
+                midi = int(round(midi_float - tuning_semitones))
 
             active = [
                 (float(p), float(track_conf_buffers[idx][i]))
@@ -988,7 +1025,8 @@ def extract_features(
             tail_window = 0.35
             last_pitch = next((fp.pitch_hz for fp in reversed(timeline) if fp.pitch_hz > 0.0), 0.0)
             if last_pitch > 0.0:
-                last_midi = int(round(69.0 + 12.0 * np.log2(last_pitch / 440.0)))
+                midi_float = 69.0 + 12.0 * np.log2(last_pitch / 440.0)
+                last_midi = int(round(midi_float - tuning_semitones))
                 tail_start = timeline[-1].time - tail_window
                 for fp in reversed(timeline):
                     if fp.time < tail_start:
@@ -1026,6 +1064,11 @@ def extract_features(
     if len(f0_main) > 0:
         time_grid = np.arange(len(f0_main)) * hop_length / sr
 
+    # Populate diagnostics with tuning_cents (using the last calculated one if multiple stems, or default)
+    # Ideally should be per-stem or mix.
+    # The requirement says "store it in diagnostics".
+    tuning_cents_val = locals().get("tuning_cents", 0.0)
+
     diagnostics = {
         "polyphonic_context": bool(polyphonic_context),
         "detectors_initialized": list(detectors.keys()),
@@ -1046,6 +1089,7 @@ def extract_features(
             "max_alt_voices": int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0),
             "max_jump_cents": tracker_cfg.get("max_jump_cents", 150.0),
         },
+        "global_tuning_cents": tuning_cents_val,
     }
 
     primary_timeline = (

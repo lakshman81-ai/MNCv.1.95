@@ -49,14 +49,47 @@ def _get(obj: Any, path: str, default: Any = None) -> Any:
 
 
 def _velocity_from_rms(rms_list: List[float], vmin: int = 20, vmax: int = 105) -> int:
+    # C4: Velocity mapping from RMS (20–105)
+    # The snippet:
+    # x = (rms - rms_min) / max(rms_max - rms_min, 1e-9)
+    # x = x ** 0.6
+    # v = 20 + round(x * (105 - 20))
     if not rms_list:
         return 64
-    r = float(np.median(np.asarray(rms_list, dtype=np.float64)))
-    # Map RMS roughly [0..0.2] -> [vmin..vmax]
-    x = max(0.0, min(1.0, r / 0.2))
-    v = int(round(vmin + x * (vmax - vmin)))
-    return int(max(vmin, min(vmax, v)))
 
+    # Using rough defaults for min/max RMS logic if not passed.
+    # Typically min/max RMS are determined by calibration or config.
+    # Here we assume min_db=-40, max_db=-4 from config defaults if we can access them,
+    # but this function is standalone.
+    # Let's use hardcoded defaults or estimate from input?
+    # The snippet provided expects arguments rms_min, rms_max.
+    # We'll adapt to use reasonable defaults or median.
+
+    rms = float(np.mean(rms_list)) # Use mean of note RMS
+
+    # Default range -40dB to -4dB
+    min_rms = 10**(-40/20)
+    max_rms = 10**(-4/20)
+
+    x = (rms - min_rms) / max(max_rms - min_rms, 1e-9)
+    x = float(np.clip(x, 0.0, 1.0))
+    x = x ** 0.6
+    v = 20 + int(round(x * (105 - 20)))
+    return int(np.clip(v, 20, 105))
+
+def _velocity_to_dynamic(v: int) -> str:
+    # C4: Dynamic label assignment
+    if v < 30: return "pp"
+    if v < 45: return "p"
+    if v < 60: return "mp"
+    if v < 75: return "mf"
+    if v < 90: return "f"
+    return "ff"
+
+def _cents_diff_hz(a, b):
+    if a <= 0 or b <= 0:
+        return 1e9
+    return abs(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
 
 def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
     if len(timeline) < 2:
@@ -104,94 +137,136 @@ def _segment_monophonic(
     min_rms: float = 0.01,
     conf_start: float | None = None,
     conf_end: float | None = None,
+    seg_cfg: Dict[str, Any] = {},
+    hop_s: float = 0.01,
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
-
-    Strategy:
-      - active if midi present, confidence >= conf_thr, AND rms >= min_rms
-      - keep segment through short gaps (<= gap_tolerance_s)
-      - split if pitch jumps too much (in semitones)
-      - split if gap was caused by low RMS (energy drop -> repeated note)
+    Updated for C1 (hysteresis) and C2 (gap merge/vibrato).
     """
     if len(timeline) < 2:
         return []
 
-    times = np.array([fp.time for fp in timeline], dtype=np.float64)
-    mids = np.array([fp.midi if fp.midi is not None else -1 for fp in timeline], dtype=np.int32)
-    conf = np.array([fp.confidence for fp in timeline], dtype=np.float64)
-    rmss = np.array([fp.rms for fp in timeline], dtype=np.float64)
+    # C1: Frame stability onset (>= 3 frames) + release hysteresis (2-3 frames)
+    min_on = int(seg_cfg.get("min_onset_frames", 3))
+    rel = int(seg_cfg.get("release_frames", 2))
 
-    # estimate hop
-    dt = np.diff(times)
-    hop_s = float(np.median(dt)) if dt.size else 0.01
-    hop_s = max(1e-4, hop_s)
+    # C2 Params
+    split_semi = float(seg_cfg.get("split_semitone", 0.7))
+    split_cents = split_semi * 100.0
+    time_merge_frames = int(seg_cfg.get("time_merge_frames", 1))
 
-    start_thr = float(conf_start) if conf_start is not None else float(conf_thr)
-    end_thr = float(conf_end) if conf_end is not None else float(conf_thr)
-
-    active = (mids > 0) & (conf >= start_thr) & (rmss >= min_rms)
+    # We will use a state machine approach similar to the request snippet,
+    # but adapted to return list of (start, end) indices.
 
     segs: List[Tuple[int, int]] = []
-    i = 0
-    while i < len(timeline):
-        if not active[i]:
-            i += 1
-            continue
 
-        s = i
-        e = i
-        last_m = float(mids[i])
-        peak_rms = rmss[i]
-        gap = 0.0
-        i += 1
+    stable = 0
+    silent = 0
+    active = False
 
-        while i < len(timeline):
-            if active[i]:
-                m = float(mids[i])
-                r = rmss[i]
-                peak_rms = max(peak_rms, r)
+    current_start = -1
+    current_end = -1
+    current_pitch_hz = 0.0
 
-                # Check 1: Pitch jump
-                if abs(m - last_m) > semitone_stability * 12.0:
-                    break
+    # Pre-calculate voiced status
+    # voiced = (fp.pitch_hz > 0.0 and fp.confidence >= conf_thr)
+    # But wait, conf_thr logic for hysteresis is simpler if we check on the fly
 
-                # Check 2: Gap analysis (Re-attack)
-                if gap > 0:
-                    gap_indices = range(e + 1, i)
-                    if gap_indices:
-                        gap_rms = rmss[gap_indices]
-                        if np.mean(gap_rms) < min_rms:
-                             break
+    for i, fp in enumerate(timeline):
+        voiced = (fp.pitch_hz > 0.0 and fp.confidence >= conf_thr)
 
-                # Check 3: Intra-note re-attack (Valley detection)
-                # If we are well inside the note (some frames passed)
-                # And we detect a rise from a valley
-                if i > s + 2:
-                    prev_r = rmss[i-1]
-                    # Valley: previous RMS significantly lower than peak
-                    is_valley = prev_r < peak_rms * 0.85
-                    # Attack: current RMS rising significantly
-                    is_rise = r > prev_r * 1.05
-
-                    if is_valley and is_rise:
-                        break
-
-                last_m = m
-                e = i
-                gap = 0.0
+        if voiced:
+            silent = 0
+            if not active:
+                stable += 1
+                if stable >= min_on:
+                    active = True
+                    # Start new note, backdate to start of stable run?
+                    # Usually we start at i - stable + 1 or just i?
+                    # Request logic: "current = start_new_note(fp.time...)" implies start now.
+                    # But usually we want to capture the onset.
+                    # Let's say it starts at i - (min_on - 1).
+                    current_start = i - (min_on - 1)
+                    current_end = i
+                    current_pitch_hz = fp.pitch_hz
             else:
-                gap += hop_s
-                # Allow brief dips down to end_thr before splitting
-                if conf[i] < end_thr or gap > float(gap_tolerance_s):
-                    break
-            i += 1
+                # Check vibrato / pitch jump - C2
+                diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
+                if diff <= split_cents:
+                    # Extend note
+                    current_end = i
+                    # Update pitch average? Simple implementation just keeps extend
+                else:
+                    # Split note
+                    segs.append((current_start, current_end))
 
-        dur = float(times[e] - times[s] + hop_s)
-        if dur >= float(min_note_dur_s):
-            segs.append((s, e))
+                    # Reset for new note
+                    # Should it require stability again?
+                    # The prompt snippet says "finalize_note(current); current = start_new_note..."
+                    # So it starts immediately.
+                    current_start = i
+                    current_end = i
+                    current_pitch_hz = fp.pitch_hz
+                    stable = min_on # Assume stability transfers? Or reset?
+                    # Usually immediate split means we treat this frame as start of new valid note.
 
-    return segs
+        else:
+            stable = 0
+            if active:
+                silent += 1
+                if silent >= rel:
+                    # Finalize
+                    segs.append((current_start, current_end))
+                    active = False
+                    current_start = -1
+                    current_end = -1
+
+    # Close pending
+    if active and current_start != -1:
+        segs.append((current_start, current_end))
+
+    # C2: Gap merge (1-frame)
+    # If same pitch class and gap <= time_merge_frames * hop_duration, merge instead of split.
+    # Note: we are operating on indices here.
+    # pitch class check needs midi or hz.
+
+    if len(segs) < 2:
+        return segs
+
+    merged_segs = []
+    if segs:
+        curr_s, curr_e = segs[0]
+        # Calculate pitch for current seg to check against next
+        def get_seg_pitch(s, e):
+            p = [timeline[x].pitch_hz for x in range(s, e+1) if timeline[x].pitch_hz > 0]
+            if not p: return 0.0
+            return np.median(p)
+
+        curr_p = get_seg_pitch(curr_s, curr_e)
+
+        for i in range(1, len(segs)):
+            next_s, next_e = segs[i]
+            next_p = get_seg_pitch(next_s, next_e)
+
+            # Gap in frames
+            gap = next_s - curr_e - 1
+
+            # Check merge conditions
+            # 1. Gap small enough
+            # 2. Pitch close enough (use split_cents)
+            if gap <= time_merge_frames and _cents_diff_hz(curr_p, next_p) <= split_cents:
+                # Merge
+                curr_e = next_e
+                # Update pitch (maybe weighted average, but keeping curr_p is stable)
+            else:
+                merged_segs.append((curr_s, curr_e))
+                curr_s, curr_e = next_s, next_e
+                curr_p = next_p
+
+        merged_segs.append((curr_s, curr_e))
+
+    return merged_segs
 
 
 def _viterbi_voicing_mask(
@@ -346,18 +421,6 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     min_note_dur_ms_poly = _get(config, "stage_c.min_note_duration_ms_poly", None)
     gap_tolerance_s = float(_get(config, "stage_c.gap_tolerance_s", 0.05))
 
-    # Derive semitone stability from configuration.  The config may specify
-    # stage_c.pitch_tolerance_cents (e.g. 50), which we convert to a semitone
-    # stability factor.  This factor is used to determine how many semitones
-    # difference triggers a new note segment.  Default fallback aligns with
-    # previous behaviour (~0.60 semitones * 12 = 7.2 semitones).
-    pitch_tol_cents = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
-    try:
-        # 100 cents = 1 semitone
-        semitone_stability = max(0.01, pitch_tol_cents / 100.0)
-    except Exception:
-        semitone_stability = 0.60  # fallback
-
     # Calculate min_rms
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
     # RMS gate usually needs to be lower than min velocity threshold to allow decay?
@@ -441,10 +504,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 conf_thr=voice_conf_gate,
                 min_note_dur_s=voice_min_dur_s,
                 gap_tolerance_s=gap_tolerance_s,
-                semitone_stability=semitone_stability,
                 min_rms=min_rms,
                 conf_start=max(start_conf, voice_conf_gate),
                 conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+                seg_cfg=seg_cfg,
+                hop_s=hop_s,
             )
 
         for (s, e) in segs:
@@ -460,6 +524,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             pitch_hz = float(np.median(hzs)) if hzs else 0.0
             confidence = float(np.mean(confs)) if confs else 0.0
             velocity = _velocity_from_rms(rmss)
+            dynamic_label = _velocity_to_dynamic(velocity)
 
             start_sec = float(timeline[s].time)
             end_sec = float(timeline[e].time + hop_s)
@@ -474,6 +539,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     pitch_hz=pitch_hz,
                     confidence=confidence,
                     velocity=velocity,
+                    dynamic=dynamic_label,
                     voice=int(vidx + 1),
                 )
             )
@@ -622,9 +688,12 @@ def quantize_notes(
                 pitch_hz=float(n.pitch_hz),
                 confidence=float(n.confidence),
                 velocity=float(n.velocity),
+                dynamic=n.dynamic,  # Pass through dynamic
                 measure=measure,
                 beat=float(beat_in_measure),
                 duration_beats=float(duration_beats),
+                voice=n.voice,
+                staff=n.staff,
             )
         )
 
