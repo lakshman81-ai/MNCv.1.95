@@ -47,6 +47,7 @@ class MetaData:
 
     # Instrument hint (optional; used to select instrument_profiles)
     instrument: Optional[str] = None  # e.g., "piano_61key", "violin", "bass_guitar"
+    instrument_profile_applied: bool = False
 
     # Loudness / processing
     lufs: float = -14.0                     # integrated loudness in LUFS

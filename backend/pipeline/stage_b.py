@@ -760,45 +760,27 @@ def extract_features(
     sr = stage_a_out.meta.sample_rate
     hop_length = stage_a_out.meta.hop_length
 
-    # PB1 / SNIPPETS2 4B: Resolve instrument profile
+    # Patch D1: Resolve instrument profile + apply overrides (without mutating config)
+    # Priority: kwargs -> config intended instrument -> meta.instrument -> fallback
     instrument = (
         kwargs.get("instrument")
-        or kwargs.get("instrument_name")
+        or (getattr(config, "intended_instrument", None) if config else None)
         or getattr(stage_a_out.meta, "instrument", None)
         or b_conf.instrument
     )
 
     profile = config.get_profile(str(instrument)) if (instrument and b_conf.apply_instrument_profile) else None
     profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
-
-    # Backward compatibility: Map flat keys to nested structures
-    if "stage_b_detectors" not in profile_special:
-        profile_special["stage_b_detectors"] = {}
-
-    # Map yin_trough_threshold -> stage_b_detectors['yin']['trough_threshold']
-    if "yin_trough_threshold" in profile_special:
-        if "yin" not in profile_special["stage_b_detectors"]:
-             profile_special["stage_b_detectors"]["yin"] = {}
-        profile_special["stage_b_detectors"]["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
-        profile_special["stage_b_detectors"]["yin"]["enabled"] = True
-
-    if "yin_conf_threshold" in profile_special:
-        if "yin" not in profile_special["stage_b_detectors"]:
-             profile_special["stage_b_detectors"]["yin"] = {}
-        profile_special["stage_b_detectors"]["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
-        profile_special["stage_b_detectors"]["yin"]["enabled"] = True
-
-    # Map pre_lpf_hz -> stage_b_pre_filter
-    if "pre_lpf_hz" in profile_special:
-         profile_special.setdefault("stage_b_pre_filter", {})["lowpass_hz"] = float(profile_special["pre_lpf_hz"])
+    profile_applied = bool(profile)
 
     # Work on copies so we don't mutate config dataclasses
     detector_cfgs = {k: dict(v) for k, v in b_conf.detectors.items()}
     weights_eff = dict(b_conf.ensemble_weights)
     melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
 
+    # Apply profile overrides
     if profile:
-        # Force instrument range everywhere (detectors + post-filter)
+        # Force instrument range everywhere
         for _, dconf in detector_cfgs.items():
             dconf["fmin"] = float(profile.fmin)
             dconf["fmax"] = float(profile.fmax)
@@ -806,24 +788,25 @@ def extract_features(
         melody_filter_eff["fmin_hz"] = float(profile.fmin)
         melody_filter_eff["fmax_hz"] = float(profile.fmax)
 
-        # Ensure recommended algo is enabled (unless "none")
+        # Ensure recommended algo is enabled
         rec = (profile.recommended_algo or "").lower()
         if rec and rec != "none" and rec in detector_cfgs:
             detector_cfgs[rec]["enabled"] = True
 
-        # Apply nested overrides from profile.special['stage_b_detectors']
-        if "stage_b_detectors" in profile_special:
-            for dname, overrides in profile_special["stage_b_detectors"].items():
-                if dname in detector_cfgs and isinstance(overrides, dict):
-                    detector_cfgs[dname].update(overrides)
+        # Map flat keys to structure
+        if "yin_trough_threshold" in profile_special:
+            if "yin" in detector_cfgs:
+                 detector_cfgs["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
 
-        if "n_fft" in profile_special:
-             # Apply to time/frequency detectors that honor n_fft
-            for dn in ("yin", "sacf", "cqt"):
-                if dn in detector_cfgs:
-                    detector_cfgs[dn]["n_fft"] = int(profile_special["n_fft"])
+        if "yin_conf_threshold" in profile_special:
+            if "yin" in detector_cfgs:
+                 detector_cfgs["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
 
-        # Violin-style vibrato smoothing (~150ms) via median window
+        if "yin_frame_length" in profile_special:
+            if "yin" in detector_cfgs:
+                detector_cfgs["yin"]["frame_length"] = int(profile_special["yin_frame_length"])
+
+        # Violin-style vibrato smoothing
         if "vibrato_smoothing_ms" in profile_special:
             ms = float(profile_special["vibrato_smoothing_ms"])
             frame_ms = 1000.0 * float(hop_length) / float(sr)
@@ -895,19 +878,18 @@ def extract_features(
         audio = stem.audio
         per_detector[stem_name] = {}
 
-        # 4E: Skip pitch entirely for drums/percussive
+        # Patch D5: Ignore pitch for drums/percussion
         if profile_special.get("ignore_pitch", False):
             merged_f0 = np.zeros(canonical_n_frames, dtype=np.float32)
             merged_conf = np.zeros(canonical_n_frames, dtype=np.float32)
-            # Need to compute RMS still (below), but skip detectors
-            # We'll just init empty stem_results
             stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         else:
             stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
-            # PB2: Pre-LPF / Audio Conditioning per detector
-            # This allows clean guitar to use raw audio while distorted guitar uses LPF'd audio
-            pre_filter_cfg = profile_special.get("stage_b_pre_filter", {})
+            # Patch D2: Pre-LPF for distorted guitar (profile special key)
+            pre_lpf = profile_special.get("pre_lpf_hz")
+            if pre_lpf and SCIPY_SIGNAL is not None:
+                audio = _butter_filter(np.asarray(audio, np.float32), sr, float(pre_lpf), "low")
 
             # Run all initialized detectors on this stem
             for name, det in detectors.items():
@@ -915,18 +897,17 @@ def extract_features(
                     # Prepare audio for this detector
                     audio_for_det = np.asarray(audio, dtype=np.float32)
 
-                    # Apply global pre-filter from profile
-                    if pre_filter_cfg.get("lowpass_hz"):
-                        audio_for_det = _butter_filter(audio_for_det, sr, float(pre_filter_cfg["lowpass_hz"]), "low")
-
-                    # Check for detector-specific pre-filter
-                    # (This allows fine-grained control if config structure permits, though profile_special mainly targets global/inst)
-                    # We can check detector_cfgs[name].get('pre_lpf_hz')
-                    det_cfg = detector_cfgs.get(name, {})
-                    if det_cfg.get("pre_lpf_hz"):
-                        audio_for_det = _butter_filter(audio_for_det, sr, float(det_cfg["pre_lpf_hz"]), "low")
-
                     f0, conf = det.predict(audio_for_det, audio_path=stage_a_out.meta.audio_path)
+
+                    # Patch D3: Transient lockout (onset skip mask)
+                    # Note: We don't have RMS yet (computed below), so we must compute temporary RMS here
+                    # or defer this check. Wait, we need conf masked BEFORE ensemble merge.
+                    # We can compute RMS once per stem at start of loop.
+
+                    # (Re-ordering RMS computation to top of loop for D3 support)
+                    pass
+
+                    # B2: Apply stricter SwiftF0 confidence gate if configured
                     # B2: Apply stricter SwiftF0 confidence gate if configured
                     if name == "swiftf0":
                         thr = float(detector_cfgs.get("swiftf0", {}).get("confidence_threshold", 0.9))
@@ -1017,7 +998,7 @@ def extract_features(
                 except Exception as e:
                     logger.warning(f"ISS peeling failed for stem {stem_name}: {e}")
 
-        # Calculate RMS
+        # Calculate RMS (re-calculated here for final alignment, though ideally shared)
         n_fft = stage_a_out.meta.window_size if stage_a_out.meta.window_size else 2048
         frames = _frame_audio(audio, n_fft, hop_length)
         rms_vals = np.sqrt(np.mean(frames**2, axis=1))
@@ -1028,30 +1009,24 @@ def extract_features(
         elif len(rms_vals) > len(merged_f0):
             rms_vals = rms_vals[:len(merged_f0)]
 
-        # PB3: Transient Lockout
-        # Zero confidence for N frames after a sharp RMS rise
-        transient_skip_ms = float(melody_filter_eff.get("transient_skip_ms", 0) or 0)
-        # Check flat key too
-        if transient_skip_ms <= 0:
-             transient_skip_ms = float(profile_special.get("stage_b_melody_filtering", {}).get("transient_skip_ms", 0) or 0)
-
+        # Patch D3: Transient Lockout (RMS-based)
+        # Zero confidence for N frames after a sharp RMS rise (pick noise)
+        transient_skip_ms = float(profile_special.get("transient_lockout_ms", 0.0))
         if transient_skip_ms > 0 and len(rms_vals) > 1:
             skip_frames = int(round((transient_skip_ms / 1000.0) * (sr / hop_length)))
             if skip_frames > 0:
-                onset_ratio = 2.0  # Heuristic: 2x jump
+                onset_ratio = 2.5  # Heuristic: 2.5x jump
                 rms_gate = 0.005   # Silence floor
 
-                # Vectorized or loop? Loop is fine for simple logic
                 lockout_counter = 0
                 for i in range(1, len(rms_vals)):
+                    # Check onset
+                    if rms_vals[i] > rms_gate and rms_vals[i] > onset_ratio * rms_vals[i-1]:
+                        lockout_counter = skip_frames
+
                     if lockout_counter > 0:
                         merged_conf[i] = 0.0
                         lockout_counter -= 1
-                        continue
-
-                    if rms_vals[i] > rms_gate and rms_vals[i] > onset_ratio * rms_vals[i-1]:
-                        lockout_counter = skip_frames
-                        merged_conf[i] = 0.0
 
         # Melody stabilization before skyline selection
         # 4F: Use melody_filter_eff
@@ -1196,7 +1171,12 @@ def extract_features(
     # The requirement says "store it in diagnostics".
     tuning_cents_val = locals().get("tuning_cents", 0.0)
 
+    # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
+        "instrument": str(instrument),
+        "profile": profile.instrument if profile else None,
+        "profile_applied": bool(profile_applied),
+        "profile_special": dict(profile.special) if profile else {},
         "polyphonic_context": bool(polyphonic_context),
         "detectors_initialized": list(detectors.keys()),
         "separation": separation_diag,

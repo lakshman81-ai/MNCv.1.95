@@ -229,6 +229,9 @@ class StageBConfig:
 
 @dataclass
 class StageCConfig:
+    # Flag to enable instrument-specific profile overrides in Stage C
+    apply_instrument_profile: bool = True
+
     # Segmentation method selection + HMM defaults
     segmentation_method: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -516,12 +519,13 @@ _profiles: List[InstrumentProfile] = [
         special={
             # Report: LPF ~800–1000 Hz to remove distortion "fizz"
             "pre_lpf_hz": 1000.0,
-
             # Report: raise YIN trough threshold for rough/distorted waveforms
             "yin_trough_threshold": 0.20,
-
             # Optional: relax confidence gating a bit if you find dropouts
             "yin_conf_threshold": 0.05,
+            # Report: Transient Lockout
+            "transient_lockout_ms": 10.0,
+            "viterbi": False,
         },
     ),
 

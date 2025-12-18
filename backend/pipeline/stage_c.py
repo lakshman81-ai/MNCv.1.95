@@ -377,14 +377,24 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     elif not isinstance(analysis_data, AnalysisData):
         return []
 
-    # PC0: Resolve instrument profile from Stage B config
-    instrument_name = _get(config, "stage_b.instrument", "piano_61key")
-    profile = None
-    if config and hasattr(config, "get_profile"):
-        profile = config.get_profile(instrument_name)
+    # Patch F0: Apply instrument profile overrides inside Stage C
+    # Resolve instrument from metadata if available, else config
+    meta_instr = getattr(analysis_data.meta, "instrument", None)
+    config_instr = _get(config, "stage_b.instrument", "piano_61key")
 
-    # Prepare overrides from profile.special
-    profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
+    # Priority: MetaData (resolved in Stage B) -> Config -> Default
+    instrument_name = meta_instr if meta_instr else config_instr
+
+    profile = None
+    profile_special = {}
+
+    # Check if overrides are enabled
+    apply_profile = _get(config, "stage_c.apply_instrument_profile", True)
+
+    if apply_profile and config and hasattr(config, "get_profile"):
+        profile = config.get_profile(str(instrument_name))
+        if profile:
+            profile_special = dict(getattr(profile, "special", {}) or {})
 
     # Helper to resolve a config value with override priority:
     # 1. profile.special['stage_c_X'] (if exists)
@@ -576,6 +586,22 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     voice=int(vidx + 1),
                 )
             )
+
+    # Patch F8: Optional Bass Backtracking
+    # Improves timing of bass notes which often have slow attacks or pre-transient noise.
+    bass_backtrack_ms = float(profile_special.get("bass_backtrack_ms", 0.0))
+    if bass_backtrack_ms > 0.0 and notes:
+        backtrack_sec = bass_backtrack_ms / 1000.0
+        # Sort to ensure safe lookback
+        notes.sort(key=lambda n: n.start_sec)
+        for i, n in enumerate(notes):
+            # Only apply if not overlapping previous note too much
+            prev_end = notes[i-1].end_sec if i > 0 else 0.0
+            new_start = n.start_sec - backtrack_sec
+
+            # Allow slight overlap or butt up against previous
+            if new_start >= prev_end - 0.05:
+                n.start_sec = max(0.0, new_start)
 
     quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
     analysis_data.notes = quantized_notes
