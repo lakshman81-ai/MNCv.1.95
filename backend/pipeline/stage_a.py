@@ -470,49 +470,10 @@ def load_and_preprocess(
             }
         })
 
-    # 6. Detect texture (mono / poly) and optionally run separation
+    # 6. Detect texture (mono / poly)
     detected_type = detect_audio_type(audio, sr)
-    stems = {"mix": Stem(audio=audio, sr=sr, type="mix")}
 
-    sep_conf = getattr(a_conf, "separation", {}) if hasattr(a_conf, "separation") else {}
-    if not sep_conf and hasattr(full_conf, "stage_b"):
-        sep_conf = getattr(full_conf.stage_b, "separation", {}) or {}
-    separation_enabled = sep_conf.get("enabled", detected_type != AudioType.MONOPHONIC)
-    separated: Dict[str, Stem] = {}
-    if separation_enabled and detected_type != AudioType.MONOPHONIC and pretrained and apply_model and torch is not None:
-        try:
-            model = pretrained.get_model(sep_conf.get("model", "htdemucs"))
-            overlap = sep_conf.get("overlap", 0.25)
-            shifts = sep_conf.get("shifts", 1)
-            mix_tensor = torch.tensor(audio, dtype=torch.float32)[None, None, :]
-            demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
-
-            separated: Dict[str, Stem] = {}
-            for idx, name in enumerate(getattr(model, "sources", ["vocals", "drums", "bass", "other"])):
-                stem_audio = demucs_out[0, idx]
-                if hasattr(stem_audio, "detach"):
-                    stem_audio = stem_audio.detach().cpu().numpy()
-                if stem_audio.ndim > 1:
-                    stem_audio = np.mean(stem_audio, axis=0)
-                sep_sr = getattr(model, "samplerate", sr)
-                stem_arr = np.asarray(stem_audio, dtype=np.float32)
-                if name == "vocals" and sep_sr != 16000:
-                    try:
-                        if librosa:
-                            stem_arr = librosa.resample(stem_arr, orig_sr=sep_sr, target_sr=16000)
-                        elif scipy.signal:
-                            stem_arr = scipy.signal.resample(stem_arr, int(len(stem_arr) * (16000 / sep_sr)))
-                        sep_sr = 16000
-                    except Exception:
-                        pass
-                separated[name] = Stem(audio=stem_arr, sr=int(sep_sr), type=name)
-
-            if separated:
-                stems.update(separated)
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"Demucs separation failed: {exc}")
-
-    # 6. Populate Metadata & Output
+    # 7. Populate Metadata & Output
     # Basic MetaData
     meta = MetaData(
         audio_path=audio_path,
@@ -543,30 +504,8 @@ def load_and_preprocess(
         beat_times=beat_times,  # Populate alias as well
     )
 
-    # Always provide only the true mix by default.
+    # Output only the mix stem. Separation is handled in Stage B.
     stems = {"mix": Stem(audio=audio, sr=sr, type="mix")}
-    if separated:
-        stems.update(separated)
-    else:
-        try:
-            vocal_sr = 16000
-            vocal_audio = audio
-            if sr != vocal_sr:
-                if librosa:
-                    vocal_audio = librosa.resample(audio, orig_sr=sr, target_sr=vocal_sr)
-                elif scipy.signal:
-                    vocal_audio = scipy.signal.resample(audio, int(len(audio) * (vocal_sr / sr)))
-            stems["vocals"] = Stem(audio=np.asarray(vocal_audio, dtype=np.float32), sr=int(vocal_sr), type="vocals")
-        except Exception:
-            stems["vocals"] = Stem(audio=np.asarray(audio, dtype=np.float32), sr=int(sr), type="vocals")
-
-    # If (and only if) real separation produced stems, merge them here.
-    if locals().get("separated") and isinstance(separated, dict):
-        for k, v in separated.items():
-            if isinstance(v, Stem):
-                stems[k] = v
-            elif isinstance(v, np.ndarray):
-                stems[k] = Stem(audio=v.astype(np.float32), sr=sr, type=str(k))
 
     return StageAOutput(
         stems=stems,
