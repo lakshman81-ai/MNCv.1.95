@@ -425,6 +425,17 @@ class BasePitchDetector:
     ):
         self.sr = int(sr)
         self.hop_length = int(hop_length)
+
+        # PB1: Map frame_length -> n_fft if provided
+        if "frame_length" in kwargs and n_fft == 2048:
+             # Only override default n_fft if frame_length is explicit
+             # Note: caller usually passes n_fft=default.
+             # If we see frame_length, use it.
+             n_fft = int(kwargs["frame_length"])
+             # Clean up to avoid confusion? Or keep it?
+             # kwargs.pop("frame_length")
+             # Leaving it in kwargs is safer for now.
+
         self.n_fft = int(n_fft)
         self.fmin = float(fmin)
         self.fmax = float(fmax)
@@ -461,6 +472,12 @@ class YinDetector(BasePitchDetector):
         def _run_pass(frame_len: int) -> Tuple[np.ndarray, np.ndarray]:
             if librosa is not None:
                 try:
+                    # PB2: Support trough_threshold
+                    trough_thr = float(self.kwargs.get("trough_threshold", 0.1))
+                    # Fallback to threshold if set and trough_threshold not explicit?
+                    # Actually standard pyin default is 0.1.
+                    # If user provided trough_threshold in kwargs, use it.
+
                     f0, _, voiced_prob = librosa.pyin(
                         y=y,
                         fmin=float(self.fmin),
@@ -469,6 +486,7 @@ class YinDetector(BasePitchDetector):
                         frame_length=int(frame_len),
                         hop_length=int(self.hop_length),
                         fill_na=0.0,
+                        trough_threshold=trough_thr,
                     )
                     f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
                     conf = np.asarray(voiced_prob, dtype=np.float32).reshape(-1)

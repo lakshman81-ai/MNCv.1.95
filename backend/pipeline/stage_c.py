@@ -29,6 +29,7 @@ try:
 except Exception:
     from models import AnalysisData, FramePitch, NoteEvent, AudioType  # type: ignore
 
+from copy import deepcopy
 
 def _get(obj: Any, path: str, default: Any = None) -> Any:
     if obj is None:
@@ -136,7 +137,15 @@ def _segment_monophonic(
     # C2 Params
     split_semi = float(seg_cfg.get("split_semitone", 0.7))
     split_cents = split_semi * 100.0
-    time_merge_frames = int(seg_cfg.get("time_merge_frames", 1))
+
+    # P4: Prioritize time_merge_frames logic
+    tmf_cfg = seg_cfg.get("time_merge_frames")
+    if tmf_cfg is not None:
+        time_merge_frames = int(tmf_cfg)
+    else:
+        # P4: Default fallback
+        time_merge_frames = int(gap_tolerance_s / hop_s)
+    time_merge_frames = max(0, time_merge_frames)
 
     segs: List[Tuple[int, int]] = []
 
@@ -148,10 +157,22 @@ def _segment_monophonic(
     current_end = -1
     current_pitch_hz = 0.0
 
-    for i, fp in enumerate(timeline):
-        voiced = (fp.pitch_hz > 0.0 and fp.confidence >= conf_thr)
+    # P5: Pitch reference buffer for vibrato stability
+    pitch_buffer: List[float] = []
+    pitch_buffer_size = 7
 
-        if voiced:
+    # P2: Apply confidence hysteresis
+    c_start = conf_start if conf_start is not None else conf_thr
+    c_end = conf_end if conf_end is not None else conf_thr
+
+    for i, fp in enumerate(timeline):
+        # P2 Hysteresis logic
+        if not active:
+             is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_start)
+        else:
+             is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_end)
+
+        if is_voiced_frame:
             silent = 0
             if not active:
                 stable += 1
@@ -160,12 +181,18 @@ def _segment_monophonic(
                     current_start = i - (min_on - 1)
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
+                    pitch_buffer = [fp.pitch_hz]
             else:
                 # Check vibrato / pitch jump - C2
                 diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
                 if diff <= split_cents:
                     # Extend note
                     current_end = i
+                    # P5: Update pitch reference to track drift/vibrato
+                    pitch_buffer.append(fp.pitch_hz)
+                    if len(pitch_buffer) > pitch_buffer_size:
+                        pitch_buffer.pop(0)
+                    current_pitch_hz = float(np.median(pitch_buffer))
                 else:
                     # Split note
                     segs.append((current_start, current_end))
@@ -174,6 +201,7 @@ def _segment_monophonic(
                     current_start = i
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
+                    pitch_buffer = [fp.pitch_hz]
                     stable = min_on
 
         else:
@@ -193,7 +221,7 @@ def _segment_monophonic(
 
     # C2: Gap merge (1-frame)
     if len(segs) < 2:
-        return segs
+        pass # Optimization: fall through to return merged_segs if empty
 
     merged_segs = []
     if segs:
@@ -216,12 +244,20 @@ def _segment_monophonic(
             if gap <= time_merge_frames and _cents_diff_hz(curr_p, next_p) <= split_cents:
                 # Merge
                 curr_e = next_e
+                # Keep curr_p stable
             else:
-                merged_segs.append((curr_s, curr_e))
+                # P3: Enforce min_note_duration_in_threshold_mode
+                dur = (curr_e - curr_s + 1) * hop_s
+                if dur >= min_note_dur_s:
+                    merged_segs.append((curr_s, curr_e))
+
                 curr_s, curr_e = next_s, next_e
                 curr_p = next_p
 
-        merged_segs.append((curr_s, curr_e))
+        # Check last
+        dur = (curr_e - curr_s + 1) * hop_s
+        if dur >= min_note_dur_s:
+            merged_segs.append((curr_s, curr_e))
 
     return merged_segs
 
@@ -341,6 +377,28 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     elif not isinstance(analysis_data, AnalysisData):
         return []
 
+    # PC0: Resolve instrument profile from Stage B config
+    instrument_name = _get(config, "stage_b.instrument", "piano_61key")
+    profile = None
+    if config and hasattr(config, "get_profile"):
+        profile = config.get_profile(instrument_name)
+
+    # Prepare overrides from profile.special
+    profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
+
+    # Helper to resolve a config value with override priority:
+    # 1. profile.special['stage_c_X'] (if exists)
+    # 2. config.stage_c.X
+    # 3. default
+
+    def resolve_val(key, default):
+        # Try profile special first (e.g. stage_c_min_note_duration_ms)
+        special_key = f"stage_c_{key}"
+        if special_key in profile_special:
+            return profile_special[special_key]
+        # Then config
+        return _get(config, f"stage_c.{key}", default)
+
     stem_timelines: Dict[str, List[FramePitch]] = analysis_data.stem_timelines or {}
 
     if not stem_timelines:
@@ -360,23 +418,20 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         return []
 
     # Thresholds (read from config if available)
-    base_conf = float(_get(config, "stage_c.confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
-    hyst_conf = _get(config, "stage_c.confidence_hysteresis", {}) or {}
+    base_conf = float(resolve_val("confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
+    hyst_conf = resolve_val("confidence_hysteresis", {}) or {}
     start_conf = float(hyst_conf.get("start", base_conf))
     end_conf = float(hyst_conf.get("end", base_conf))
 
     poly_conf = float(_get(config, "stage_c.polyphonic_confidence.melody", base_conf))
     accomp_conf = float(_get(config, "stage_c.polyphonic_confidence.accompaniment", poly_conf))
     conf_thr = base_conf
-    min_note_dur_s = float(_get(config, "stage_c.min_note_duration_s", 0.05))
-    min_note_dur_ms = _get(config, "stage_c.min_note_duration_ms", None)
-    if min_note_dur_ms is not None:
-        try:
-            min_note_dur_s = float(min_note_dur_ms) / 1000.0
-        except Exception:
-            pass
-    min_note_dur_ms_poly = _get(config, "stage_c.min_note_duration_ms_poly", None)
-    gap_tolerance_s = float(_get(config, "stage_c.gap_tolerance_s", 0.05))
+
+    min_note_dur_ms = resolve_val("min_note_duration_ms", 50.0)
+    min_note_dur_s = float(min_note_dur_ms) / 1000.0
+
+    min_note_dur_ms_poly = resolve_val("min_note_duration_ms_poly", None)
+    gap_tolerance_s = float(resolve_val("gap_tolerance_s", 0.05))
 
     # Calculate min_rms
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
@@ -405,9 +460,14 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     notes: List[NoteEvent] = []
 
-    seg_cfg = _get(config, "stage_c.segmentation_method", {}) or {}
+    seg_cfg = resolve_val("segmentation_method", {}) or {}
     seg_method = str(seg_cfg.get("method", "threshold")).lower()
+
+    # P1: Auto-enable smoothing for HMM
     smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", False))
+    if seg_method == "hmm":
+        smoothing_enabled = True
+
     transition_penalty = float(seg_cfg.get("transition_penalty", 0.8))
     stay_bonus = float(seg_cfg.get("stay_bonus", 0.05))
     silence_bias = float(seg_cfg.get("silence_bias", 0.1))
@@ -423,6 +483,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         voice_min_dur_s = min_note_dur_s
 
         if poly_frames:
+            # PC7 (Part 1): Update assignment tolerances indirectly by using correct gates
             voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
             try:
                 if min_note_dur_ms_poly is not None:
@@ -489,8 +550,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             midi_note = int(round(float(np.median(mids))))
             pitch_hz = float(np.median(hzs)) if hzs else 0.0
             confidence = float(np.mean(confs)) if confs else 0.0
-            velocity = _velocity_from_rms(rmss)
-            dynamic_label = _velocity_to_dynamic(velocity)
+
+            # P6: Velocity semantics + RMS value
+            midi_vel = _velocity_from_rms(rmss)
+            velocity_norm = float(midi_vel) / 127.0
+            rms_val = float(np.mean(rmss)) if rmss else 0.0
+
+            dynamic_label = _velocity_to_dynamic(midi_vel)
 
             start_sec = float(timeline[s].time)
             end_sec = float(timeline[e].time + hop_s)
@@ -504,7 +570,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     midi_note=midi_note,
                     pitch_hz=pitch_hz,
                     confidence=confidence,
-                    velocity=velocity,
+                    velocity=velocity_norm, # Normalized 0..1
+                    rms_value=rms_val,
                     dynamic=dynamic_label,
                     voice=int(vidx + 1),
                 )

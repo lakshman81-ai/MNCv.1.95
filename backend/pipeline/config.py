@@ -66,6 +66,10 @@ class StageAConfig:
 
 @dataclass
 class StageBConfig:
+    # Instrument selection (for Stage B tuning)
+    instrument: str = "piano_61key"
+    apply_instrument_profile: bool = True
+
     # Source separation (HTDemucs)
     separation: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -386,8 +390,15 @@ class PipelineConfig:
         aliases = {
             "piano": "piano_61key",
             "keys": "piano_61key",
+            # Guitar aliases
             "electric_guitar": "electric_guitar_clean",
             "electric-guitar": "electric_guitar_clean",
+            "distorted_guitar": "electric_guitar_distorted",
+            "guitar_distorted": "electric_guitar_distorted",
+            "electric_guitar_distorted": "electric_guitar_distorted",
+            "electric_guitar_overdrive": "electric_guitar_distorted",
+            "electric_guitar_distortion": "electric_guitar_distorted",
+
             "drums": "drums_percussive",
             "percussion": "drums_percussive",
         }
@@ -493,6 +504,24 @@ _profiles: List[InstrumentProfile] = [
         fmax=1200.0,
         special={
             "threshold": 0.05,
+        },
+    ),
+
+    # Electric Guitar (distorted) – YIN tuned for rough signals + pre-LPF
+    InstrumentProfile(
+        instrument="electric_guitar_distorted",
+        recommended_algo="yin",
+        fmin=80.0,
+        fmax=1200.0,
+        special={
+            # Report: LPF ~800–1000 Hz to remove distortion "fizz"
+            "pre_lpf_hz": 1000.0,
+
+            # Report: raise YIN trough threshold for rough/distorted waveforms
+            "yin_trough_threshold": 0.20,
+
+            # Optional: relax confidence gating a bit if you find dropouts
+            "yin_conf_threshold": 0.05,
         },
     ),
 
