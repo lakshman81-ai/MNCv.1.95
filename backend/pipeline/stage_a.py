@@ -247,16 +247,25 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
     return noise_rms, noise_db
 
 
-def _detect_tempo_and_beats(
+def detect_tempo_and_beats(
     audio: np.ndarray,
     sr: int,
     enabled: bool,
     tightness: float = 100.0,
-    trim: bool = True
+    trim: bool = True,
+    hop_length: int = 512,
+    pipeline_logger: Optional[Any] = None,
 ) -> Tuple[Optional[float], List[float]]:
     """Run a lightweight tempo/beat estimator if enabled and librosa is available."""
 
-    if not enabled or librosa is None:
+    if not enabled:
+        if pipeline_logger:
+            pipeline_logger.log_event("stage_a", "bpm_detection_skipped_disabled")
+        return None, []
+
+    if librosa is None:
+        if pipeline_logger:
+            pipeline_logger.log_event("stage_a", "bpm_detection_skipped_missing_librosa")
         return None, []
 
     try:
@@ -264,26 +273,31 @@ def _detect_tempo_and_beats(
         if y.size == 0:
             return None, []
 
-        # Downsample and cap duration to keep beat tracking stable/cheap
-        beat_sr = 16000 if sr > 16000 else max(11025, sr)
+        # Skip short clips (WI rule: >= 6.0s)
+        duration = float(len(y)) / float(sr)
+        if duration < 6.0:
+            if pipeline_logger:
+                pipeline_logger.log_event("stage_a", "bpm_detection_skipped_short_audio", {"duration": duration})
+            return None, []
+
+        # Cap duration to keep beat tracking stable/cheap
         max_seconds = 90.0
 
         if librosa:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                if sr != beat_sr:
-                    y = librosa.resample(y, orig_sr=sr, target_sr=beat_sr)
-                if y.size > int(beat_sr * max_seconds):
-                    y = y[: int(beat_sr * max_seconds)]
+                # Removed resampling to ensure hop_length alignment with downstream processing
+                if y.size > int(sr * max_seconds):
+                    y = y[: int(sr * max_seconds)]
 
                 tempo_est, beat_frames = librosa.beat.beat_track(
                     y=y,
-                    sr=beat_sr,
-                    hop_length=256,
+                    sr=sr,
+                    hop_length=hop_length,
                     tightness=tightness,
                     trim=trim,
                 )
-                beat_times = librosa.frames_to_time(beat_frames, sr=beat_sr, hop_length=256).tolist()
+                beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length).tolist()
         else:  # pragma: no cover - defensive fallback
             beat_times = []
             tempo_est = None
@@ -292,9 +306,18 @@ def _detect_tempo_and_beats(
         if tempo_val is not None and hasattr(tempo_val, "__len__"):
             tempo_val = tempo_val[0] if len(tempo_val) else None
         tempo_val = float(tempo_val) if tempo_val and np.isfinite(tempo_val) and tempo_val > 0 else None
+
+        if pipeline_logger:
+            pipeline_logger.log_event("stage_a", "bpm_detection_success", {
+                "bpm": tempo_val,
+                "n_beats": len(beat_times)
+            })
+
         return tempo_val, beat_times
     except Exception as exc:  # pragma: no cover - defensive
         warnings.warn(f"Beat tracking failed: {exc}")
+        if pipeline_logger:
+            pipeline_logger.log_event("stage_a", "bpm_detection_failed", {"error": str(exc)})
         return None, []
 
 def load_and_preprocess(
@@ -446,12 +469,14 @@ def load_and_preprocess(
     bpm_tightness = float(bpm_cfg.get("tightness", 100.0))
     bpm_trim = bool(bpm_cfg.get("trim", True))
 
-    tempo_bpm, beat_times = _detect_tempo_and_beats(
+    tempo_bpm, beat_times = detect_tempo_and_beats(
         audio,
         sr=target_sr,
         enabled=bpm_enabled,
         tightness=bpm_tightness,
-        trim=bpm_trim
+        trim=bpm_trim,
+        hop_length=hop_length,
+        pipeline_logger=pipeline_logger,
     )
     if beat_times:
         beat_times = sorted(list(set(beat_times)))
