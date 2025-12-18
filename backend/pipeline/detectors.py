@@ -76,6 +76,7 @@ def _autocorr_pitch_per_frame(
     """
     Lightweight ACF pitch estimator: returns (f0, conf) per frame.
     conf ~ normalized ACF peak (0..1).
+    Optimized with vectorized FFT-based autocorrelation.
     """
     n_frames, frame_length = frames.shape
     f0 = np.zeros((n_frames,), dtype=np.float32)
@@ -89,32 +90,60 @@ def _autocorr_pitch_per_frame(
     lag_max = max(lag_min + 1, int(sr / max(fmin, 1e-6)))
     lag_max = min(lag_max, frame_length - 2)
 
+    # 1. Windowing
     win = np.hanning(frame_length).astype(np.float32)
+    # Apply window to all frames at once
+    windowed = frames * win
 
-    for i in range(n_frames):
-        x = frames[i] * win
-        x = x - np.mean(x)
-        denom = float(np.dot(x, x)) + 1e-12
-        if denom <= 1e-10:
-            continue
+    # 2. Mean subtraction per frame
+    means = np.mean(windowed, axis=1, keepdims=True)
+    windowed = windowed - means
 
-        ac = scipy.signal.correlate(x, x, mode="full", method="auto")
-        ac = ac[ac.size // 2 :]  # keep non-negative lags
-        ac0 = float(ac[0]) + 1e-12
+    # 3. Energy calculation (denom) per frame
+    denoms = np.sum(windowed**2, axis=1)
 
-        seg = ac[lag_min:lag_max]
-        if seg.size <= 0:
-            continue
+    # 4. Vectorized FFT-based autocorrelation
+    # Pad to at least 2*N-1 to avoid circular aliasing
+    n_fft = 1 << (2 * frame_length - 1).bit_length()
 
-        k = int(np.argmax(seg)) + lag_min
-        peak = float(ac[k]) / ac0
-        peak = float(np.clip(peak, 0.0, 1.0))
+    # RFFT over the last axis (time samples)
+    spec = np.fft.rfft(windowed, n=n_fft, axis=1)
+    # Autocorrelation = IFFT(|FFT|^2)
+    ac_full = np.fft.irfft(spec * np.conj(spec), n=n_fft, axis=1)
 
-        if peak <= 0.0:
-            continue
+    # We only care about lags [0, lag_max)
+    # ac_full[:, 0] is energy at lag 0 (should match denom)
+    ac = ac_full[:, :lag_max]
 
-        f0[i] = float(sr / k)
-        conf[i] = float(peak)
+    ac0 = ac[:, 0] + 1e-12
+
+    # 5. Peak picking
+    # Slice valid lag range
+    seg = ac[:, lag_min:lag_max]
+
+    if seg.shape[1] == 0:
+        return f0, conf
+
+    # Find peak index relative to lag_min
+    k_rel = np.argmax(seg, axis=1)
+    k = k_rel + lag_min
+
+    # Extract peak values
+    # Use advanced indexing: row indices 0..n-1, column indices k
+    peaks = ac[np.arange(n_frames), k]
+
+    # Normalize
+    norm_peaks = peaks / ac0
+    norm_peaks = np.clip(norm_peaks, 0.0, 1.0)
+
+    # 6. Filtering
+    # Valid if energy > threshold AND peak > 0
+    valid_mask = (denoms > 1e-10) & (norm_peaks > 0.0)
+
+    # Assign results
+    # k[valid_mask] are the lag indices for valid frames
+    f0[valid_mask] = sr / k[valid_mask]
+    conf[valid_mask] = norm_peaks[valid_mask]
 
     return f0, conf
 
