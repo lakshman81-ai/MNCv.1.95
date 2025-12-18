@@ -15,3 +15,4 @@ pandas
 torch
 mir_eval
 demucs
+pytest>=7.0.0
