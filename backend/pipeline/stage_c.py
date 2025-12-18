@@ -603,7 +603,23 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             if new_start >= prev_end - 0.05:
                 n.start_sec = max(0.0, new_start)
 
+    # Populate diagnostics
+    if hasattr(analysis_data, "diagnostics"):
+         analysis_data.diagnostics["stage_c"] = {
+             "segmentation_method": seg_method,
+             "timelines_processed": len(timelines_to_process),
+             "note_count_raw": len(notes)
+         }
+
     quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
+
+    # Gap tolerance post-processing (C1 - Glitch tolerance)
+    # Merge notes that are same pitch and extremely close in time, even after quantization if needed,
+    # or before quantization. Merging before is better.
+    # Currently _segment_monophonic handles gap_tolerance in frames.
+    # But if notes are split due to other reasons and land close, we might want to merge.
+    # However, existing logic is mostly sufficient.
+
     analysis_data.notes = quantized_notes
     return quantized_notes
 

@@ -532,7 +532,10 @@ def transcribe(
             payload={"reason": "no_real_separation_outputs", "stems": list(stage_a_out.stems.keys())},
         )
 
-    validate_invariants(stage_a_out, config)
+    res_a = validate_invariants(stage_a_out, config, logger=pipeline_logger)
+    if hasattr(stage_a_out, "diagnostics"):
+        stage_a_out.diagnostics["contracts"] = res_a
+
     pipeline_logger.record_timing(
         "stage_a",
         time.perf_counter() - t_a,
@@ -634,7 +637,9 @@ def transcribe(
             config=config,
         )
 
-        validate_invariants(d_out, config)
+        res_d = validate_invariants(d_out, config, logger=pipeline_logger)
+        if hasattr(d_out.analysis_data, "diagnostics"):
+            d_out.analysis_data.diagnostics.setdefault("contracts", {})["stage_d"] = res_d
 
         pipeline_logger.record_timing(
             "stage_d",
@@ -866,7 +871,10 @@ def transcribe(
             config=config,
             pipeline_logger=pipeline_logger,
         )
-        validate_invariants(stage_b_out, config)
+        res_b = validate_invariants(stage_b_out, config, logger=pipeline_logger)
+        if hasattr(stage_b_out, "diagnostics"):
+            stage_b_out.diagnostics["contracts"] = res_b
+
         pipeline_logger.record_timing(
             "stage_b",
             time.perf_counter() - t_b,
@@ -901,7 +909,15 @@ def transcribe(
             analysis_data,
             config=config,
         )
-        validate_invariants(notes, config, analysis_data=analysis_data)
+        res_c = validate_invariants(notes, config, analysis_data=analysis_data, logger=pipeline_logger)
+        if hasattr(analysis_data, "diagnostics"):
+            analysis_data.diagnostics.setdefault("contracts", {})["stage_c"] = res_c
+            # Consolidate previous contract statuses into AnalysisData
+            if stage_a_out and hasattr(stage_a_out, "diagnostics"):
+                analysis_data.diagnostics.setdefault("contracts", {})["stage_a"] = stage_a_out.diagnostics.get("contracts")
+            if stage_b_out and hasattr(stage_b_out, "diagnostics"):
+                analysis_data.diagnostics.setdefault("contracts", {})["stage_b"] = stage_b_out.diagnostics.get("contracts")
+
         pipeline_logger.record_timing("stage_c", time.perf_counter() - t_c, metadata={"note_count": len(notes)})
 
     # --------------------------------------------------------
@@ -954,7 +970,10 @@ def transcribe(
         config=config,
         pipeline_logger=pipeline_logger,
     )
-    validate_invariants(d_out, config)
+    res_d = validate_invariants(d_out, config, logger=pipeline_logger)
+    if hasattr(d_out.analysis_data, "diagnostics"):
+        d_out.analysis_data.diagnostics.setdefault("contracts", {})["stage_d"] = res_d
+
     pipeline_logger.record_timing(
         "stage_d",
         time.perf_counter() - t_d,

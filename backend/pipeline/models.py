@@ -103,6 +103,7 @@ class StageAOutput:
     noise_floor_rms: float = 0.0
     noise_floor_db: float = -80.0
     beats: List[float] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,6 +212,7 @@ class AnalysisData:
     frame_hop_seconds: float = 0.0
     notes_before_quantization: List[NoteEvent] = field(default_factory=list)
     benchmark: Optional[BenchmarkResult] = None
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -268,6 +270,7 @@ class AnalysisData:
                 asdict(e) for e in self.notes_before_quantization
             ],
             "benchmark": asdict(self.benchmark) if self.benchmark else None,
+            "diagnostics": self.diagnostics,
         }
 
 
