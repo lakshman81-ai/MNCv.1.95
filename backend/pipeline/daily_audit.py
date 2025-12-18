@@ -1,551 +1,366 @@
-"""
-Daily Pipeline Continuity Audit V1
+# backend/pipeline/daily_audit.py
+# Purpose: Run benchmark levels and SAVE ALL RESULTS/ACCURACY into a dated run folder.
+# Works even if benchmark_runner only writes to ./results (this script snapshots it per level).
 
-This script performs a comprehensive health check of the audio pipeline,
-ensuring continuity across stages, verifying config usage, and detecting regressions.
+from __future__ import annotations
 
-It runs 8 Gates (0-7):
-0. Environment & Import Safety
-1. Static Config Knob Coverage
-2. Unit Tests Smoke
-3. Synthetic Pipeline Scenarios
-4. Stage Contracts
-5. Fallback Continuity
-6. Artifact & Schema Validation
-7. Benchmark Ladder (L0/L1)
-"""
-
-import os
-import sys
 import argparse
-import subprocess
+import csv
 import json
-import logging
-import datetime
-import importlib
-import dataclasses
-import shutil
+import os
 import platform
-import traceback
-import tempfile
-import numpy as np
-import soundfile as sf
-from typing import Dict, Any, List, Optional, Tuple
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Ensure we can import backend modules from repo root
-sys.path.append(os.path.abspath("."))
 
-# Late imports to allow Gate 0 to catch import errors safely
-# (We import them inside functions or main after Gate 0)
+# -----------------------------
+# Small utilities
+# -----------------------------
 
-# --- Configuration & Constants ---
+def now_stamps() -> Tuple[str, str]:
+    now = datetime.now()
+    return now.strftime("%Y-%m-%d"), now.strftime("%H%M%S")
 
-AUDIT_RESULTS_DIR = "results/audit"
-STATIC_KNOBS_TO_SCAN = [
-    # Stage A / Rhythm
-    "stage_a.bpm_detection",
-    "meta.tempo_bpm",
-    "meta.beats",
-    "meta.beat_times",
-    "hop_length",
 
-    # Stage B / Polyphony
-    "polyphonic_peeling",
-    "voice_tracking",
-    "FramePitch.active_pitches",
-    "diagnostics[\"separation\"]",
-    "diagnostics['separation']",
-    "diagnostics[\"iss\"]",
-    "diagnostics['iss']",
-    "diagnostics[\"global_tuning_cents\"]",
-    "diagnostics['global_tuning_cents']",
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    # Stage C / Segmentation
-    "confidence_hysteresis",
-    "min_note_duration_ms",
-    "min_note_duration_ms_poly",
-    "gap_tolerance_s",
-    "gap_filling.max_gap_ms",
-    "active_pitches",
 
-    # Stage D / Render
-    "_snap_ql",
-    "glissando_handling_piano",
-    "PartStaff",
-    "duration_beats",
-]
+def write_json(path: Path, obj: Any) -> None:
+    ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
 
-# --- Reporting ---
 
-class AuditReporter:
-    def __init__(self, mode: str):
-        self.mode = mode
-        self.timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        self.date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-        self.day_dir = os.path.join(AUDIT_RESULTS_DIR, self.date_str)
-        self.run_dir = os.path.join(self.day_dir, f"run_{self.timestamp}")
-        self.latest_link = os.path.join(self.day_dir, "latest")
-
-        self.report_data = {
-            "date": self.date_str,
-            "timestamp": self.timestamp,
-            "status": "PASS",
-            "mode": mode,
-            "env": {},
-            "static": { "knob_coverage": { "missing": [] } },
-            "tests": { "passed": False, "failed": [] },
-            "synthetic_cases": [],
-            "contracts": {
-                "stage_a": { "passed": True, "failed": [] },
-                "stage_b": { "passed": True, "failed": [] },
-                "stage_c": { "passed": True, "failed": [] },
-                "stage_d": { "passed": True, "failed": [] }
-            },
-            "fallbacks": {
-                "bpm": { "triggered_count": 0, "triggered_cases": [] },
-                "detectors": { "triggered_count": 0 }
-            },
-            "regressions": [],
-            "next_actions": []
-        }
-
-        os.makedirs(self.run_dir, exist_ok=True)
-        # Also create artifacts folder
-        os.makedirs(os.path.join(self.run_dir, "artifacts"), exist_ok=True)
-
-        logging.basicConfig(
-            filename=os.path.join(self.run_dir, "audit.log"),
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s"
-        )
-        self.console = logging.StreamHandler(sys.stdout)
-        self.console.setLevel(logging.INFO)
-        logging.getLogger().addHandler(self.console)
-
-    def log(self, message: str, level=logging.INFO):
-        logging.log(level, message)
-
-    def fail_gate(self, gate_name: str, reason: str):
-        self.log(f"GATE FAILED: {gate_name} - {reason}", logging.ERROR)
-        self.report_data["status"] = "FAIL"
-        self.report_data["regressions"].append(f"{gate_name}: {reason}")
-        if self.mode == "strict":
-            self.save_report()
-            sys.exit(1)
-
-    def record_contract_failure(self, stage: str, msg: str):
-        self.report_data["contracts"][stage]["passed"] = False
-        self.report_data["contracts"][stage]["failed"].append(msg)
-        self.log(f"CONTRACT VIOLATION [{stage}]: {msg}", logging.ERROR)
-
-    def save_report(self):
-        json_path = os.path.join(self.run_dir, "audit_report.json")
-        with open(json_path, "w") as f:
-            json.dump(self.report_data, f, indent=2)
-
-        md_path = os.path.join(self.run_dir, "audit_report.md")
-        with open(md_path, "w") as f:
-            f.write(f"# Daily Pipeline Audit Report: {self.date_str}\n\n")
-            f.write(f"**Run ID:** {self.timestamp}\n")
-            f.write(f"**Status:** {self.report_data['status']}\n")
-            f.write(f"**Mode:** {self.mode}\n\n")
-
-            f.write("## Regressions\n")
-            if not self.report_data["regressions"]:
-                f.write("*None*\n")
-            else:
-                for r in self.report_data["regressions"]:
-                    f.write(f"- ❌ {r}\n")
-
-            f.write("\n## Synthetic Cases\n")
-            for case in self.report_data["synthetic_cases"]:
-                icon = "✅" if case["status"] == "PASS" else "❌"
-                f.write(f"- {icon} **{case['id']}**: {case['status']}\n")
-                if case.get("contracts_failed"):
-                    for cf in case["contracts_failed"]:
-                        f.write(f"  - Failed: {cf}\n")
-
-        if os.path.exists(self.latest_link):
-            if os.path.islink(self.latest_link):
-                os.unlink(self.latest_link)
-            elif os.path.isdir(self.latest_link):
-                shutil.rmtree(self.latest_link)
-
-        shutil.copytree(self.run_dir, self.latest_link)
-        self.log(f"Report saved to {self.run_dir} and linked to {self.latest_link}")
-
-# --- Generators ---
-
-def generate_sine_wave(freq=440.0, duration=2.0, sr=44100):
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    y = 0.5 * np.sin(2 * np.pi * freq * t)
-    return y, sr
-
-def generate_poly_chord(freqs=[440.0, 554.37, 659.25], duration=2.0, sr=44100):
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    y = np.zeros_like(t)
-    for f in freqs:
-        y += 0.3 * np.sin(2 * np.pi * f * t)
-    return y, sr
-
-def generate_click_track(bpm=120, duration=8.0, sr=44100):
-    y = np.zeros(int(sr * duration))
-    samples_per_beat = int(sr * 60 / bpm)
-    for i in range(0, len(y), samples_per_beat):
-        if i + 100 < len(y):
-            y[i:i+100] = 1.0 # Click
-    return y, sr
-
-# --- Gates ---
-
-def run_gate_0(reporter: AuditReporter):
-    reporter.log("--- Gate 0: Environment & Import Safety ---")
-
-    # Prepare env for subprocesses
-    env = os.environ.copy()
-    if "PYTHONPATH" not in env:
-        env["PYTHONPATH"] = os.getcwd()
-    else:
-        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env["PYTHONPATH"]
-
+def read_json(path: Path) -> Optional[Any]:
     try:
-        pip_freeze = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], env=env).decode("utf-8")
-        reporter.report_data["env"]["packages_hash"] = hash(pip_freeze)
-        reporter.report_data["env"]["python_version"] = sys.version
-        reporter.report_data["env"]["platform"] = platform.platform()
-        try:
-            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], env=env).decode("utf-8").strip()
-            reporter.report_data["env"]["commit"] = commit
-        except Exception:
-            reporter.report_data["env"]["commit"] = "unknown"
-    except Exception as e:
-        reporter.fail_gate("Gate 0.1", f"Environment snapshot failed: {e}")
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-    modules_to_check = [
-        "backend.pipeline.stage_a", "backend.pipeline.stage_b",
-        "backend.pipeline.stage_c", "backend.pipeline.stage_d",
-        "backend.pipeline.transcribe", "backend.pipeline.detectors",
-        "backend.pipeline.config", "backend.pipeline.models",
-    ]
-    for mod in modules_to_check:
-        try:
-            importlib.import_module(mod)
-            reporter.log(f"Import check passed: {mod}")
-        except Exception as e:
-            msg = f"Import failed for {mod}: {e}"
-            if reporter.mode == "strict":
-                reporter.fail_gate("Gate 0.2", msg)
-            else:
-                reporter.log(f"WARNING: {msg}", logging.WARNING)
 
-def run_gate_1(reporter: AuditReporter):
-    reporter.log("--- Gate 1: Static Config Knob Coverage ---")
-    missing_knobs = []
-    search_paths = ["backend/pipeline", "backend/benchmarks"]
-    exclude_dirs = ["__pycache__", ".pytest_cache", ".mypy_cache", "results", "outputs", ".venv", "venv", "build", "dist", "tests", "audit_assets"]
-    files_to_scan = []
-    for path in search_paths:
-        if not os.path.exists(path): continue
-        for root, dirs, files in os.walk(path):
-            dirs[:] = [d for d in dirs if d not in exclude_dirs]
-            for file in files:
-                if file.endswith(".py"):
-                    files_to_scan.append(os.path.join(root, file))
+def copytree_overwrite(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
 
-    for knob in STATIC_KNOBS_TO_SCAN:
-        found = False
-        knob_clean = knob.replace("\"", "").replace("'", "")
-        for filepath in files_to_scan:
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    if knob in content or knob_clean in content:
-                        found = True
-                        break
-            except Exception: continue
-        if not found:
-            missing_knobs.append(knob)
-            reporter.log(f"Dead Knob Found: {knob}", logging.ERROR)
 
-    reporter.report_data["static"]["knob_coverage"]["missing"] = missing_knobs
-    if missing_knobs:
-        msg = f"Found {len(missing_knobs)} dead config knobs."
-        if reporter.mode == "strict":
-            reporter.fail_gate("Gate 1", msg)
-        else:
-            reporter.log(f"WARNING: {msg}", logging.WARNING)
-
-def run_gate_2(reporter: AuditReporter):
-    reporter.log("--- Gate 2: Unit Tests Smoke ---")
-
-    env = os.environ.copy()
-    if "PYTHONPATH" not in env:
-        env["PYTHONPATH"] = os.getcwd()
-    else:
-        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env["PYTHONPATH"]
-
-    cmd = [sys.executable, "-m", "pytest", "-q", "backend/pipeline/test_pipeline_flow.py"]
+def safe_rmtree(p: Path) -> None:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if result.returncode == 0:
-            reporter.report_data["tests"]["passed"] = True
-            reporter.log("Unit tests passed.")
-        else:
-            reporter.report_data["tests"]["passed"] = False
-            reporter.report_data["tests"]["failed"].append("pytest returned non-zero")
-            reporter.log(f"Unit tests failed:\n{result.stderr}\n{result.stdout}", logging.ERROR)
-            if reporter.mode == "strict":
-                reporter.fail_gate("Gate 2", "Unit smoke tests failed.")
-    except Exception as e:
-        reporter.fail_gate("Gate 2", f"Failed to execute pytest: {e}")
-
-# --- Gate 3, 4, 5: Synthetic Scenarios & Contracts ---
-
-def check_stage_contracts(reporter, result, case_id):
-    """Executes Stage A-D contracts and updates reporter."""
-    analysis = result.analysis_data
-    diagnostics = analysis.diagnostics
-    config = result.resolved_config if hasattr(result, "resolved_config") else None
-
-    # --- Stage A Contracts ---
-    if "mix" not in analysis.stem_timelines and "mix" not in analysis.stem_onsets and not analysis.timeline:
-         # Note: AnalysisData structure might have flattened mix into .timeline
-         # But usually StageAOutput puts it in stems['mix']
-         pass # AnalysisData abstracts stems, check metadata
-
-    if analysis.meta.sample_rate <= 0 or analysis.meta.hop_length <= 0:
-        reporter.record_contract_failure("stage_a", f"{case_id}: Invalid meta SR/hop")
-
-    # A1 Rhythm
-    if config and config.stage_a.bpm_detection.enabled and analysis.meta.duration_sec >= 6.0:
-        if not analysis.beats and not diagnostics.get("bpm_detection_skipped_missing_librosa"):
-             # If librosa is present (implied by no skip flag) and duration long enough, we expect beats or valid fallback
-             pass
-
-    # --- Stage B Contracts ---
-    # B0 Shape
-    # Check if we have timelines. For monophonic, timeline is in analysis.timeline
-    if analysis.timeline:
-        # Check alignment if we had access to raw StageBOutput, but here we have AnalysisData
+        if p.exists():
+            shutil.rmtree(p)
+    except Exception:
         pass
 
-    # B1 Diagnostics
-    # We can't access StageBOutput diagnostics directly from AnalysisData unless propagated.
-    # We'll assume they are in analysis.diagnostics for now (some are).
 
-    # B2 Polyphony
-    if case_id == "S4_chord":
-        # Need evidence of polyphony.
-        # Check if we have multiple notes at similar times
-        pass # implemented in specific case check below
+def run_subprocess(
+    cmd: Sequence[str],
+    cwd: Optional[Path],
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_sec: Optional[int] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> int:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
 
-    # --- Stage C Contracts ---
-    # C0 Mono
-    if case_id in ["S1_mono", "S3_vibrato"]:
-        if len(analysis.notes) > 1:
-             # Check for overlap (doubling)
-             sorted_notes = sorted(analysis.notes, key=lambda n: n.start_sec)
-             for i in range(len(sorted_notes)-1):
-                 if sorted_notes[i].end_sec > sorted_notes[i+1].start_sec + 0.05:
-                     reporter.record_contract_failure("stage_c", f"{case_id}: Overlapping notes in mono case")
+    proc = subprocess.run(
+        list(cmd),
+        cwd=str(cwd) if cwd else None,
+        env=merged_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_sec,
+    )
+    ensure_dir(stdout_path.parent)
+    stdout_path.write_text(proc.stdout or "", encoding="utf-8")
+    stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+    return int(proc.returncode)
 
-    # --- Stage D Contracts ---
-    # D0 Output
-    if not result.musicxml:
-        reporter.record_contract_failure("stage_d", f"{case_id}: MusicXML missing")
-    if not result.midi_bytes:
-        reporter.record_contract_failure("stage_d", f"{case_id}: MIDI bytes missing")
 
-def run_synthetic_cases(reporter: AuditReporter):
-    reporter.log("--- Gate 3/4/5: Synthetic Scenarios & Contracts ---")
-
-    from backend.pipeline.transcribe import transcribe
-    from backend.pipeline.config import PipelineConfig, PIANO_61KEY_CONFIG
-    from backend.pipeline.models import AudioType
-
-    # Helper to run case
-    def run_case(case_id, audio, sr, config_modifier=None):
-        case_status = {"id": case_id, "status": "PASS", "contracts_failed": []}
-
-        # Save temp audio
-        tmp_wav = os.path.join(reporter.run_dir, "artifacts", f"{case_id}.wav")
-        sf.write(tmp_wav, audio, sr)
-
-        # Config
-        cfg = dataclasses.replace(PIANO_61KEY_CONFIG)
-        if config_modifier:
-            config_modifier(cfg)
-
-        try:
-            res = transcribe(tmp_wav, config=cfg)
-
-            # --- Specific Case Assertions ---
-
-            # S1: Mono Sine
-            if case_id == "S1_mono":
-                if len(res.analysis_data.notes) != 1:
-                    fail = f"Expected 1 note, got {len(res.analysis_data.notes)}"
-                    case_status["contracts_failed"].append(fail)
-                    reporter.record_contract_failure("stage_c", f"{case_id}: {fail}")
-                else:
-                    note = res.analysis_data.notes[0]
-                    # Check duration roughly 2s
-                    if not (1.8 < (note.end_sec - note.start_sec) < 2.2):
-                         reporter.record_contract_failure("stage_c", f"{case_id}: Duration mismatch")
-
-            # S4: Chord
-            if case_id == "S4_chord":
-                if len(res.analysis_data.notes) < 3:
-                    fail = f"Expected >=3 notes, got {len(res.analysis_data.notes)}"
-                    case_status["contracts_failed"].append(fail)
-                    reporter.record_contract_failure("stage_b", f"{case_id}: Failed to separate chord")
-
-            # S5: Short Clip (BPM Gate)
-            if case_id == "S5_short":
-                # Should NOT have beats if duration is short (4s) and code gates at 6s
-                # Assuming code gates.
-                if res.analysis_data.meta.beats:
-                     # Check diagnostics for why it ran? Or maybe it's allowed if confident?
-                     # The requirement says "Stage A BPM detection skips".
-                     pass
-
-            # S6: 120 BPM
-            if case_id == "S6_120bpm":
-                bpm = res.analysis_data.meta.tempo_bpm
-                if not (118 < bpm < 122):
-                    fail = f"Expected ~120 BPM, got {bpm}"
-                    case_status["contracts_failed"].append(fail)
-                    reporter.record_contract_failure("stage_a", f"{case_id}: {fail}")
-                if not res.analysis_data.beats:
-                    reporter.record_contract_failure("stage_a", f"{case_id}: No beats detected")
-
-            # Run General Contracts
-            check_stage_contracts(reporter, res, case_id)
-
-            # Check Fallbacks (Gate 5)
-            # Inspect diagnostics if available
-            diag = res.analysis_data.diagnostics
-            if diag:
-                if diag.get("fallback_triggered"): # hypothetical key
-                    reporter.report_data["fallbacks"]["detectors"]["triggered_count"] += 1
-
-        except Exception as e:
-            case_status["status"] = "CRASH"
-            case_status["contracts_failed"].append(str(e))
-            reporter.log(f"Case {case_id} CRASHED: {e}", logging.ERROR)
-            traceback.print_exc()
-
-        if case_status["contracts_failed"]:
-            case_status["status"] = "FAIL"
-
-        reporter.report_data["synthetic_cases"].append(case_status)
-
-    # --- Scenario Definitions ---
-
-    # S1 Mono
-    y1, sr1 = generate_sine_wave(440, 2.0)
-    run_case("S1_mono", y1, sr1)
-
-    # S4 Chord
-    y4, sr4 = generate_poly_chord([440, 554, 659], 2.0)
-    def cfg_poly(c):
-        c.stage_b.separation["enabled"] = True # Ensure separation is tried
-    run_case("S4_chord", y4, sr4, cfg_poly)
-
-    # S5 Short
-    y5, sr5 = generate_sine_wave(440, 4.0) # < 6s
-    run_case("S5_short", y5, sr5)
-
-    # S6 120BPM
-    y6, sr6 = generate_click_track(120, 8.0)
-    def cfg_rhythm(c):
-        c.stage_a.bpm_detection["enabled"] = True
-    run_case("S6_120bpm", y6, sr6, cfg_rhythm)
-
-    # Check overall synthetic failure
-    failed_cases = [c for c in reporter.report_data["synthetic_cases"] if c["status"] != "PASS"]
-    if failed_cases:
-        reporter.fail_gate("Gate 3", f"{len(failed_cases)} synthetic cases failed.")
-
-# --- Gate 6: Artifacts ---
-
-def run_gate_6(reporter: AuditReporter):
-    reporter.log("--- Gate 6: Artifact Validation ---")
-    # Scan artifacts folder
-    artifacts_dir = os.path.join(reporter.run_dir, "artifacts")
-    if not os.path.exists(artifacts_dir) or not os.listdir(artifacts_dir):
-        # We expected wavs from synthetic run
-        reporter.log("No artifacts generated?", logging.WARNING)
-
-# --- Gate 7: Benchmarks ---
-
-def run_gate_7(reporter: AuditReporter):
-    reporter.log("--- Gate 7: Benchmark Ladder (L0/L1) ---")
-
-    env = os.environ.copy()
-    if "PYTHONPATH" not in env:
-        env["PYTHONPATH"] = os.getcwd()
-    else:
-        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env["PYTHONPATH"]
-
-    # Call existing runner
-    # For daily we want L0, L1. The runner script takes one level or "all".
-    # Let's run "L0" then "L1" separately to be safe/granular, or "all" if it's fast.
-    # The requirement says "Daily (must): L0, L1".
-
-    for level in ["L0", "L1"]:
-        try:
-            cmd_level = [
-                sys.executable, "backend/benchmarks/benchmark_runner.py",
-                "--level", level,
-                "--output", os.path.join(reporter.run_dir, f"benchmarks_{level}")
-            ]
-            res = subprocess.run(cmd_level, capture_output=True, text=True, env=env)
-            if res.returncode != 0:
-                reporter.log(f"Benchmark {level} failed: {res.stderr}", logging.ERROR)
-                if reporter.mode == "strict":
-                    reporter.fail_gate("Gate 7", f"Benchmark {level} failed")
-            else:
-                reporter.log(f"Benchmark {level} passed.")
-        except Exception as e:
-            reporter.fail_gate("Gate 7", f"Benchmark execution error: {e}")
-
-# --- Main Entry ---
-
-def main():
-    parser = argparse.ArgumentParser(description="Daily Pipeline Audit")
-    parser.add_argument("--mode", choices=["strict", "dev"], default="dev",
-                        help="Audit mode (strict fails on any error, dev warns)")
-    args = parser.parse_args()
-
-    reporter = AuditReporter(args.mode)
-
+def try_get_git_head(repo_root: Path) -> Optional[str]:
     try:
-        run_gate_0(reporter)
-        run_gate_1(reporter)
-        run_gate_2(reporter)
+        rc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if rc.returncode == 0:
+            head = (rc.stdout or "").strip()
+            return head or None
+    except Exception:
+        pass
+    return None
 
-        # Check if we can proceed to pipeline logic (deps check)
-        # If Gate 0 passed (or warned in dev), we try.
-        # But if core deps are missing, next steps will crash.
-        try:
-            import backend.pipeline.transcribe
-            run_synthetic_cases(reporter) # Gates 3, 4, 5
-            run_gate_6(reporter)
-            run_gate_7(reporter)
-        except ImportError as e:
-            reporter.log(f"Skipping pipeline gates due to missing deps: {e}", logging.WARNING)
-            if reporter.mode == "strict":
-                 reporter.fail_gate("Gate 3", "Dependencies missing for pipeline audit")
 
-        reporter.save_report()
-        print(f"Audit Complete. Report: {reporter.run_dir}")
+def read_summary_csv(summary_csv: Path) -> List[Dict[str, str]]:
+    if not summary_csv.exists():
+        return []
+    try:
+        with summary_csv.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
 
-    except Exception as e:
-        reporter.log(f"Unhandled Exception: {e}", logging.CRITICAL)
-        traceback.print_exc()
-        sys.exit(1)
+
+def tail(rows: List[Any], n: int = 20) -> List[Any]:
+    return rows[-n:] if len(rows) > n else rows
+
+
+def extract_accuracy_from_results(results_snapshot: Path) -> Dict[str, Any]:
+    """
+    Defensive extraction of "accuracy-ish" data.
+    - summary.csv: returns last row + header keys
+    - leaderboard.json: stores the whole object (schema may vary)
+    - metrics.json inside results/run_*/ if present: stores the newest one
+    """
+    out: Dict[str, Any] = {}
+
+    # summary.csv
+    summary_csv = results_snapshot / "summary.csv"
+    rows = read_summary_csv(summary_csv)
+    if rows:
+        out["summary_last_row"] = rows[-1]
+        out["summary_tail"] = tail(rows, 10)
+        out["summary_columns"] = list(rows[-1].keys())
+    else:
+        out["summary_last_row"] = None
+        out["summary_tail"] = []
+        out["summary_columns"] = []
+
+    # leaderboard.json
+    leaderboard_json = results_snapshot / "leaderboard.json"
+    if leaderboard_json.exists():
+        out["leaderboard"] = read_json(leaderboard_json)
+    else:
+        out["leaderboard"] = None
+
+    # newest metrics.json under results/run_*/
+    run_dirs = sorted([p for p in results_snapshot.glob("run_*") if p.is_dir()])
+    newest_metrics: Optional[Path] = None
+    newest_dir: Optional[Path] = None
+    if run_dirs:
+        newest_dir = run_dirs[-1]
+        cand = newest_dir / "metrics.json"
+        if cand.exists():
+            newest_metrics = cand
+
+    out["newest_run_dir"] = str(newest_dir) if newest_dir else None
+    out["newest_metrics"] = read_json(newest_metrics) if newest_metrics else None
+
+    return out
+
+
+# -----------------------------
+# Benchmark execution
+# -----------------------------
+
+@dataclass
+class LevelRun:
+    level: str
+    cmd: List[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    results_snapshot: str
+    accuracy: Dict[str, Any]
+
+
+class DailyPipelineAudit:
+    def __init__(
+        self,
+        levels: List[str],
+        audit_root: Path = Path("results") / "audit",
+        results_root: Path = Path("results"),
+        benchmark_module: str = "backend.benchmarks.benchmark_runner",
+        repo_root: Optional[Path] = None,
+    ) -> None:
+        self.levels = levels
+        self.audit_root = audit_root
+        self.results_root = results_root
+        self.benchmark_module = benchmark_module
+        self.repo_root = repo_root or Path.cwd()
+
+        date_s, time_s = now_stamps()
+        self.date_s = date_s
+        self.time_s = time_s
+        self.run_dir = ensure_dir(self.audit_root / date_s / f"run_{time_s}")
+
+    def _write_manifest(self) -> None:
+        manifest = {
+            "date": self.date_s,
+            "time": self.time_s,
+            "run_dir": str(self.run_dir),
+            "python": sys.version,
+            "platform": platform.platform(),
+            "cwd": str(Path.cwd()),
+            "git_head": try_get_git_head(self.repo_root),
+            "levels": self.levels,
+            "benchmark_module": self.benchmark_module,
+        }
+        write_json(self.run_dir / "manifest.json", manifest)
+
+    def _snapshot_results(self, dst: Path) -> None:
+        # Snapshot EVERYTHING under ./results into this per-level folder
+        copytree_overwrite(self.results_root, dst)
+
+    def run_level(self, level: str, extra_args: Optional[List[str]] = None, timeout_sec: Optional[int] = None) -> LevelRun:
+        extra_args = extra_args or []
+
+        level_dir = ensure_dir(self.run_dir / "bench" / level)
+        stdout_path = level_dir / f"benchmark_{level}.stdout.txt"
+        stderr_path = level_dir / f"benchmark_{level}.stderr.txt"
+
+        # Run benchmark runner as a module (most stable)
+        cmd = [sys.executable, "-m", self.benchmark_module, "--level", level] + extra_args
+
+        rc = run_subprocess(
+            cmd=cmd,
+            cwd=self.repo_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_sec=timeout_sec,
+        )
+
+        # Snapshot results after the run so each level gets its own preserved outputs
+        snapshot_dir = level_dir / "results_snapshot"
+        self._snapshot_results(snapshot_dir)
+
+        # Extract accuracy/metrics defensively
+        accuracy = extract_accuracy_from_results(snapshot_dir)
+
+        # Store a single JSON summary for this level
+        level_run = LevelRun(
+            level=level,
+            cmd=cmd,
+            returncode=rc,
+            stdout=str(stdout_path),
+            stderr=str(stderr_path),
+            results_snapshot=str(snapshot_dir),
+            accuracy=accuracy,
+        )
+        write_json(level_dir / "level_result.json", {
+            "level": level_run.level,
+            "cmd": level_run.cmd,
+            "returncode": level_run.returncode,
+            "stdout": level_run.stdout,
+            "stderr": level_run.stderr,
+            "results_snapshot": level_run.results_snapshot,
+            "accuracy": level_run.accuracy,
+        })
+
+        return level_run
+
+    def run(self, extra_args: Optional[List[str]] = None, timeout_sec: Optional[int] = None) -> int:
+        self._write_manifest()
+
+        index: Dict[str, Any] = {
+            "status": "running",
+            "run_dir": str(self.run_dir),
+            "date": self.date_s,
+            "time": self.time_s,
+            "levels": self.levels,
+            "bench": [],
+        }
+        write_json(self.run_dir / "audit_index.json", index)
+
+        all_ok = True
+        for lvl in self.levels:
+            res = self.run_level(lvl, extra_args=extra_args, timeout_sec=timeout_sec)
+            index["bench"].append({
+                "level": res.level,
+                "returncode": res.returncode,
+                "level_result_json": str((self.run_dir / "bench" / lvl / "level_result.json").resolve()),
+                "results_snapshot": res.results_snapshot,
+            })
+            write_json(self.run_dir / "audit_index.json", index)
+
+            if res.returncode != 0:
+                all_ok = False
+                # Gate behavior: stop on first failure (benchmark ladder principle)
+                break
+
+        index["status"] = "ok" if all_ok else "failed"
+        write_json(self.run_dir / "audit_index.json", index)
+
+        # Convenience pointer: results/audit/<date>/latest -> current run
+        latest_dir = self.audit_root / self.date_s / "latest"
+        safe_rmtree(latest_dir)
+        copytree_overwrite(self.run_dir, latest_dir)
+
+        return 0 if all_ok else 2
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Daily pipeline audit: run benchmarks and snapshot results per level.")
+    p.add_argument(
+        "--levels",
+        nargs="*",
+        default=["L0_MONO_SANITY", "L1_MONO_MUSIC"],
+        help="Benchmark levels to run in order. Stops on first failure.",
+    )
+    p.add_argument(
+        "--benchmark-module",
+        default="backend.benchmarks.benchmark_runner",
+        help="Python module path for benchmark runner.",
+    )
+    p.add_argument(
+        "--results-root",
+        default="results",
+        help="Where benchmark_runner writes outputs (default: results).",
+    )
+    p.add_argument(
+        "--audit-root",
+        default=str(Path("results") / "audit"),
+        help="Where to store audit runs (default: results/audit).",
+    )
+    p.add_argument(
+        "--timeout-sec",
+        type=int,
+        default=0,
+        help="Optional timeout per level (0 = no timeout).",
+    )
+    p.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="Extra arg to pass to benchmark_runner (repeatable). Example: --extra-arg --device --extra-arg cpu",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    audit = DailyPipelineAudit(
+        levels=list(args.levels),
+        audit_root=Path(args.audit_root),
+        results_root=Path(args.results_root),
+        benchmark_module=str(args.benchmark_module),
+        repo_root=Path.cwd(),
+    )
+
+    timeout = None if int(args.timeout_sec) <= 0 else int(args.timeout_sec)
+
+    return audit.run(extra_args=list(args.extra_arg) if args.extra_arg else None, timeout_sec=timeout)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
