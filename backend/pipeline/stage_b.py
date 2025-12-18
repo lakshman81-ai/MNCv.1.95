@@ -26,6 +26,9 @@ from .detectors import (
     BasePitchDetector
 )
 
+# PB0: Fix imports
+from copy import deepcopy
+
 logger = logging.getLogger(__name__)
 
 # Re-export for tests
@@ -757,13 +760,86 @@ def extract_features(
     sr = stage_a_out.meta.sample_rate
     hop_length = stage_a_out.meta.hop_length
 
+    # PB1 / SNIPPETS2 4B: Resolve instrument profile
+    instrument = (
+        kwargs.get("instrument")
+        or kwargs.get("instrument_name")
+        or getattr(stage_a_out.meta, "instrument", None)
+        or b_conf.instrument
+    )
+
+    profile = config.get_profile(str(instrument)) if (instrument and b_conf.apply_instrument_profile) else None
+    profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
+
+    # Backward compatibility: Map flat keys to nested structures
+    if "stage_b_detectors" not in profile_special:
+        profile_special["stage_b_detectors"] = {}
+
+    # Map yin_trough_threshold -> stage_b_detectors['yin']['trough_threshold']
+    if "yin_trough_threshold" in profile_special:
+        if "yin" not in profile_special["stage_b_detectors"]:
+             profile_special["stage_b_detectors"]["yin"] = {}
+        profile_special["stage_b_detectors"]["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
+        profile_special["stage_b_detectors"]["yin"]["enabled"] = True
+
+    if "yin_conf_threshold" in profile_special:
+        if "yin" not in profile_special["stage_b_detectors"]:
+             profile_special["stage_b_detectors"]["yin"] = {}
+        profile_special["stage_b_detectors"]["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
+        profile_special["stage_b_detectors"]["yin"]["enabled"] = True
+
+    # Map pre_lpf_hz -> stage_b_pre_filter
+    if "pre_lpf_hz" in profile_special:
+         profile_special.setdefault("stage_b_pre_filter", {})["lowpass_hz"] = float(profile_special["pre_lpf_hz"])
+
+    # Work on copies so we don't mutate config dataclasses
+    detector_cfgs = {k: dict(v) for k, v in b_conf.detectors.items()}
+    weights_eff = dict(b_conf.ensemble_weights)
+    melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
+
+    if profile:
+        # Force instrument range everywhere (detectors + post-filter)
+        for _, dconf in detector_cfgs.items():
+            dconf["fmin"] = float(profile.fmin)
+            dconf["fmax"] = float(profile.fmax)
+
+        melody_filter_eff["fmin_hz"] = float(profile.fmin)
+        melody_filter_eff["fmax_hz"] = float(profile.fmax)
+
+        # Ensure recommended algo is enabled (unless "none")
+        rec = (profile.recommended_algo or "").lower()
+        if rec and rec != "none" and rec in detector_cfgs:
+            detector_cfgs[rec]["enabled"] = True
+
+        # Apply nested overrides from profile.special['stage_b_detectors']
+        if "stage_b_detectors" in profile_special:
+            for dname, overrides in profile_special["stage_b_detectors"].items():
+                if dname in detector_cfgs and isinstance(overrides, dict):
+                    detector_cfgs[dname].update(overrides)
+
+        if "n_fft" in profile_special:
+             # Apply to time/frequency detectors that honor n_fft
+            for dn in ("yin", "sacf", "cqt"):
+                if dn in detector_cfgs:
+                    detector_cfgs[dn]["n_fft"] = int(profile_special["n_fft"])
+
+        # Violin-style vibrato smoothing (~150ms) via median window
+        if "vibrato_smoothing_ms" in profile_special:
+            ms = float(profile_special["vibrato_smoothing_ms"])
+            frame_ms = 1000.0 * float(hop_length) / float(sr)
+            win = int(round(ms / max(frame_ms, 1e-6)))
+            if win % 2 == 0:
+                win += 1
+            current = int(melody_filter_eff.get("median_window", 1) or 1)
+            melody_filter_eff["median_window"] = max(current, win)
+
     # Separation routing happens before harmonic masking/ISS so downstream
     # detectors always see the requested stem layout.
     resolved_stems, separation_diag = _resolve_separation(stage_a_out, b_conf)
 
     # 1. Initialize Detectors based on Config
     detectors: Dict[str, BasePitchDetector] = {}
-    for name, det_conf in b_conf.detectors.items():
+    for name, det_conf in detector_cfgs.items():
         det = _init_detector(name, det_conf, sr, hop_length)
         if det:
             detectors[name] = det
@@ -819,22 +895,48 @@ def extract_features(
         audio = stem.audio
         per_detector[stem_name] = {}
 
-        stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        # 4E: Skip pitch entirely for drums/percussive
+        if profile_special.get("ignore_pitch", False):
+            merged_f0 = np.zeros(canonical_n_frames, dtype=np.float32)
+            merged_conf = np.zeros(canonical_n_frames, dtype=np.float32)
+            # Need to compute RMS still (below), but skip detectors
+            # We'll just init empty stem_results
+            stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        else:
+            stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
-        # Run all initialized detectors on this stem
-        for name, det in detectors.items():
-            try:
-                f0, conf = det.predict(audio, audio_path=stage_a_out.meta.audio_path)
-                # B2: Apply stricter SwiftF0 confidence gate if configured
-                if name == "swiftf0":
-                    thr = float(b_conf.detectors.get("swiftf0", {}).get("confidence_threshold", 0.9))
-                    conf = np.where(conf >= thr, conf, 0.0)
-                    f0 = np.where(conf > 0.0, f0, 0.0)
+            # PB2: Pre-LPF / Audio Conditioning per detector
+            # This allows clean guitar to use raw audio while distorted guitar uses LPF'd audio
+            pre_filter_cfg = profile_special.get("stage_b_pre_filter", {})
 
-                stem_results[name] = (f0, conf)
-                per_detector[stem_name][name] = (f0, conf)
-            except Exception as e:
-                logger.warning(f"Detector {name} failed on stem {stem_name}: {e}")
+            # Run all initialized detectors on this stem
+            for name, det in detectors.items():
+                try:
+                    # Prepare audio for this detector
+                    audio_for_det = np.asarray(audio, dtype=np.float32)
+
+                    # Apply global pre-filter from profile
+                    if pre_filter_cfg.get("lowpass_hz"):
+                        audio_for_det = _butter_filter(audio_for_det, sr, float(pre_filter_cfg["lowpass_hz"]), "low")
+
+                    # Check for detector-specific pre-filter
+                    # (This allows fine-grained control if config structure permits, though profile_special mainly targets global/inst)
+                    # We can check detector_cfgs[name].get('pre_lpf_hz')
+                    det_cfg = detector_cfgs.get(name, {})
+                    if det_cfg.get("pre_lpf_hz"):
+                        audio_for_det = _butter_filter(audio_for_det, sr, float(det_cfg["pre_lpf_hz"]), "low")
+
+                    f0, conf = det.predict(audio_for_det, audio_path=stage_a_out.meta.audio_path)
+                    # B2: Apply stricter SwiftF0 confidence gate if configured
+                    if name == "swiftf0":
+                        thr = float(detector_cfgs.get("swiftf0", {}).get("confidence_threshold", 0.9))
+                        conf = np.where(conf >= thr, conf, 0.0)
+                        f0 = np.where(conf > 0.0, f0, 0.0)
+
+                    stem_results[name] = (f0, conf)
+                    per_detector[stem_name][name] = (f0, conf)
+                except Exception as e:
+                    logger.warning(f"Detector {name} failed on stem {stem_name}: {e}")
 
         # Ensemble Merge with disagreement and SwiftF0 priority floor
         if stem_results:
@@ -926,13 +1028,38 @@ def extract_features(
         elif len(rms_vals) > len(merged_f0):
             rms_vals = rms_vals[:len(merged_f0)]
 
+        # PB3: Transient Lockout
+        # Zero confidence for N frames after a sharp RMS rise
+        transient_skip_ms = float(melody_filter_eff.get("transient_skip_ms", 0) or 0)
+        # Check flat key too
+        if transient_skip_ms <= 0:
+             transient_skip_ms = float(profile_special.get("stage_b_melody_filtering", {}).get("transient_skip_ms", 0) or 0)
+
+        if transient_skip_ms > 0 and len(rms_vals) > 1:
+            skip_frames = int(round((transient_skip_ms / 1000.0) * (sr / hop_length)))
+            if skip_frames > 0:
+                onset_ratio = 2.0  # Heuristic: 2x jump
+                rms_gate = 0.005   # Silence floor
+
+                # Vectorized or loop? Loop is fine for simple logic
+                lockout_counter = 0
+                for i in range(1, len(rms_vals)):
+                    if lockout_counter > 0:
+                        merged_conf[i] = 0.0
+                        lockout_counter -= 1
+                        continue
+
+                    if rms_vals[i] > rms_gate and rms_vals[i] > onset_ratio * rms_vals[i-1]:
+                        lockout_counter = skip_frames
+                        merged_conf[i] = 0.0
+
         # Melody stabilization before skyline selection
-        filter_conf = getattr(b_conf, "melody_filtering", {}) or {}
+        # 4F: Use melody_filter_eff
         merged_f0, merged_conf = _apply_melody_filters(
             merged_f0,
             merged_conf,
             rms_vals,
-            filter_conf,
+            melody_filter_eff,
         )
 
         # Build timeline with optional skyline selection from poly layers
@@ -943,7 +1070,7 @@ def extract_features(
         voicing_thr_effective = voicing_thr_global - poly_relax
 
         # Melody filter threshold stays a *post-filter* knob (do not silently lower global gate)
-        melody_voiced_thr = float(filter_conf.get("voiced_prob_threshold", voicing_thr_effective))
+        melody_voiced_thr = float(melody_filter_eff.get("voiced_prob_threshold", voicing_thr_effective))
 
         # Use voicing_thr_effective for deciding voiced/unvoiced frames
         voicing_thr = voicing_thr_effective

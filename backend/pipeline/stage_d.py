@@ -97,9 +97,10 @@ def quantize_and_render(
     # --------------------------------------------------------
     s = stream.Score()
 
-    part_treble = stream.Part()
+    # P11: Use PartStaff for staves in a grand staff
+    part_treble = stream.PartStaff()
     part_treble.id = "P1"
-    part_bass = stream.Part()
+    part_bass = stream.PartStaff()
     part_bass.id = "P2"
 
     # Clefs
@@ -169,6 +170,16 @@ def quantize_and_render(
     def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
         start_beats = 0.0
         dur_beats = 0.0
+
+        # P8: Prefer NoteEvent measure/beat/duration_beats when present
+        if e.measure is not None and e.beat is not None and e.duration_beats is not None:
+             if np.isfinite(e.measure) and np.isfinite(e.beat) and np.isfinite(e.duration_beats):
+                 start_beats = (float(e.measure) - 1.0) * beats_per_measure + (float(e.beat) - 1.0)
+                 dur_beats = float(e.duration_beats)
+                 # Re-snap to grid for consistency
+                 start_beats = round(start_beats / grid_res_beats) * grid_res_beats
+                 dur_beats = max(grid_res_beats, round(dur_beats / grid_res_beats) * grid_res_beats)
+                 return float(start_beats), float(dur_beats)
 
         # Calculate start_beats
         if use_beat_grid:
@@ -271,6 +282,9 @@ def quantize_and_render(
         # D2: Ensure duration is compatible with grid
         # We already quantized dur_beats in get_event_beats
         q_len = dur_beats
+
+        # P9: Apply snap QL
+        q_len = _snap_ql(q_len)
 
         try:
             m21_obj.duration = music21.duration.Duration(q_len)
@@ -379,7 +393,16 @@ def quantize_and_render(
     # But let's ensure we at least cover the duration.
 
     # 3b. Glissando (Optional)
-    if gliss_conf.get("enabled", False):
+    # P10: Respect piano disable flag
+    gliss_enabled = gliss_conf.get("enabled", False)
+    if piano_gliss_conf.get("enabled", False) is False:
+         # Assuming piano context if not told otherwise, or if 'piano_gliss_conf'
+         # specifically targets piano and defaults to False.
+         # The requirement is: Disable gliss insertion for piano when glissando_handling_piano.enabled is False.
+         # Since this function assumes piano context often (PIANO_61KEY_CONFIG), we check it.
+         gliss_enabled = False
+
+    if gliss_enabled:
         min_semitones = float(gliss_conf.get("min_semitones", 2.0))
         max_time_ms = float(gliss_conf.get("max_time_ms", 500.0))
         from music21 import spanner
@@ -432,6 +455,18 @@ def quantize_and_render(
     s_quant = stream.Score()
     for qp in quantized_parts:
         s_quant.append(qp)
+
+    # P11: Insert Staff Group for Grand Staff
+    try:
+        grp = layout.StaffGroup(
+            [quantized_parts[0], quantized_parts[1]],
+            name="Piano",
+            abbreviation="Pno.",
+            symbol="brace"
+        )
+        s_quant.insert(0, grp)
+    except Exception:
+        pass
 
     # --------------------------------------------------------
     # 5. Export to MusicXML string and MIDI bytes
