@@ -304,6 +304,7 @@ def load_and_preprocess(
     start_offset: float = 0.0,
     max_duration: Optional[float] = None,
     pipeline_logger: Optional[Any] = None,
+    **kwargs: Any,
 ) -> StageAOutput:
     """
     Stage A main entry point.
@@ -491,6 +492,10 @@ def load_and_preprocess(
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         pipeline_version="2.0.0",
+
+        # Instrument (Patch C1)
+        # Attempt to set instrument if explicitly provided in kwargs or config, but don't force default.
+        instrument=str(kwargs.get("instrument") or "") or None,
 
         # Resolved values
         hop_length=hop_length,

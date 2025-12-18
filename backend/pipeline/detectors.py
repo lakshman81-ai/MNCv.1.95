@@ -472,22 +472,35 @@ class YinDetector(BasePitchDetector):
         def _run_pass(frame_len: int) -> Tuple[np.ndarray, np.ndarray]:
             if librosa is not None:
                 try:
-                    # PB2: Support trough_threshold
-                    trough_thr = float(self.kwargs.get("trough_threshold", 0.1))
-                    # Fallback to threshold if set and trough_threshold not explicit?
-                    # Actually standard pyin default is 0.1.
-                    # If user provided trough_threshold in kwargs, use it.
+                    # PB2: Support trough_threshold (Patch E1)
+                    # Pass trough_threshold only if explicitly requested, to be safe across librosa versions
+                    # that might not support it (though 0.8+ does).
+                    extra_kwargs = {}
+                    if "trough_threshold" in self.kwargs:
+                         extra_kwargs["trough_threshold"] = float(self.kwargs["trough_threshold"])
 
-                    f0, _, voiced_prob = librosa.pyin(
-                        y=y,
-                        fmin=float(self.fmin),
-                        fmax=float(self.fmax),
-                        sr=int(self.sr),
-                        frame_length=int(frame_len),
-                        hop_length=int(self.hop_length),
-                        fill_na=0.0,
-                        trough_threshold=trough_thr,
-                    )
+                    try:
+                        f0, _, voiced_prob = librosa.pyin(
+                            y=y,
+                            fmin=float(self.fmin),
+                            fmax=float(self.fmax),
+                            sr=int(self.sr),
+                            frame_length=int(frame_len),
+                            hop_length=int(self.hop_length),
+                            fill_na=0.0,
+                            **extra_kwargs
+                        )
+                    except TypeError:
+                        # Fallback if argument not supported
+                        f0, _, voiced_prob = librosa.pyin(
+                            y=y,
+                            fmin=float(self.fmin),
+                            fmax=float(self.fmax),
+                            sr=int(self.sr),
+                            frame_length=int(frame_len),
+                            hop_length=int(self.hop_length),
+                            fill_na=0.0,
+                        )
                     f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
                     conf = np.asarray(voiced_prob, dtype=np.float32).reshape(-1)
                     f0 = np.where(np.isfinite(f0), f0, 0.0).astype(np.float32)
