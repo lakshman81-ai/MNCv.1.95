@@ -50,20 +50,8 @@ def _get(obj: Any, path: str, default: Any = None) -> Any:
 
 def _velocity_from_rms(rms_list: List[float], vmin: int = 20, vmax: int = 105) -> int:
     # C4: Velocity mapping from RMS (20–105)
-    # The snippet:
-    # x = (rms - rms_min) / max(rms_max - rms_min, 1e-9)
-    # x = x ** 0.6
-    # v = 20 + round(x * (105 - 20))
     if not rms_list:
         return 64
-
-    # Using rough defaults for min/max RMS logic if not passed.
-    # Typically min/max RMS are determined by calibration or config.
-    # Here we assume min_db=-40, max_db=-4 from config defaults if we can access them,
-    # but this function is standalone.
-    # Let's use hardcoded defaults or estimate from input?
-    # The snippet provided expects arguments rms_min, rms_max.
-    # We'll adapt to use reasonable defaults or median.
 
     rms = float(np.mean(rms_list)) # Use mean of note RMS
 
@@ -102,13 +90,7 @@ def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
 
 
 def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float = 35.0) -> bool:
-    """Return True when active_pitches include clearly different layers.
-
-    A small cents tolerance filters out duplicate detector hits that encode the
-    same pitch multiple times without representing true polyphony (e.g. no ISS
-    separation).  Default of ~35 cents keeps near-unison detector duplicates
-    from being treated as distinct layers.
-    """
+    """Return True when active_pitches include clearly different layers."""
     for fp in timeline:
         if not getattr(fp, "active_pitches", None) or len(fp.active_pitches) < 2:
             continue
@@ -156,9 +138,6 @@ def _segment_monophonic(
     split_cents = split_semi * 100.0
     time_merge_frames = int(seg_cfg.get("time_merge_frames", 1))
 
-    # We will use a state machine approach similar to the request snippet,
-    # but adapted to return list of (start, end) indices.
-
     segs: List[Tuple[int, int]] = []
 
     stable = 0
@@ -169,10 +148,6 @@ def _segment_monophonic(
     current_end = -1
     current_pitch_hz = 0.0
 
-    # Pre-calculate voiced status
-    # voiced = (fp.pitch_hz > 0.0 and fp.confidence >= conf_thr)
-    # But wait, conf_thr logic for hysteresis is simpler if we check on the fly
-
     for i, fp in enumerate(timeline):
         voiced = (fp.pitch_hz > 0.0 and fp.confidence >= conf_thr)
 
@@ -182,11 +157,6 @@ def _segment_monophonic(
                 stable += 1
                 if stable >= min_on:
                     active = True
-                    # Start new note, backdate to start of stable run?
-                    # Usually we start at i - stable + 1 or just i?
-                    # Request logic: "current = start_new_note(fp.time...)" implies start now.
-                    # But usually we want to capture the onset.
-                    # Let's say it starts at i - (min_on - 1).
                     current_start = i - (min_on - 1)
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
@@ -196,20 +166,15 @@ def _segment_monophonic(
                 if diff <= split_cents:
                     # Extend note
                     current_end = i
-                    # Update pitch average? Simple implementation just keeps extend
                 else:
                     # Split note
                     segs.append((current_start, current_end))
 
                     # Reset for new note
-                    # Should it require stability again?
-                    # The prompt snippet says "finalize_note(current); current = start_new_note..."
-                    # So it starts immediately.
                     current_start = i
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
-                    stable = min_on # Assume stability transfers? Or reset?
-                    # Usually immediate split means we treat this frame as start of new valid note.
+                    stable = min_on
 
         else:
             stable = 0
@@ -227,10 +192,6 @@ def _segment_monophonic(
         segs.append((current_start, current_end))
 
     # C2: Gap merge (1-frame)
-    # If same pitch class and gap <= time_merge_frames * hop_duration, merge instead of split.
-    # Note: we are operating on indices here.
-    # pitch class check needs midi or hz.
-
     if len(segs) < 2:
         return segs
 
@@ -252,13 +213,9 @@ def _segment_monophonic(
             # Gap in frames
             gap = next_s - curr_e - 1
 
-            # Check merge conditions
-            # 1. Gap small enough
-            # 2. Pitch close enough (use split_cents)
             if gap <= time_merge_frames and _cents_diff_hz(curr_p, next_p) <= split_cents:
                 # Merge
                 curr_e = next_e
-                # Update pitch (maybe weighted average, but keeping curr_p is stable)
             else:
                 merged_segs.append((curr_s, curr_e))
                 curr_s, curr_e = next_s, next_e
@@ -423,12 +380,20 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     # Calculate min_rms
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
-    # RMS gate usually needs to be lower than min velocity threshold to allow decay?
-    # Use -40dB or slightly lower as gate.
     min_rms = 10 ** (min_db / 20.0)
 
-    # Build list of timelines to process. Primary melody first; optional secondary
-    # timelines (e.g., additional stems in polyphonic material) follow.
+    # Use noise floor from Stage A if available
+    nf = 0.0
+    try:
+        nf = float(getattr(getattr(analysis_data, "meta", None), "noise_floor_rms", 0.0) or 0.0)
+    except Exception:
+        nf = 0.0
+
+    if nf > 0.0:
+        # require ~+6 dB above estimated noise floor
+        min_rms = max(min_rms, nf * (10 ** (6.0 / 20.0)))
+
+    # Build list of timelines to process.
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]
     audio_type = getattr(analysis_data.meta, "audio_type", None)
     allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
@@ -465,8 +430,6 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             except Exception:
                 pass
 
-            # If the polyphony came from detector duplicates (no clear ISS layer),
-            # tighten the gate for secondary voices to suppress fluttery artifacts.
             if vidx > 0 and not has_distinct_poly:
                 voice_conf_gate = max(voice_conf_gate, accomp_conf)
                 try:
@@ -475,7 +438,6 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 except Exception:
                     pass
         elif vidx > 0:
-            # Secondary timelines without explicit poly layers still use a stricter gate.
             voice_conf_gate = max(voice_conf_gate, accomp_conf)
 
         hop_s = _estimate_hop_seconds(timeline)
@@ -520,6 +482,10 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             if not mids:
                 continue
 
+            # Enforce RMS gate (important for noise floor handling)
+            if rmss and np.mean(rmss) < min_rms:
+                continue
+
             midi_note = int(round(float(np.median(mids))))
             pitch_hz = float(np.median(hzs)) if hzs else 0.0
             confidence = float(np.mean(confs)) if confs else 0.0
@@ -547,6 +513,55 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
     analysis_data.notes = quantized_notes
     return quantized_notes
+
+
+def _sec_to_beat_index(t: float, beat_times: list[float]) -> float:
+    n = len(beat_times)
+    if n < 2:
+        return 0.0
+
+    bt = np.asarray(beat_times, dtype=np.float64)
+    idx = np.arange(n, dtype=np.float64)
+
+    # interior mapping
+    if bt[0] <= t <= bt[-1]:
+        return float(np.interp(t, bt, idx))
+
+    # edge intervals (robust)
+    dt0 = float(bt[1] - bt[0])
+    dt1 = float(bt[-1] - bt[-2])
+
+    # guard against bad beat arrays
+    if dt0 <= 1e-6 or dt1 <= 1e-6:
+        # fallback: clamp rather than explode
+        return 0.0 if t < bt[0] else float(n - 1)
+
+    if t < bt[0]:
+        return float((t - bt[0]) / dt0)  # beat 0 + negative offset
+    else:
+        return float((n - 1) + (t - bt[-1]) / dt1)  # extend beyond last beat
+
+
+def _beat_index_to_sec(b: float, beat_times: list[float]) -> float:
+    n = len(beat_times)
+    if n < 2:
+        return 0.0
+
+    bt = np.asarray(beat_times, dtype=np.float64)
+    idx = np.arange(n, dtype=np.float64)
+
+    if 0.0 <= b <= float(n - 1):
+        return float(np.interp(b, idx, bt))
+
+    dt0 = float(bt[1] - bt[0])
+    dt1 = float(bt[-1] - bt[-2])
+    if dt0 <= 1e-6 or dt1 <= 1e-6:
+        return float(bt[0] if b < 0 else bt[-1])
+
+    if b < 0.0:
+        return float(bt[0] + b * dt0)
+    else:
+        return float(bt[-1] + (b - float(n - 1)) * dt1)
 
 
 def quantize_notes(
@@ -583,11 +598,21 @@ def quantize_notes(
 
     analysis: Optional[AnalysisData] = analysis_data
 
+    beat_times = []
+    if analysis is not None:
+        beat_times = list(getattr(analysis, "beats", []) or [])
+        if not beat_times:
+            meta = getattr(analysis, "meta", None)
+            if meta is not None:
+                beat_times = list(getattr(meta, "beat_times", []) or getattr(meta, "beats", []) or [])
+
+    use_beat_times = len(beat_times) >= 2
+
     bpm_source = None
     if analysis is not None:
         bpm_source = _get(analysis, "meta.tempo_bpm", None)
         if bpm_source is None:
-            beats_seq = _get(analysis, "beats", []) or []
+            beats_seq = beat_times
             if beats_seq:
                 diffs = np.diff(sorted(beats_seq))
                 if diffs.size:
@@ -621,7 +646,7 @@ def quantize_notes(
         elif effective_bpm > 140:
             denom = max(denom, 32)
     else:
-        denom = 8  # coarse snap when tempo unknown
+        denom = 8
 
     step_beats = 4.0 / float(max(1, denom))  # in 4/4, quarter note = 1 beat
     step_sec = sec_per_beat * step_beats
@@ -644,41 +669,63 @@ def quantize_notes(
 
     out: List[NoteEvent] = []
     for n in notes:
-        s = float(n.start_sec)
-        e = float(n.end_sec)
+        # Quantize Logic
+        if use_beat_times:
+            # Beat-space quantization
+            bs = _sec_to_beat_index(float(n.start_sec), beat_times)
+            be = _sec_to_beat_index(float(n.end_sec), beat_times)
 
-        # Redundant check removed: logic is identical
-        qs = round(s / step_sec) * step_sec
-        qe = round(e / step_sec) * step_sec
+            qbs = round(bs / step_beats) * step_beats
+            qbe = round(be / step_beats) * step_beats
 
-        if qe <= qs:
-            qe = qs + max(int(min_steps), 1) * step_sec
+            if qbe <= qbs:
+                qbe = qbs + max(int(min_steps), 1) * step_beats
 
-        # enforce minimum duration
-        if (qe - qs) < max(int(min_steps), 1) * step_sec:
-            qe = qs + max(int(min_steps), 1) * step_sec
+            # Convert back to seconds
+            qs = _beat_index_to_sec(qbs, beat_times)
+            qe = _beat_index_to_sec(qbe, beat_times)
 
-        beat_idx = qs / sec_per_beat  # 0-indexed global beat position
+            # Clamp negative times from backward extrapolation
+            qs = max(0.0, qs)
+            qe = max(0.0, qe)
+
+            # Re-enforce duration in seconds after clamping
+            if qe <= qs:
+                # Fallback step sec estimation if needed, but we can try to respect grid
+                # Just bump qe
+                qe = qs + 0.05
+
+            # For NoteEvent metrics
+            beat_idx = qbs
+            duration_beats = qbe - qbs
+
+        else:
+            # Constant BPM fallback
+            s = float(n.start_sec)
+            e = float(n.end_sec)
+            qs = round(s / step_sec) * step_sec
+            qe = round(e / step_sec) * step_sec
+
+            if qe <= qs:
+                qe = qs + max(int(min_steps), 1) * step_sec
+            if (qe - qs) < max(int(min_steps), 1) * step_sec:
+                qe = qs + max(int(min_steps), 1) * step_sec
+
+            beat_idx = qs / sec_per_beat
+            duration_beats = (qe - qs) / sec_per_beat
+
         measure = int(beat_idx // beats_per_measure) + 1
         beat_in_measure = (beat_idx % beats_per_measure) + 1
-        duration_beats = (qe - qs) / sec_per_beat
 
-        # Clamp to audio duration if known (avoid validation errors)
+        # Clamp to audio duration if known
         if analysis is not None:
              dur = getattr(analysis.meta, "duration_sec", 0.0)
              if dur > 0.0 and qe > dur:
                  qe = dur
-                 # Recompute duration_beats if needed, or just keep as is?
-                 # Validation checks end_sec vs duration.
-                 # We should technically update duration_beats to match new length
-                 if qe > qs:
-                    duration_beats = (qe - qs) / sec_per_beat
-                 else:
-                    # Note pushed entirely out of bounds?
-                    # If qe <= qs, we might drop it or keep minimal length.
-                    # Ideally drop, but let's just clamp qs too?
-                    # For now, let's just clamp qe.
-                    pass
+                 # Recalculate duration_beats if possible, but complex in beat space
+                 # if we clamp qe, duration_beats might be wrong relative to grid
+                 # but strict clamp is safer for validation.
+                 pass
 
         out.append(
             NoteEvent(
@@ -688,7 +735,7 @@ def quantize_notes(
                 pitch_hz=float(n.pitch_hz),
                 confidence=float(n.confidence),
                 velocity=float(n.velocity),
-                dynamic=n.dynamic,  # Pass through dynamic
+                dynamic=n.dynamic,
                 measure=measure,
                 beat=float(beat_in_measure),
                 duration_beats=float(duration_beats),

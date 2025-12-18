@@ -160,8 +160,7 @@ def _trim_silence(audio: np.ndarray, top_db: float, frame_length: int = 2048, ho
             pass
 
     # Fallback trim: RMS threshold
-    # Simple calculation of RMS per frame
-    return audio # TODO: implement manual trim if needed, for now return as is if librosa fails
+    return audio
 
 def _measure_loudness(audio: np.ndarray, sr: int) -> Tuple[Optional[float], str]:
     """Measure loudness using pyloudnorm (LUFS) or RMS fallback."""
@@ -234,15 +233,11 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
         return 0.0, -100.0
 
     # Frame energy
-    # Make frames
     if len(audio) < hop_length:
         rms_vals = np.array([np.sqrt(np.mean(audio**2))])
     else:
         # Simple framing
-        # Pad to ensure we cover everything?
         n_frames = len(audio) // hop_length
-        # We can just reshape roughly to get stats
-        # Truncate to multiple of hop
         y = audio[:n_frames * hop_length]
         y_frames = y.reshape((n_frames, hop_length))
         rms_vals = np.sqrt(np.mean(y_frames**2, axis=1))
@@ -252,7 +247,13 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
     return noise_rms, noise_db
 
 
-def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[Optional[float], List[float]]:
+def _detect_tempo_and_beats(
+    audio: np.ndarray,
+    sr: int,
+    enabled: bool,
+    tightness: float = 100.0,
+    trim: bool = True
+) -> Tuple[Optional[float], List[float]]:
     """Run a lightweight tempo/beat estimator if enabled and librosa is available."""
 
     if not enabled or librosa is None:
@@ -264,22 +265,25 @@ def _detect_tempo_and_beats(audio: np.ndarray, sr: int, enabled: bool) -> Tuple[
             return None, []
 
         # Downsample and cap duration to keep beat tracking stable/cheap
-        target_sr = 16000 if sr > 16000 else max(11025, sr)
+        beat_sr = 16000 if sr > 16000 else max(11025, sr)
         max_seconds = 90.0
+
         if librosa:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                if sr != target_sr:
-                    y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
-                if y.size > int(target_sr * max_seconds):
-                    y = y[: int(target_sr * max_seconds)]
+                if sr != beat_sr:
+                    y = librosa.resample(y, orig_sr=sr, target_sr=beat_sr)
+                if y.size > int(beat_sr * max_seconds):
+                    y = y[: int(beat_sr * max_seconds)]
+
                 tempo_est, beat_frames = librosa.beat.beat_track(
                     y=y,
-                    sr=target_sr,
+                    sr=beat_sr,
                     hop_length=256,
-                    tightness=100,
+                    tightness=tightness,
+                    trim=trim,
                 )
-                beat_times = librosa.frames_to_time(beat_frames, sr=target_sr, hop_length=256).tolist()
+                beat_times = librosa.frames_to_time(beat_frames, sr=beat_sr, hop_length=256).tolist()
         else:  # pragma: no cover - defensive fallback
             beat_times = []
             tempo_est = None
@@ -311,17 +315,13 @@ def load_and_preprocess(
     5. Estimate noise floor.
     """
     if config is None:
-        # Default empty PipelineConfig which has a default StageAConfig
         full_conf = PipelineConfig()
         a_conf = full_conf.stage_a
     elif isinstance(config, StageAConfig):
-        # Wrap StageAConfig in a PipelineConfig so Stage B defaults still
-        # influence hop/window selection for consistency across stages.
         full_conf = PipelineConfig()
         full_conf.stage_a = config
         a_conf = config
     else:
-        # It's a PipelineConfig
         full_conf = config
         a_conf = config.stage_a
 
@@ -334,20 +334,16 @@ def load_and_preprocess(
     window_size = 2048
 
     if full_conf:
-        # Check Stage B detectors for 'yin' or 'swiftf0' preference
-        # We use .get() safely
         detectors = full_conf.stage_b.detectors
         yin_conf = detectors.get("yin")
         swift_conf = detectors.get("swiftf0")
 
         # Priority: YIN > SwiftF0 (if enabled)
-        # Note: configs might not have explicit hop_length keys, so we check existence
         if yin_conf and yin_conf.get("enabled", False):
             hop_length = int(yin_conf.get("hop_length", 512))
-            window_size = int(yin_conf.get("frame_length", 2048)) # YIN usually calls it frame_length
+            window_size = int(yin_conf.get("frame_length", 2048))
         elif swift_conf and swift_conf.get("enabled", False):
             hop_length = int(swift_conf.get("hop_length", 512))
-            # SwiftF0 might not specify window size same way, default to 2048
             window_size = int(swift_conf.get("n_fft", 2048))
 
     # 1. Load & Resample
@@ -365,7 +361,6 @@ def load_and_preprocess(
                 )
         else:
             audio, sr = _load_audio_fallback(audio_path, target_sr)
-            # Manual offset/duration handling for fallback path
             if start_offset or max_duration:
                 offset_samples = int(max(0.0, float(start_offset or 0.0)) * sr)
                 end = int(offset_samples + (max_duration * sr if max_duration else len(audio)))
@@ -378,70 +373,28 @@ def load_and_preprocess(
 
     original_duration = float(len(audio)) / float(sr)
 
-    # 1b. Signal conditioning (DC Offset, HPF, Limiter) - NEW for A2
-    # Apply after loading/resampling but before trimming/norm
+    # 1b. Signal conditioning (DC Offset, HPF, Limiter)
 
     # DC offset removal
-    if getattr(a_conf, "dc_offset_removal", False) or (isinstance(a_conf.dc_offset_removal, dict) and a_conf.dc_offset_removal.get("enabled", False)):
+    dc_conf = getattr(a_conf, "dc_offset_removal", False)
+    if dc_conf is True or (isinstance(dc_conf, dict) and dc_conf.get("enabled", False)):
         audio = _remove_dc_offset(audio)
 
     # High-pass filter
-    hpf = getattr(a_conf, "high_pass_filter", {}) or {}
-    # Check if we should use high_pass_filter_cutoff/order (legacy) or dict (new)
-    # The config shows high_pass_filter_cutoff is Dict in StageAConfig default, but our new config uses high_pass_filter dict
-    # We will try to support both or check 'high_pass_filter' attribute first (as added in my config update)
-    # Wait, in config.py I did NOT change StageAConfig fields definition, only PIANO_61KEY_CONFIG usage.
-    # StageAConfig has `high_pass_filter_cutoff` and `high_pass_filter_order`.
-    # BUT `PIANO_61KEY_CONFIG` used `high_pass_filter={"enabled": True...}` which doesn't match StageAConfig definition I see in `config.py`.
-    # I must check `config.py` again.
-    # `StageAConfig` has `high_pass_filter_cutoff` (dict) and `high_pass_filter_order` (dict).
-    # It does NOT have `high_pass_filter` (dict).
-    # My update to `PIANO_61KEY_CONFIG` used `high_pass_filter=...`. This might be an error if I didn't update the dataclass.
-    # I did NOT update the dataclass in Step 2.
-    # I should have checked if `high_pass_filter` field exists.
-    # Let me check `backend/pipeline/config.py` content I just wrote.
-    # I wrote `PIANO_61KEY_CONFIG` with `high_pass_filter=...`.
-    # But `StageAConfig` definition was:
-    # high_pass_filter_cutoff: Dict...
-    # high_pass_filter_order: Dict...
-    # So `PIANO_61KEY_CONFIG` might fail at runtime if I try to instantiate it with unknown field, unless `StageAConfig` handles extra fields (unlikely).
-    # OR maybe I should use `high_pass_filter_cutoff` and `high_pass_filter_order` to store the config.
-    # BUT, the prompt asked me to add:
-    # `high_pass_filter: dict = field(default_factory=lambda: {"enabled": True, "cutoff_hz": 60.0, "order": 4})`
-    # I missed adding this field to `StageAConfig` class in Step 2. I only updated the `PIANO_61KEY_CONFIG`.
-    # I need to fix `StageAConfig` definition to include `high_pass_filter`, `dc_offset_removal` (as dict or bool? Prompt says dict in snippet, bool in my plan/code), `peak_limiter`.
-    # Currently `dc_offset_removal` is bool in `StageAConfig`.
+    hpf_cfg = getattr(a_conf, "high_pass_filter", None) or {}
+    legacy_cut = getattr(a_conf, "high_pass_filter_cutoff", None)
 
-    # Let's fix this in `stage_a.py` by checking attributes safely for now, but I should probably update `config.py` to match the usage in `PIANO_61KEY_CONFIG`.
-    # Since I already wrote `config.py`, I should check if I broke it.
-    # If I run a test now it would likely fail.
-    # I will proceed with `stage_a.py` implementation assuming standard fields or new fields if they exist.
-    # For now, I will implement flexible checking.
+    # Fallback to legacy if dict is missing but legacy exists
+    if (not hpf_cfg) and (legacy_cut is not None):
+        legacy_cut_val = legacy_cut.get("value", 55.0) if isinstance(legacy_cut, dict) else legacy_cut
+        hpf_cfg = {"enabled": True, "cutoff_hz": float(legacy_cut_val), "order": 4}
 
-    hpf_cutoff_val = 55.0
-    hpf_order_val = 4
-    hpf_enabled = False
-
-    if hasattr(a_conf, "high_pass_filter") and isinstance(a_conf.high_pass_filter, dict):
-        hpf_dict = a_conf.high_pass_filter
-        hpf_enabled = hpf_dict.get("enabled", False)
-        hpf_cutoff_val = float(hpf_dict.get("cutoff_hz", 55.0))
-        hpf_order_val = int(hpf_dict.get("order", 4))
-    else:
-        # Legacy/Existing fields
-        # high_pass_filter_cutoff is a dict with "value"
-        if hasattr(a_conf, "high_pass_filter_cutoff"):
-            hpf_cutoff_val = float(a_conf.high_pass_filter_cutoff.get("value", 55.0))
-        if hasattr(a_conf, "high_pass_filter_order"):
-            hpf_order_val = int(a_conf.high_pass_filter_order.get("value", 4))
-        # No explicit enabled flag in legacy? Assuming enabled if we are here? No, legacy didn't have enabled flag maybe.
-        # But A1 requirement says "Config defaults ... HPF=60Hz".
-        # I'll rely on the new field if present, otherwise skip or default?
-        # Use `hpf_enabled` only if I find the new field.
-        pass
+    hpf_enabled = bool(hpf_cfg.get("enabled", False))
+    hpf_cutoff = float(hpf_cfg.get("cutoff_hz", 60.0))
+    hpf_order = int(hpf_cfg.get("order", 4))
 
     if hpf_enabled:
-        audio = _high_pass(audio, sr=int(sr), cutoff_hz=hpf_cutoff_val, order=hpf_order_val)
+        audio = _high_pass(audio, sr=int(sr), cutoff_hz=hpf_cutoff, order=hpf_order)
 
     # Peak limiter
     lim = getattr(a_conf, "peak_limiter", {}) or {}
@@ -456,15 +409,14 @@ def load_and_preprocess(
     # Diagnostics logging
     if pipeline_logger:
         pipeline_logger.log_event("stage_a", "preprocessing_applied", payload={
-            "dc_offset": bool(getattr(a_conf, "dc_offset_removal", False)),
+            "dc_offset": bool(dc_conf),
             "hpf": bool(hpf_enabled),
-            "hpf_cutoff": float(hpf_cutoff_val),
+            "hpf_cutoff": float(hpf_cutoff),
             "limiter": bool(lim.get("enabled", False)),
         })
 
 
-    # 1c. Transient Emphasis (Optional) - existing
-    # Applied after loading but before silence trimming/norm
+    # 1c. Transient Emphasis (Optional)
     tpe_conf = a_conf.transient_pre_emphasis
     if tpe_conf.get("enabled", True):
         audio = warped_linear_prediction(audio, sr=sr, pre_emphasis=float(tpe_conf.get("alpha", 0.97)))
@@ -488,11 +440,35 @@ def load_and_preprocess(
     nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
 
     # 5. Optional tempo / beat detection (lightweight, single pass)
+    bpm_cfg = getattr(a_conf, "bpm_detection", None) or {}
+    bpm_enabled = bool(bpm_cfg.get("enabled", True))
+    bpm_tightness = float(bpm_cfg.get("tightness", 100.0))
+    bpm_trim = bool(bpm_cfg.get("trim", True))
+
     tempo_bpm, beat_times = _detect_tempo_and_beats(
         audio,
         sr=target_sr,
-        enabled=a_conf.bpm_detection.get("enabled", False),
+        enabled=bpm_enabled,
+        tightness=bpm_tightness,
+        trim=bpm_trim
     )
+    if beat_times:
+        beat_times = sorted(list(set(beat_times)))
+
+    if pipeline_logger:
+        pipeline_logger.log_event("stage_a", "params_resolved", payload={
+            "bpm_detection": {
+                "enabled": bpm_enabled,
+                "tightness": bpm_tightness,
+                "trim": bpm_trim
+            },
+            "high_pass_filter": {
+                "enabled": hpf_enabled,
+                "cutoff_hz": hpf_cutoff,
+                "order": hpf_order,
+                "legacy_fallback_used": (not getattr(a_conf, "high_pass_filter", None)) and (legacy_cut is not None)
+            }
+        })
 
     # 6. Detect texture (mono / poly) and optionally run separation
     detected_type = detect_audio_type(audio, sr)
@@ -585,8 +561,6 @@ def load_and_preprocess(
             stems["vocals"] = Stem(audio=np.asarray(audio, dtype=np.float32), sr=int(sr), type="vocals")
 
     # If (and only if) real separation produced stems, merge them here.
-    # Expect a dict like {"vocals": np.ndarray, "bass": ..., "other": ...} or {"vocals": Stem, ...}
-    # In this function, 'separated' (if populated above) already contains Stem objects.
     if locals().get("separated") and isinstance(separated, dict):
         for k, v in separated.items():
             if isinstance(v, Stem):
