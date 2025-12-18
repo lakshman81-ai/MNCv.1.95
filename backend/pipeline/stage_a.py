@@ -469,19 +469,44 @@ def load_and_preprocess(
     bpm_tightness = float(bpm_cfg.get("tightness", 100.0))
     bpm_trim = bool(bpm_cfg.get("trim", True))
 
-    tempo_bpm, beat_times = detect_tempo_and_beats(
-        audio,
-        sr=target_sr,
-        enabled=bpm_enabled,
-        tightness=bpm_tightness,
-        trim=bpm_trim,
-        hop_length=hop_length,
-        pipeline_logger=pipeline_logger,
-    )
-    if beat_times:
-        beat_times = sorted(list(set(beat_times)))
+    # Diagnostics for BPM
+    bpm_diag = {"method": "librosa", "enabled": bpm_enabled, "run": False}
+
+    tempo_bpm = None
+    beat_times = []
+
+    # Check for short audio gate (Stage A contract/invariants)
+    # If audio is very short, librosa might fail or return garbage.
+    # We set a gate: e.g., < 6.0s -> skip (too short)
+    # Also if user explicitly disabled it.
+
+    is_too_short = (len(audio) / sr) < 6.0 # explicit 6s gate per requirements
+
+    if bpm_enabled and not is_too_short:
+        tempo_bpm, beat_times = _detect_tempo_and_beats(
+            audio,
+            sr=target_sr,
+            enabled=True,
+            tightness=bpm_tightness,
+            trim=bpm_trim
+        )
+        if beat_times:
+            beat_times = sorted(list(set(beat_times)))
+        bpm_diag["run"] = True
+        bpm_diag["result"] = "success" if tempo_bpm else "no_tempo"
+    else:
+        bpm_diag["run"] = False
+        bpm_diag["reason"] = "disabled" if not bpm_enabled else "too_short"
+        # Fallback default
+        tempo_bpm = 120.0
+        beat_times = []
+
+    # Ensure tempo_bpm is 120.0 if None
+    if tempo_bpm is None:
+        tempo_bpm = 120.0
 
     if pipeline_logger:
+        pipeline_logger.log_event("stage_a", "bpm_detection", payload=bpm_diag)
         pipeline_logger.log_event("stage_a", "params_resolved", payload={
             "bpm_detection": {
                 "enabled": bpm_enabled,
@@ -544,4 +569,5 @@ def load_and_preprocess(
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         beats=beat_times,
+        diagnostics={"bpm": bpm_diag}
     )
