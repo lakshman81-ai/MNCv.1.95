@@ -191,7 +191,14 @@ class SyntheticMDXSeparator:
         }
 
 
-def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, shifts: int) -> Optional[Dict[str, Any]]:
+def _run_htdemucs(
+    audio: np.ndarray,
+    sr: int,
+    model_name: str,
+    overlap: float,
+    shifts: int,
+    device: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     if (
         not _module_available("demucs.pretrained")
         or not _module_available("demucs.apply")
@@ -204,8 +211,15 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     from demucs.apply import apply_model
     import torch
 
+    # Resolve device
+    try:
+        dev = torch.device(device) if device else torch.device("cpu")
+    except Exception:
+        dev = torch.device("cpu")
+
     try:
         model = get_model(model_name)
+        model.to(dev)
     except Exception as exc:
         logger.warning(f"HTDemucs unavailable ({exc}); skipping neural separation.")
         return None
@@ -220,10 +234,10 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     else:
         resampled = audio
 
-    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, None, :]
+    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, None, :].to(dev)
     try:
         with torch.no_grad():
-            demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts)
+            demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts, device=dev)
     except Exception as exc:
         logger.warning(f"HTDemucs inference failed ({exc}); skipping neural separation.")
         return None
@@ -241,7 +255,7 @@ def _run_htdemucs(audio: np.ndarray, sr: int, model_name: str, overlap: float, s
     return separated
 
 
-def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Resolve separation strategy and track which path actually executed.
     Returns (stems, diagnostics).
@@ -316,6 +330,7 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf) -> Tuple[Dict[str, An
         sep_conf.get("model", "htdemucs"),
         overlap,
         shifts,
+        device=device,
     )
 
     if separated:
@@ -760,7 +775,7 @@ def extract_features(
     sr = stage_a_out.meta.sample_rate
     hop_length = stage_a_out.meta.hop_length
 
-    # Patch D1: Resolve instrument profile + apply overrides (without mutating config)
+    # Patch D1 / B0: Resolve instrument profile + apply overrides (without mutating config)
     # Priority: kwargs -> config intended instrument -> meta.instrument -> fallback
     instrument = (
         kwargs.get("instrument")
@@ -774,14 +789,24 @@ def extract_features(
     profile_applied = bool(profile)
 
     # Work on copies so we don't mutate config dataclasses
-    detector_cfgs = {k: dict(v) for k, v in b_conf.detectors.items()}
+    detector_cfgs = deepcopy(b_conf.detectors)
     weights_eff = dict(b_conf.ensemble_weights)
     melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
 
-    # Apply profile overrides
+    # Apply Optional nested overrides first
+    nested = profile_special.get("stage_b_detectors") or {}
+    for det_name, overrides in (nested.items() if isinstance(nested, dict) else []):
+        if det_name in detector_cfgs and isinstance(overrides, dict):
+            detector_cfgs[det_name].update(overrides)
+
+    # Apply profile overrides and flat keys
     if profile:
         # Force instrument range everywhere
         for _, dconf in detector_cfgs.items():
+            dconf.setdefault("fmin", float(profile.fmin))
+            dconf.setdefault("fmax", float(profile.fmax))
+            # If profile provides explicit range, we should arguably prioritize it,
+            # but usually defaults are broader. Let's enforce profile range if set.
             dconf["fmin"] = float(profile.fmin)
             dconf["fmax"] = float(profile.fmax)
 
@@ -794,17 +819,14 @@ def extract_features(
             detector_cfgs[rec]["enabled"] = True
 
         # Map flat keys to structure
-        if "yin_trough_threshold" in profile_special:
-            if "yin" in detector_cfgs:
-                 detector_cfgs["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
+        if "yin_trough_threshold" in profile_special and "yin" in detector_cfgs:
+             detector_cfgs["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
 
-        if "yin_conf_threshold" in profile_special:
-            if "yin" in detector_cfgs:
-                 detector_cfgs["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
+        if "yin_conf_threshold" in profile_special and "yin" in detector_cfgs:
+             detector_cfgs["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
 
-        if "yin_frame_length" in profile_special:
-            if "yin" in detector_cfgs:
-                detector_cfgs["yin"]["frame_length"] = int(profile_special["yin_frame_length"])
+        if "yin_frame_length" in profile_special and "yin" in detector_cfgs:
+            detector_cfgs["yin"]["frame_length"] = int(profile_special["yin_frame_length"])
 
         # Violin-style vibrato smoothing
         if "vibrato_smoothing_ms" in profile_special:
@@ -818,7 +840,24 @@ def extract_features(
 
     # Separation routing happens before harmonic masking/ISS so downstream
     # detectors always see the requested stem layout.
-    resolved_stems, separation_diag = _resolve_separation(stage_a_out, b_conf)
+    device = getattr(config, "device", "cpu")
+    resolved_stems, separation_diag = _resolve_separation(stage_a_out, b_conf, device=device)
+
+    # Patch OPT6: Apply active_stems filter
+    whitelist = getattr(b_conf, "active_stems", None)
+    if whitelist is not None:
+        # Keep 'mix' always or check if user excluded it? Usually we keep mix for fallback.
+        # But if whitelist is explicit, maybe we should respect it fully?
+        # Safe bet: always keep mix if it exists, filter others.
+        # Requirement says: "active_stems: Optional[List[str]] = None # e.g. ["bass", "vocals"]; None => all"
+
+        filtered_stems = {}
+        for sname, sobj in resolved_stems.items():
+            if sname == "mix":
+                filtered_stems[sname] = sobj
+            elif sname in whitelist:
+                filtered_stems[sname] = sobj
+        resolved_stems = filtered_stems
 
     # 1. Initialize Detectors based on Config
     detectors: Dict[str, BasePitchDetector] = {}
@@ -886,28 +925,21 @@ def extract_features(
         else:
             stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 
-            # Patch D2: Pre-LPF for distorted guitar (profile special key)
-            pre_lpf = profile_special.get("pre_lpf_hz")
-            if pre_lpf and SCIPY_SIGNAL is not None:
-                audio = _butter_filter(np.asarray(audio, np.float32), sr, float(pre_lpf), "low")
+            # Patch B4: Pre-LPF (distorted guitar) before detector predict
+            # We filter a copy of audio for detection, preserving original for other uses
+            audio_in = audio
+            pre_lpf_hz = float(profile_special.get("pre_lpf_hz", 0.0) or 0.0)
+            if pre_lpf_hz > 0.0 and SCIPY_SIGNAL is not None:
+                audio_in = _butter_filter(np.asarray(audio, dtype=np.float32), sr, pre_lpf_hz, "low")
 
             # Run all initialized detectors on this stem
             for name, det in detectors.items():
                 try:
                     # Prepare audio for this detector
-                    audio_for_det = np.asarray(audio, dtype=np.float32)
+                    audio_for_det = np.asarray(audio_in, dtype=np.float32)
 
                     f0, conf = det.predict(audio_for_det, audio_path=stage_a_out.meta.audio_path)
 
-                    # Patch D3: Transient lockout (onset skip mask)
-                    # Note: We don't have RMS yet (computed below), so we must compute temporary RMS here
-                    # or defer this check. Wait, we need conf masked BEFORE ensemble merge.
-                    # We can compute RMS once per stem at start of loop.
-
-                    # (Re-ordering RMS computation to top of loop for D3 support)
-                    pass
-
-                    # B2: Apply stricter SwiftF0 confidence gate if configured
                     # B2: Apply stricter SwiftF0 confidence gate if configured
                     if name == "swiftf0":
                         thr = float(detector_cfgs.get("swiftf0", {}).get("confidence_threshold", 0.9))
@@ -1009,24 +1041,42 @@ def extract_features(
         elif len(rms_vals) > len(merged_f0):
             rms_vals = rms_vals[:len(merged_f0)]
 
-        # Patch D3: Transient Lockout (RMS-based)
-        # Zero confidence for N frames after a sharp RMS rise (pick noise)
-        transient_skip_ms = float(profile_special.get("transient_lockout_ms", 0.0))
-        if transient_skip_ms > 0 and len(rms_vals) > 1:
-            skip_frames = int(round((transient_skip_ms / 1000.0) * (sr / hop_length)))
-            if skip_frames > 0:
-                onset_ratio = 2.5  # Heuristic: 2.5x jump
-                rms_gate = 0.005   # Silence floor
+        # Patch B3: Vectorized Transient Lockout (RMS-based)
+        lockout_ms = float(profile_special.get("transient_lockout_ms", 0.0) or 0.0)
+        onset_ratio_thr = float(profile_special.get("onset_ratio_thr", 2.5) or 2.5)
 
-                lockout_counter = 0
-                for i in range(1, len(rms_vals)):
-                    # Check onset
-                    if rms_vals[i] > rms_gate and rms_vals[i] > onset_ratio * rms_vals[i-1]:
-                        lockout_counter = skip_frames
+        lockout_frames = int(round((lockout_ms / 1000.0) * sr / max(hop_length, 1))) if lockout_ms > 0 else 0
 
-                    if lockout_counter > 0:
-                        merged_conf[i] = 0.0
-                        lockout_counter -= 1
+        if lockout_frames > 0 and len(rms_vals) > 1:
+            lock_mask = np.zeros_like(merged_conf, dtype=bool)
+            eps = 1e-9
+            rms_ratio = np.ones_like(rms_vals, dtype=np.float32)
+            rms_ratio[1:] = rms_vals[1:] / (rms_vals[:-1] + eps)
+
+            onset_idx = np.where(rms_ratio >= onset_ratio_thr)[0]
+            for idx in onset_idx:
+                lock_mask[idx : min(idx + lockout_frames, len(lock_mask))] = True
+
+            # Apply mask to merged
+            merged_conf = np.where(lock_mask, 0.0, merged_conf)
+            merged_f0   = np.where(lock_mask, 0.0, merged_f0)
+
+            # Apply mask to ISS layers too
+            masked_iss_layers = []
+            for f0_l, c_l in iss_layers:
+                c_l = np.where(lock_mask[:len(c_l)], 0.0, c_l)
+                f0_l = np.where(c_l > 0.0, f0_l, 0.0)
+                masked_iss_layers.append((f0_l, c_l))
+            iss_layers = masked_iss_layers
+
+            # (Optional) Apply mask to per_detector tracks for consistent debugging
+            for det_name in per_detector[stem_name]:
+                 pf0, pconf = per_detector[stem_name][det_name]
+                 if len(pconf) == len(lock_mask):
+                     pconf = np.where(lock_mask, 0.0, pconf)
+                     pf0 = np.where(lock_mask, 0.0, pf0)
+                     per_detector[stem_name][det_name] = (pf0, pconf)
+
 
         # Melody stabilization before skyline selection
         # 4F: Use melody_filter_eff

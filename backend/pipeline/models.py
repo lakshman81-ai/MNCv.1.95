@@ -44,6 +44,7 @@ class MetaData:
     # Tuning / music-theory info
     tuning_offset: float = 0.0              # in semitones (fractional)
     detected_key: str = "C"                 # e.g. "C", "Gm"
+    forced_key: Optional[str] = None        # User forced key (e.g. "F#m")
 
     # Instrument hint (optional; used to select instrument_profiles)
     instrument: Optional[str] = None  # e.g., "piano_61key", "violin", "bass_guitar"

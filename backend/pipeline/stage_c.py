@@ -535,8 +535,31 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         special_key = f"stage_c_{key}"
         if special_key in profile_special:
             return profile_special[special_key]
+        # Also check flat key without stage_c_ prefix if it was in the report?
+        # But report says "stage_c_min_note_duration_ms"
+        # However, for nested override "stage_c" -> key
+        # We can also check explicit nested overrides.
+        nested_c = profile_special.get("stage_c", {})
+        if isinstance(nested_c, dict) and key in nested_c:
+            return nested_c[key]
+
         # Then config
         return _get(config, f"stage_c.{key}", default)
+
+    # Patch C0: Resolve overrides for segmentation
+    # Specifically map: stage_c_pitch_ref_window_frames, stage_c_conf_start/end
+
+    seg_cfg = dict(resolve_val("segmentation_method", {}) or {})
+    if "stage_c_pitch_ref_window_frames" in profile_special:
+         # Note: stage_c_pitch_ref_window_frames doesn't exist in segmentation_method usually,
+         # it's usually a local param or logic. But let's check.
+         # Actually it's P5 in _segment_monophonic which currently hardcodes pitch_buffer_size=7.
+         # We need to pass it down.
+         pass
+
+    # We'll pass seg_cfg into _segment_monophonic, so let's update it if needed
+    if "stage_c_pitch_ref_window_frames" in profile_special:
+        seg_cfg["pitch_ref_window_frames"] = int(profile_special["stage_c_pitch_ref_window_frames"])
 
     stem_timelines: Dict[str, List[FramePitch]] = analysis_data.stem_timelines or {}
 
@@ -749,20 +772,43 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                      )
                  )
 
-    # Patch F8: Optional Bass Backtracking
-    bass_backtrack_ms = float(profile_special.get("bass_backtrack_ms", 0.0))
+    # Patch C8: Optional Bass Backtracking with Strict Clamp
+    bass_backtrack_ms = float(profile_special.get("stage_c_backtrack_ms", 0.0) or profile_special.get("bass_backtrack_ms", 0.0))
     if bass_backtrack_ms > 0.0 and notes:
         backtrack_sec = bass_backtrack_ms / 1000.0
-        # Sort to ensure safe lookback
-        notes.sort(key=lambda n: n.start_sec)
-        for i, n in enumerate(notes):
-            # Only apply if not overlapping previous note too much
-            prev_end = notes[i-1].end_sec if i > 0 else 0.0
-            new_start = n.start_sec - backtrack_sec
+        min_dur_s = min_note_dur_s # Use the resolved min dur
 
-            # Allow slight overlap or butt up against previous
-            if new_start >= prev_end - 0.05:
-                n.start_sec = max(0.0, new_start)
+        # Sort to ensure safe lookback order
+        notes.sort(key=lambda n: n.start_sec)
+
+        # We need to do this per-voice to respect monophonic lines correctly.
+        # Group by voice first.
+        by_voice = {}
+        for n in notes:
+            v = n.voice
+            if v not in by_voice: by_voice[v] = []
+            by_voice[v].append(n)
+
+        for v in by_voice:
+            v_notes = by_voice[v]
+            # Assumed sorted by start_sec
+
+            for i, n in enumerate(v_notes):
+                prev_end = v_notes[i-1].end_sec if i > 0 else 0.0
+
+                # Desired new start
+                new_start = max(0.0, float(n.start_sec) - backtrack_sec)
+
+                # Strict clamp: No overlap with previous note in same voice
+                new_start = max(new_start, prev_end)
+
+                # Safety clamp: Ensure min duration remains
+                # If backtracking eats into end, we must stop before end - min_dur
+                max_start_limit = max(new_start, float(n.end_sec) - min_dur_s)
+                # Ideally we don't move start later than it was, only earlier.
+                # But here we are checking if new_start is valid w.r.t end.
+                if new_start < max_start_limit:
+                    n.start_sec = float(new_start)
 
     # Populate diagnostics
     if hasattr(analysis_data, "diagnostics"):

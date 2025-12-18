@@ -128,10 +128,14 @@ def quantize_and_render(
     part_bass.append(tempo_bass)
 
     # Key (if detected)
-    if analysis_data.meta.detected_key:
+    # Patch OPT7: Forced key override
+    forced = getattr(d_conf, "forced_key", None)
+    key_sig_str = forced or getattr(analysis_data.meta, "forced_key", None) or analysis_data.meta.detected_key
+
+    if key_sig_str:
         try:
-            key_treble = key.Key(analysis_data.meta.detected_key)
-            key_bass = key.Key(analysis_data.meta.detected_key)
+            key_treble = key.Key(key_sig_str)
+            key_bass = key.Key(key_sig_str)
             part_treble.append(key_treble)
             part_bass.append(key_bass)
         except Exception:

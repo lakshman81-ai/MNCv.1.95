@@ -56,7 +56,11 @@ class StageAConfig:
 
     # BPM / beat grid detection
     bpm_detection: Dict[str, Any] = field(
-        default_factory=lambda: {"enabled": True}
+        default_factory=lambda: {
+            "enabled": True,
+            "min_bpm": 55.0,
+            "max_bpm": 215.0,
+        }
     )
 
 
@@ -68,6 +72,9 @@ class StageAConfig:
 class StageBConfig:
     # Instrument selection (for Stage B tuning)
     instrument: str = "piano_61key"
+
+    # Active stems whitelist (None = all)
+    active_stems: Optional[List[str]] = None  # e.g. ["bass", "vocals"]
     # Flag to enable instrument-specific profile overrides in Stage B
     apply_instrument_profile: bool = True
 
@@ -303,6 +310,9 @@ class StageCConfig:
 
 @dataclass
 class StageDConfig:
+    # Forced key signature (overrides detection)
+    forced_key: Optional[str] = None
+
     # MusicXML divisions per quarter note (24 = 1/24 quarter)
     divisions_per_quarter: int = 24
 
@@ -377,6 +387,7 @@ class InstrumentProfile:
 
 @dataclass
 class PipelineConfig:
+    device: str = "cpu"  # "cpu" | "cuda" | "mps"
     stage_a: StageAConfig = field(default_factory=StageAConfig)
     stage_b: StageBConfig = field(default_factory=StageBConfig)
     stage_c: StageCConfig = field(default_factory=StageCConfig)
@@ -462,7 +473,21 @@ _profiles: List[InstrumentProfile] = [
         fmin=30.0,
         fmax=400.0,
         special={
+            "yin_frame_length": 8192,
+            # Backwards compat alias (optional but safe)
             "frame_length": 8192,
+        },
+    ),
+
+    # 5-String Bass - Lower range + backtracking
+    InstrumentProfile(
+        instrument="bass_5string",
+        recommended_algo="yin",
+        fmin=30.0,
+        fmax=400.0,
+        special={
+            "yin_frame_length": 8192,
+            "stage_c_backtrack_ms": 100.0,
         },
     ),
 
@@ -507,6 +532,8 @@ _profiles: List[InstrumentProfile] = [
         fmin=80.0,
         fmax=1200.0,
         special={
+            "yin_conf_threshold": 0.05,
+            # Backwards compat
             "threshold": 0.05,
         },
     ),
@@ -522,8 +549,6 @@ _profiles: List[InstrumentProfile] = [
             "pre_lpf_hz": 1000.0,
             # Report: raise YIN trough threshold for rough/distorted waveforms
             "yin_trough_threshold": 0.20,
-            # Optional: relax confidence gating a bit if you find dropouts
-            "yin_conf_threshold": 0.05,
             # Report: Transient Lockout
             "transient_lockout_ms": 10.0,
             "viterbi": False,
