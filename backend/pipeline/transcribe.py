@@ -27,7 +27,7 @@ import math
 from typing import Optional
 
 from .config import PIANO_61KEY_CONFIG, PipelineConfig
-from .stage_a import load_and_preprocess
+from .stage_a import load_and_preprocess, detect_tempo_and_beats
 from .stage_b import extract_features
 from .stage_c import apply_theory
 from .stage_d import quantize_and_render
@@ -524,6 +524,62 @@ def transcribe(
         audio_path,
         config=config,
     )
+
+    # --------------------------------------------------------
+    # BPM Fallback (Gated Safety Net)
+    # --------------------------------------------------------
+    # Runs only if beat detection was enabled but failed to produce beats in Stage A
+    # AND audio is long enough to warrant reliable detection.
+    bpm_cfg = getattr(config.stage_a, "bpm_detection", {}) or {}
+    bpm_enabled = bool(bpm_cfg.get("enabled", True))
+    meta = stage_a_out.meta
+
+    # Check conditions: Enabled AND (No beats or Default+NoBeats) AND Duration >= 6.0
+    # Also verify existing beats are empty (do not overwrite)
+    needs_fallback = (
+        bpm_enabled
+        and (len(meta.beats) == 0)
+        and (meta.tempo_bpm is None or meta.tempo_bpm <= 0 or (meta.tempo_bpm == 120.0 and len(meta.beats) == 0))
+        and (meta.duration_sec >= 6.0)
+    )
+
+    if needs_fallback:
+        try:
+            # Lazy import librosa check
+            import importlib.util
+            if importlib.util.find_spec("librosa"):
+                pipeline_logger.log_event("stage_a", "bpm_fallback_triggered", {"reason": "missing_beats"})
+
+                # Run fallback detection
+                # We need the audio from the mix stem
+                mix_stem = stage_a_out.stems.get("mix")
+                if mix_stem:
+                    fb_bpm, fb_beats = detect_tempo_and_beats(
+                        mix_stem.audio,
+                        sr=mix_stem.sr,
+                        enabled=True,
+                        tightness=float(bpm_cfg.get("tightness", 100.0)),
+                        trim=bool(bpm_cfg.get("trim", True)),
+                        hop_length=meta.hop_length,
+                        pipeline_logger=pipeline_logger,
+                    )
+
+                    if fb_beats:
+                        fb_beats = sorted(list(set(fb_beats)))
+                        # Update in-place
+                        meta.beats = fb_beats
+                        meta.beat_times = fb_beats # Alias
+                        if fb_bpm and fb_bpm > 0:
+                            meta.tempo_bpm = fb_bpm
+
+                        pipeline_logger.log_event("stage_a", "bpm_fallback_success", {
+                            "bpm": fb_bpm,
+                            "n_beats": len(fb_beats)
+                        })
+                    else:
+                        pipeline_logger.log_event("stage_a", "bpm_fallback_no_result")
+        except Exception as e:
+            pipeline_logger.log_event("stage_a", "bpm_fallback_failed", {"error": str(e)})
 
     if len(stage_a_out.stems) == 1 and "mix" in stage_a_out.stems:
         pipeline_logger.log_event(

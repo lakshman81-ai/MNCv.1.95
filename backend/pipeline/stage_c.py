@@ -111,6 +111,111 @@ def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float
     return False
 
 
+def _decompose_polyphonic_timeline(
+    timeline: List[FramePitch],
+    pitch_tolerance_cents: float = 50.0,
+    max_tracks: int = 5
+) -> List[List[FramePitch]]:
+    """
+    Split a polyphonic timeline (with active_pitches) into multiple monophonic timelines (voice tracks).
+    Uses simple greedy tracking based on pitch proximity.
+    """
+    if not timeline:
+        return []
+
+    # Tracks: list of list of FramePitch
+    tracks: List[List[FramePitch]] = []
+    # Current pitch of each track to match against (0.0 if inactive/silence)
+    track_heads: List[float] = []
+
+    # Initialize tracks
+    for _ in range(max_tracks):
+        tracks.append([])
+        track_heads.append(0.0)
+
+    for fp in timeline:
+        # Get active pitches for this frame
+        candidates: List[Tuple[float, float]] = []
+        if getattr(fp, "active_pitches", None):
+            # Sort by confidence desc
+            candidates = sorted(
+                [(p, c) for (p, c) in fp.active_pitches if p > 0.0],
+                key=lambda x: x[1],
+                reverse=True
+            )
+        elif fp.pitch_hz > 0.0:
+            candidates = [(fp.pitch_hz, fp.confidence)]
+
+        # If no candidates, append silent frames to all tracks and reset heads
+        if not candidates:
+            for i in range(max_tracks):
+                tracks[i].append(FramePitch(
+                    time=fp.time,
+                    pitch_hz=0.0,
+                    midi=None,
+                    confidence=0.0,
+                    rms=fp.rms
+                ))
+                track_heads[i] = 0.0
+            continue
+
+        # Greedy matching
+        assigned_tracks = set()
+        current_heads = list(track_heads)
+
+        # Assign each candidate
+        for p_hz, conf in candidates:
+            best_idx = -1
+            best_dist = float('inf')
+
+            # 1. Try to match to an active track
+            for i in range(max_tracks):
+                if i in assigned_tracks:
+                    continue
+
+                head = current_heads[i]
+                if head > 0.0:
+                    dist = _cents_diff_hz(p_hz, head)
+                    if dist <= pitch_tolerance_cents and dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+
+            # 2. If no match to active track, find an empty track
+            if best_idx == -1:
+                for i in range(max_tracks):
+                    if i in assigned_tracks:
+                        continue
+                    if current_heads[i] <= 0.0: # Inactive
+                        best_idx = i
+                        break
+
+            # 3. Assign
+            if best_idx != -1:
+                tracks[best_idx].append(FramePitch(
+                    time=fp.time,
+                    pitch_hz=p_hz,
+                    midi=int(round(69 + 12 * np.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                    confidence=conf,
+                    rms=fp.rms
+                ))
+                track_heads[best_idx] = p_hz
+                assigned_tracks.add(best_idx)
+
+        # Fill unassigned tracks with silence
+        for i in range(max_tracks):
+            if i not in assigned_tracks:
+                tracks[i].append(FramePitch(
+                    time=fp.time,
+                    pitch_hz=0.0,
+                    midi=None,
+                    confidence=0.0,
+                    rms=fp.rms
+                ))
+                track_heads[i] = 0.0
+
+    return tracks
+
+
 def _segment_monophonic(
     timeline: List[FramePitch],
     conf_thr: float,
@@ -125,7 +230,7 @@ def _segment_monophonic(
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
-    Updated for C1 (hysteresis) and C2 (gap merge/vibrato).
+    Updated for C1 (hysteresis), C2 (gap merge/vibrato), and robustness/glitch tolerance.
     """
     if len(timeline) < 2:
         return []
@@ -161,6 +266,10 @@ def _segment_monophonic(
     pitch_buffer: List[float] = []
     pitch_buffer_size = 7
 
+    # Glitch tolerance
+    glitch_counter = 0
+    MAX_GLITCH_FRAMES = 2
+
     # P2: Apply confidence hysteresis
     c_start = conf_start if conf_start is not None else conf_thr
     c_end = conf_end if conf_end is not None else conf_thr
@@ -173,6 +282,26 @@ def _segment_monophonic(
              is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_end)
 
         if is_voiced_frame:
+            # Check for glitch if active
+            is_glitch = False
+            if active:
+                diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
+                if diff > split_cents:
+                     is_glitch = True
+
+            if is_glitch:
+                if glitch_counter < MAX_GLITCH_FRAMES:
+                    # Absorb glitch: extend current note logically but don't update pitch ref
+                    # Treat as part of note
+                    current_end = i
+                    glitch_counter += 1
+                    continue
+                else:
+                    # Confirmed split, proceed to standard logic to handle it
+                    glitch_counter = 0
+            else:
+                glitch_counter = 0
+
             silent = 0
             if not active:
                 stable += 1
@@ -188,7 +317,7 @@ def _segment_monophonic(
                 if diff <= split_cents:
                     # Extend note
                     current_end = i
-                    # P5: Update pitch reference to track drift/vibrato
+                    # P5: Update pitch reference to track drift/vibrato (median of last N good frames)
                     pitch_buffer.append(fp.pitch_hz)
                     if len(pitch_buffer) > pitch_buffer_size:
                         pitch_buffer.pop(0)
@@ -246,7 +375,7 @@ def _segment_monophonic(
                 curr_e = next_e
                 # Keep curr_p stable
             else:
-                # P3: Enforce min_note_duration_in_threshold_mode
+                # P3: Enforce min_note_duration
                 dur = (curr_e - curr_s + 1) * hop_s
                 if dur >= min_note_dur_s:
                     merged_segs.append((curr_s, curr_e))
@@ -420,12 +549,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     elif "vocals" in stem_timelines:
         stem_name = "vocals"
     else:
-        stem_name = next(iter(stem_timelines.keys()))
+        # Deterministic fallback for primary stem
+        stem_name = sorted(stem_timelines.keys())[0]
 
     primary_timeline = stem_timelines.get(stem_name, [])
-    if len(primary_timeline) < 2:
-        analysis_data.notes = []
-        return []
+    # Removed strict length check here to allow robust fallback handling loop below
 
     # Thresholds (read from config if available)
     base_conf = float(resolve_val("confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
@@ -462,11 +590,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]
     audio_type = getattr(analysis_data.meta, "audio_type", None)
     allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
+
     if allow_secondary and len(stem_timelines) > 1:
-        for other_name, other_timeline in stem_timelines.items():
-            if other_name == stem_name or len(other_timeline) < 2:
-                continue
-            timelines_to_process.append((other_name, other_timeline))
+        # Add others in deterministic order
+        other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
+        for other_name in other_keys:
+             timelines_to_process.append((other_name, stem_timelines[other_name]))
 
     notes: List[NoteEvent] = []
 
@@ -484,16 +613,43 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     energy_weight = float(seg_cfg.get("energy_weight", 0.35))
     conf_weight = max(0.0, min(1.0, 1.0 - energy_weight))
 
+    # Polyphony config
+    poly_filter_mode = _get(config, "stage_c.polyphony_filter.mode", "skyline_top_voice")
+    max_alt_voices = int(_get(config, "stage_b.voice_tracking.max_alt_voices", 4))
+    max_tracks = 1 + max_alt_voices
+    poly_pitch_tolerance = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
+
     for vidx, (vname, timeline) in enumerate(timelines_to_process):
+        if not timeline or len(timeline) < 2:
+            continue
+
         # Detect polyphonic context based on active pitch annotations
         poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
-        has_distinct_poly = _has_distinct_poly_layers(timeline)
 
+        # Should we enable polyphonic segmentation?
+        # Gate: config != "skyline_top_voice" (implied "process_all") or just presence of poly_frames?
+        # WI implies we should use active_pitches if present, unless explicitly disabled?
+        # WI says: "Detect polyphony... OR config signal"
+        enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
+
+        # Decompose into tracks if polyphony active
+        voice_timelines = []
+        if enable_polyphony:
+             voice_timelines = _decompose_polyphonic_timeline(
+                 timeline,
+                 pitch_tolerance_cents=poly_pitch_tolerance,
+                 max_tracks=max_tracks
+             )
+        else:
+             voice_timelines = [timeline]
+
+        # Determine thresholds
         voice_conf_gate = conf_thr
         voice_min_dur_s = min_note_dur_s
+        has_distinct_poly = _has_distinct_poly_layers(timeline)
 
-        if poly_frames:
-            # PC7 (Part 1): Update assignment tolerances indirectly by using correct gates
+        # Tune thresholds for context
+        if poly_frames or enable_polyphony:
             voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
             try:
                 if min_note_dur_ms_poly is not None:
@@ -503,92 +659,97 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
             if vidx > 0 and not has_distinct_poly:
                 voice_conf_gate = max(voice_conf_gate, accomp_conf)
-                try:
-                    if min_note_dur_ms_poly is not None:
-                        voice_min_dur_s = max(voice_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
-                except Exception:
-                    pass
         elif vidx > 0:
             voice_conf_gate = max(voice_conf_gate, accomp_conf)
 
         hop_s = _estimate_hop_seconds(timeline)
 
-        use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
-        if use_viterbi:
-            mask = _viterbi_voicing_mask(
-                timeline,
-                conf_weight=conf_weight,
-                energy_weight=energy_weight,
-                transition_penalty=transition_penalty,
-                stay_bonus=stay_bonus,
-                silence_bias=silence_bias,
-            )
-            segs = _segments_from_mask(
-                timeline=timeline,
-                mask=mask,
-                hop_s=hop_s,
-                min_note_dur_s=voice_min_dur_s,
-                min_conf=voice_conf_gate,
-                min_rms=min_rms,
-            )
-        else:
-            segs = _segment_monophonic(
-                timeline=timeline,
-                conf_thr=voice_conf_gate,
-                min_note_dur_s=voice_min_dur_s,
-                gap_tolerance_s=gap_tolerance_s,
-                min_rms=min_rms,
-                conf_start=max(start_conf, voice_conf_gate),
-                conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
-                seg_cfg=seg_cfg,
-                hop_s=hop_s,
-            )
+        # Process each decomposed voice track
+        for sub_idx, sub_tl in enumerate(voice_timelines):
+             # Skip empty tracks
+             if not any(fp.pitch_hz > 0 for fp in sub_tl):
+                 continue
 
-        for (s, e) in segs:
-            mids = [timeline[i].midi for i in range(s, e + 1) if timeline[i].midi is not None and timeline[i].midi > 0]
-            hzs = [timeline[i].pitch_hz for i in range(s, e + 1) if timeline[i].pitch_hz > 0]
-            confs = [timeline[i].confidence for i in range(s, e + 1)]
-            rmss = [timeline[i].rms for i in range(s, e + 1)]
+             use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+             segs = []
 
-            if not mids:
-                continue
+             if use_viterbi:
+                 mask = _viterbi_voicing_mask(
+                     sub_tl,
+                     conf_weight=conf_weight,
+                     energy_weight=energy_weight,
+                     transition_penalty=transition_penalty,
+                     stay_bonus=stay_bonus,
+                     silence_bias=silence_bias,
+                 )
+                 segs = _segments_from_mask(
+                     timeline=sub_tl,
+                     mask=mask,
+                     hop_s=hop_s,
+                     min_note_dur_s=voice_min_dur_s,
+                     min_conf=voice_conf_gate,
+                     min_rms=min_rms,
+                 )
+             else:
+                 segs = _segment_monophonic(
+                     timeline=sub_tl,
+                     conf_thr=voice_conf_gate,
+                     min_note_dur_s=voice_min_dur_s,
+                     gap_tolerance_s=gap_tolerance_s,
+                     min_rms=min_rms,
+                     conf_start=max(start_conf, voice_conf_gate),
+                     conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+                     seg_cfg=seg_cfg,
+                     hop_s=hop_s,
+                 )
 
-            # Enforce RMS gate (important for noise floor handling)
-            if rmss and np.mean(rmss) < min_rms:
-                continue
+             for (s, e) in segs:
+                 # Extract data from sub_tl
+                 mids = [sub_tl[i].midi for i in range(s, e + 1) if sub_tl[i].midi is not None and sub_tl[i].midi > 0]
+                 hzs = [sub_tl[i].pitch_hz for i in range(s, e + 1) if sub_tl[i].pitch_hz > 0]
+                 confs = [sub_tl[i].confidence for i in range(s, e + 1)]
+                 rmss = [sub_tl[i].rms for i in range(s, e + 1)]
 
-            midi_note = int(round(float(np.median(mids))))
-            pitch_hz = float(np.median(hzs)) if hzs else 0.0
-            confidence = float(np.mean(confs)) if confs else 0.0
+                 if not mids:
+                     continue
 
-            # P6: Velocity semantics + RMS value
-            midi_vel = _velocity_from_rms(rmss)
-            velocity_norm = float(midi_vel) / 127.0
-            rms_val = float(np.mean(rmss)) if rmss else 0.0
+                 if rmss and np.mean(rmss) < min_rms:
+                     continue
 
-            dynamic_label = _velocity_to_dynamic(midi_vel)
+                 midi_note = int(round(float(np.median(mids))))
+                 pitch_hz = float(np.median(hzs)) if hzs else 0.0
+                 confidence = float(np.mean(confs)) if confs else 0.0
 
-            start_sec = float(timeline[s].time)
-            end_sec = float(timeline[e].time + hop_s)
-            if end_sec <= start_sec:
-                end_sec = start_sec + hop_s
+                 midi_vel = _velocity_from_rms(rmss)
+                 velocity_norm = float(midi_vel) / 127.0
+                 rms_val = float(np.mean(rmss)) if rmss else 0.0
+                 dynamic_label = _velocity_to_dynamic(midi_vel)
 
-            notes.append(
-                NoteEvent(
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    midi_note=midi_note,
-                    pitch_hz=pitch_hz,
-                    confidence=confidence,
-                    velocity=velocity_norm, # Normalized 0..1
-                    rms_value=rms_val,
-                    dynamic=dynamic_label,
-                    voice=int(vidx + 1),
-                )
-            )
+                 start_sec = float(sub_tl[s].time)
+                 end_sec = float(sub_tl[e].time + hop_s)
+                 if end_sec <= start_sec:
+                     end_sec = start_sec + hop_s
+
+                 # Stable Voice ID
+                 # vidx = stem index
+                 # sub_idx = local voice index (0..4)
+                 voice_id = (vidx * 16) + (sub_idx + 1)
+
+                 notes.append(
+                     NoteEvent(
+                         start_sec=start_sec,
+                         end_sec=end_sec,
+                         midi_note=midi_note,
+                         pitch_hz=pitch_hz,
+                         confidence=confidence,
+                         velocity=velocity_norm,
+                         rms_value=rms_val,
+                         dynamic=dynamic_label,
+                         voice=voice_id,
+                     )
+                 )
 
     # Patch F8: Optional Bass Backtracking
-    # Improves timing of bass notes which often have slow attacks or pre-transient noise.
     bass_backtrack_ms = float(profile_special.get("bass_backtrack_ms", 0.0))
     if bass_backtrack_ms > 0.0 and notes:
         backtrack_sec = bass_backtrack_ms / 1000.0
