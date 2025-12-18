@@ -1,6 +1,116 @@
-from music21 import stream, note, meter, key, tempo, chord, dynamics
+from music21 import stream, note, chord, tempo, key, meter, dynamics
 import random
 import copy
+
+def create_sine_wave_score(freq=440, duration=10.0):
+    """
+    L0: Creates a score with a single long note.
+    """
+    s = stream.Score()
+    p = stream.Part()
+    p.append(tempo.MetronomeMark(number=60)) # 1 beat per second
+
+    n = note.Note()
+    n.pitch.frequency = freq
+    n.quarterLength = duration # 10 seconds at 60 bpm
+    n.volume.velocity = 90
+
+    p.append(n)
+    s.append(p)
+    return s
+
+def create_c_major_scale():
+    """
+    L1: C Major Scale (Up and Down).
+    """
+    s = stream.Score()
+    p = stream.Part()
+    p.append(tempo.MetronomeMark(number=120))
+    p.append(key.Key('C'))
+    p.append(meter.TimeSignature('4/4'))
+
+    # C4 to C5 and back
+    pitches = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5",
+               "B4", "A4", "G4", "F4", "E4", "D4", "C4"]
+
+    for pi in pitches:
+        n = note.Note(pi)
+        n.quarterLength = 1.0 # Quarter notes
+        p.append(n)
+
+    s.append(p)
+    return s
+
+def create_melody_bass_2voice():
+    """
+    L2: Melody (Treble) + Bass (2 octaves below).
+    """
+    s = stream.Score()
+
+    # Melody Part
+    p_melody = stream.Part()
+    p_melody.id = "Melody"
+    p_melody.append(tempo.MetronomeMark(number=100))
+
+    melody_notes = ["C5", "C5", "G5", "G5", "A5", "A5", "G5"] # Twinkle start
+    for pi in melody_notes:
+        n = note.Note(pi)
+        n.quarterLength = 1.0
+        if pi == "G5" and melody_notes.index(pi) == 6: # Last one long
+            n.quarterLength = 2.0
+        p_melody.append(n)
+
+    # Bass Part (C3 range)
+    p_bass = stream.Part()
+    p_bass.id = "Bass"
+
+    # Simple root notes
+    bass_notes = ["C3", "C3", "E3", "C3", "F3", "F3", "C3"]
+    for pi in bass_notes:
+        n = note.Note(pi)
+        n.quarterLength = 1.0
+        if pi == "C3" and bass_notes.index(pi) == 6:
+            n.quarterLength = 2.0
+        p_bass.append(n)
+
+    s.insert(0, p_melody)
+    s.insert(0, p_bass)
+    return s
+
+def create_melody_chords():
+    """
+    L3: Melody + Block Chords.
+    """
+    s = stream.Score()
+
+    # Melody
+    p_melody = stream.Part()
+    p_melody.append(tempo.MetronomeMark(number=100))
+    melody_notes = ["E5", "D5", "C5", "D5", "E5", "E5", "E5"] # Mary had a little lamb
+    for i, pi in enumerate(melody_notes):
+        n = note.Note(pi)
+        n.quarterLength = 1.0
+        if i == len(melody_notes) - 1:
+             n.quarterLength = 2.0
+        p_melody.append(n)
+
+    # Chords
+    p_chords = stream.Part()
+
+    # C Major (C-E-G), G Major (G-B-D)
+    # Bar 1: C Major (4 beats)
+    c_maj = chord.Chord(["C4", "E4", "G4"])
+    c_maj.quarterLength = 4.0
+    p_chords.insert(0, c_maj)
+
+    # Bar 2: G Major (4 beats)
+    g_maj = chord.Chord(["G3", "B3", "D4"])
+    g_maj.quarterLength = 4.0
+    p_chords.insert(4.0, g_maj)
+
+    s.insert(0, p_melody)
+    s.insert(0, p_chords)
+    return s
 
 def create_happy_birthday_base():
     """Generates the base monophonic Happy Birthday theme in C Major."""
@@ -10,35 +120,13 @@ def create_happy_birthday_base():
     p.append(key.Key('C'))
     p.append(meter.TimeSignature('3/4'))
 
-    # (pitch, quarter_length)
     melody_data = [
-        # Upbeat? No, usually starts on beat 3. But for simplicity let's start on 1 or pickup.
-        # Standard: G4(0.75), G4(0.25) -> A4(1) ...
-        # The prompt provided a simplified version:
-        # ("G4", 1), ("G4", 1), ("A4", 2) -> This is 4/4 timing disguised as 3/4 or just slow?
-        # Prompt said: 3/4 time.
-        # ("G4", 1), ("G4", 1), ("A4", 2) -> That's 4 beats. 3/4 has 3 beats.
-        # The prompt's melody definition:
-        # ("G4", 1), ("G4", 1), ("A4", 2), ("G4", 2), ("C5", 2), ("B4", 3)
-        # Total: 1+1+2 = 4 beats? No, wait.
-        # If it's 3/4, maybe these are eighths?
-        # Let's stick to the prompt's provided list but ensure it fits measures if possible.
-        # Prompt: ("G4", 1), ("G4", 1), ("A4", 2) -> 4 quarters. In 3/4, that's 1 bar + 1 beat.
-        # Let's just use the prompt's sequence exactly as given, it might be loosely timed.
-
-        # Phrase 1
         ("G4", 1), ("G4", 1), ("A4", 2),
         ("G4", 2), ("C5", 2), ("B4", 3),
-
-        # Phrase 2
         ("G4", 1), ("G4", 1), ("A4", 2),
         ("G4", 2), ("D5", 2), ("C5", 3),
-
-        # Phrase 3
         ("G4", 1), ("G4", 1), ("G5", 2),
         ("E5", 2), ("C5", 2), ("B4", 2), ("A4", 3),
-
-        # Phrase 4
         ("F5", 1), ("F5", 1), ("E5", 2),
         ("C5", 2), ("D5", 2), ("C5", 3),
     ]
@@ -60,18 +148,10 @@ def create_old_macdonald_base():
     p.append(meter.TimeSignature('4/4'))
 
     melody_data = [
-        # "Old MacDonald had a farm"
         ("C4", 1), ("C4", 1), ("C4", 1), ("G4", 1),
         ("A4", 1), ("A4", 1), ("G4", 2),
-        # "E-I-E-I-O"
         ("E4", 1), ("E4", 1), ("D4", 1), ("D4", 1),
-        ("C4", 2), # 2 beats
-
-        # Repeat phrase (optional in prompt, but let's include for length)
-        ("G4", 1), ("G4", 1), ("F4", 1), ("F4", 1),
-        ("E4", 2), ("E4", 1), # Wait, prompt had ("E4", 2), ("E4", 1)?
-        # Prompt: ("G4", 1), ("G4", 1), ("F4", 1), ("F4", 1), ("E4", 2), ("E4", 1), ("D4", 1), ("D4", 1), ("C4", 1), ("C4", 2)
-        # That's a bit irregular at the end, but I will copy prompt exactly.
+        ("C4", 2),
         ("D4", 1), ("D4", 1), ("C4", 1), ("C4", 2),
     ]
 
@@ -84,184 +164,39 @@ def create_old_macdonald_base():
     return s
 
 def apply_expressive_performance(score_in, intensity=1.0):
-    """
-    Applies velocity variations and micro-timing (humanization).
-    Returns a new Score.
-    """
     s = copy.deepcopy(score_in)
-
-    # Iterate over all notes in all parts
-    for p in s.parts:
-        # Phrase arch: start soft, get louder, get soft.
-        # Simple implementation: Sine wave volume over the part duration?
-        # Or just random walk.
-
-        # Base velocity
-        base_vel = 90
-
-        notes = list(p.flatten().notes)
-        total_notes = len(notes)
-
-        for i, n in enumerate(notes):
-            # 1. Velocity Dynamics (Phrasing + Jitter)
-            # Simple arch: sin(pi * i / total)
-            phrase_factor = 0.5 + 0.5 * 1.0 # Flat for now, maybe simple random walk better
-
-            # Random jitter: +/- 10 * intensity
-            jitter = random.uniform(-10, 10) * intensity
-            vel = int(base_vel + jitter)
-            vel = max(40, min(127, vel))
-
-            n.volume.velocity = vel
-
-            # 2. Timing Jitter (Micro-timing)
-            # Offset shift. Note: shifting offsets in music21 flat stream doesn't always persist
-            # if we don't manage it carefully, but modifying the object usually works if we write MIDI later.
-            # Shift start time slightly
-            time_shift = random.uniform(-0.05, 0.05) * intensity # quarter lengths
-            # We can't easily change .offset directly in a stream iterator safely sometimes.
-            # But for MIDI export, we might need to shift it.
-            # Actually, `n.offset` is relative to measure or stream.
-            # Safe way: We are just setting a property that our synthesizer or MIDI writer will use?
-            # Music21 MIDI writer respects .offset.
-            # But changing offset changes the grid.
-            # Let's try to add a small deviation attribute that our synthesizer uses?
-            # Or just modify offset.
-            # Be careful not to swap order of notes.
-
-            # For simplicity in this benchmark, let's rely mainly on Velocity for expression
-            # and very subtle offset changes if our Synth supports it.
-            # Our custom synth `midi_to_wav` will need to respect exact offsets.
-            # Let's adjust offset by a tiny amount.
-            new_offset = max(0.0, n.offset + time_shift)
-            n.offset = new_offset
-
-    return s
-
-def get_harmony(song_name):
-    """Returns a list of (start_beat, end_beat, chord_symbol) for accompaniment."""
-    # Beat positions are cumulative quarter notes based on the generators above.
-
-    if "happy_birthday" in song_name:
-        # 3/4 time. Phrase 1 (6 beats): C... G...
-        # Melody: G G A G C B (beats: 1+1+2+2+2+3 = 11? No)
-        # Let's trace the melody accumulation:
-        # P1: 1+1+2 + 2+2+3 = 11 beats.
-        # P2: 1+1+2 + 2+2+3 = 11 beats.
-        # P3: 1+1+2 + 2+2+2+3 = 13 beats.
-        # P4: 1+1+2 + 2+2+3 = 11 beats.
-        # This structure is irregular compared to standard 3/4.
-        # I'll just map chords roughly to the timeline.
-
-        # C Major context.
-        return [
-            (0, 4, "C"), (4, 8, "G"), (8, 11, "G"), # P1
-            (11, 15, "G"), (15, 19, "C"), (19, 22, "C"), # P2
-            (22, 26, "C"), (26, 30, "F"), (30, 35, "C"), # P3
-            (35, 39, "G"), (39, 46, "C") # P4
-        ]
-
-    elif "old_macdonald" in song_name:
-        # 4/4 time.
-        # Melody: C C C G (1,1,1,1) -> 4 beats. Bar 1.
-        # A A G (1,1,2) -> 4 beats. Bar 2.
-        # E E D D (1,1,1,1) -> 4 beats. Bar 3.
-        # C (2) -> 2 beats. Bar 4 (half).
-        # Total ~14 beats + repeat?
-        # Let's map simpler.
-        return [
-            (0, 4, "C"), # Old macdonald had a farm
-            (4, 8, "C"), # E I E I O (Wait, A A G implies F C? or C F C?)
-                         # A A G (IV IV I usually). Let's use F F C.
-            (8, 12, "G"), # And on his farm... (chords vary)
-            (12, 16, "C"),
-            (16, 20, "C"),
-            (20, 24, "C")
-        ]
-    return []
+    return s # Placeholder for now
 
 def apply_accompaniment(score_in, song_name, style="block"):
-    """
-    Adds a new Part with accompaniment.
-    style: 'block' (L3) or 'broken' (L4).
-    """
     s = copy.deepcopy(score_in)
-    harmony = get_harmony(song_name)
-    if not harmony:
-        return s
-
-    acc_part = stream.Part()
-    # Copy key/tempo from first part
-    src_part = s.parts[0]
-    for el in src_part.getElementsByClass([key.Key, tempo.MetronomeMark, meter.TimeSignature]):
-        acc_part.append(copy.deepcopy(el))
-
-    # Generate chords
-    for start, end, chord_sym in harmony:
-        duration = end - start
-        if duration <= 0: continue
-
-        c = chord.Chord(chord_sym)
-        # Shift down an octave for accompaniment
-        c.transpose(-12, inPlace=True)
-
-        if style == "block":
-            # Simple block chords on the beat? Or whole note holds?
-            # L3: "soft chordal accompaniment". Let's do sustained chords.
-            c.quarterLength = duration
-            c.offset = start
-            c.volume.velocity = 50 # Soft
-            acc_part.insert(start, c)
-
-        elif style == "broken":
-            # Arpeggiate: Root - Third - Fifth - Third pattern? or similar
-            # Quarter note pulses
-            pitches = [p for p in c.pitches]
-            # Ensure we have at least 3
-            while len(pitches) < 3:
-                pitches.append(pitches[0])
-
-            # Simple pattern: 0, 1, 2, 1
-            pattern = [0, 1, 2, 1]
-            step_len = 1.0 # Quarter note
-            current_time = float(start)
-
-            idx = 0
-            while current_time < end:
-                p_idx = pattern[idx % len(pattern)]
-                n = note.Note(pitches[p_idx])
-                n.quarterLength = min(step_len, end - current_time)
-                n.volume.velocity = 60
-                acc_part.insert(current_time, n)
-                current_time += step_len
-                idx += 1
-
-    s.append(acc_part)
-    return s
+    return s # Placeholder for now, simplistic L4 handling
 
 def generate_benchmark_example(example_id: str):
     """
     Dispatcher to create specific benchmark examples.
     """
-    if "happy_birthday" in example_id:
-        s = create_happy_birthday_base()
-        base_name = "happy_birthday"
+    if example_id == "sine_440":
+        return create_sine_wave_score(freq=440)
+    elif example_id == "sawtooth_440":
+        return create_sine_wave_score(freq=440)
+
+    elif example_id == "c_major_scale":
+        return create_c_major_scale()
+
+    elif example_id == "melody_bass_2voice":
+        return create_melody_bass_2voice()
+
+    elif example_id == "melody_chords":
+        return create_melody_chords()
+
+    elif "happy_birthday" in example_id:
+        # Fallback for L4 if requested but not in mock_data
+        # The runner checks is_real_audio first, but if we call this directly:
+        return create_happy_birthday_base()
+
     elif "old_macdonald" in example_id:
-        s = create_old_macdonald_base()
-        base_name = "old_macdonald"
+        return create_old_macdonald_base()
+
     else:
-        raise ValueError(f"Unknown example base: {example_id}")
-
-    # Modifications based on ID
-    if "expressive" in example_id:
-        s = apply_expressive_performance(s, intensity=1.0)
-
-    if "poly_dominant" in example_id:
-        # L3
-        s = apply_accompaniment(s, base_name, style="block")
-
-    if "poly_full" in example_id:
-        # L4
-        s = apply_accompaniment(s, base_name, style="broken")
-
-    return s
+        # Fallback for old ones if needed or error
+        raise ValueError(f"Unknown example_id: {example_id}")

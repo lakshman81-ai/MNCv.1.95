@@ -1,30 +1,37 @@
 BENCHMARK_LEVELS = [
     {
-        "id": "L1_MONO_SIMPLE",
-        "description": "Single monophonic melody, fixed tempo, no accompaniment.",
-        "examples": ["happy_birthday", "old_macdonald"],
-        "polyphony": "monophonic",
-        "dominant_voice": "single",
+        "id": "L0_SIGNAL",
+        "name": "Signal Primitives",
+        "description": "10s of pure Sine/Sawtooth waves at fixed freq (e.g., 440Hz).",
+        "examples": ["sine_440", "sawtooth_440"],
+        "expected_metrics": {"stage_a_bpm_sane": False, "stage_b_fer": 0.05} # Example expectations
     },
     {
-        "id": "L2_MONO_EXPRESSIVE",
-        "description": "Monophonic melody with dynamics, small tempo variations, pedal-like sustain.",
-        "examples": ["happy_birthday_expressive"],
-        "polyphony": "monophonic",
-        "dominant_voice": "single",
+        "id": "L1_MONO",
+        "name": "Monophonic Scales",
+        "description": "Clean C Major scale, constant velocity, synthetic instrument.",
+        "examples": ["c_major_scale"],
+        "expected_metrics": {"stage_c_recall": 1.0}
     },
     {
-        "id": "L3_POLY_DOMINANT",
-        "description": "2-3 voices; 1 clearly louder dominant melody + soft chordal accompaniment.",
-        "examples": ["happy_birthday_poly_dominant"],
-        "polyphony": "polyphonic_dominant",
-        "dominant_voice": "melody_top",
+        "id": "L2_POLY_SIMPLE",
+        "name": "Simple Polyphony",
+        "description": "Melody + Bass (2 voices), distinct frequency ranges.",
+        "examples": ["melody_bass_2voice"],
+        "expected_metrics": {"stage_c_voice_assignment": 0.9}
     },
     {
-        "id": "L4_POLY_FULL",
-        "description": "Full polyphony: broken chords, inner voices, 3-5 notes at once.",
-        "examples": ["old_macdonald_poly_full"],
-        "polyphony": "polyphonic_full",
-        "dominant_voice": "none",
+        "id": "L3_HOMOPHONIC",
+        "name": "Homophonic Texture",
+        "description": "Melody + Chords (Block chords), synthetic piano.",
+        "examples": ["melody_chords"],
+        "expected_metrics": {"stage_c_chord_f1": 0.85}
+    },
+    {
+        "id": "L4_REAL",
+        "name": "Real World",
+        "description": "Happy Birthday / Old MacDonald (Real Instruments).",
+        "examples": ["happy_birthday_real", "old_macdonald_real"],
+        "is_real_audio": True # Marker to skip synthesis and look in mock_data
     }
 ]
