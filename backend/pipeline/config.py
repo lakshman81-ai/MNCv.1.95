@@ -68,6 +68,7 @@ class StageAConfig:
 class StageBConfig:
     # Instrument selection (for Stage B tuning)
     instrument: str = "piano_61key"
+    # Flag to enable instrument-specific profile overrides in Stage B
     apply_instrument_profile: bool = True
 
     # Source separation (HTDemucs)
