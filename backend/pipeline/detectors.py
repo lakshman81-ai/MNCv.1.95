@@ -473,11 +473,14 @@ class YinDetector(BasePitchDetector):
             if librosa is not None:
                 try:
                     # PB2: Support trough_threshold (Patch E1)
-                    # Pass trough_threshold only if explicitly requested, to be safe across librosa versions
-                    # that might not support it (though 0.8+ does).
+                    # Pass trough_threshold only if explicitly requested (or configured in profile),
+                    # to be safe across librosa versions that might not support it (though 0.8+ does).
                     extra_kwargs = {}
-                    if "trough_threshold" in self.kwargs:
-                         extra_kwargs["trough_threshold"] = float(self.kwargs["trough_threshold"])
+
+                    # Also check flat key in kwargs just in case it wasn't nested
+                    trough = self.kwargs.get("trough_threshold") or self.kwargs.get("yin_trough_threshold")
+                    if trough is not None:
+                         extra_kwargs["trough_threshold"] = float(trough)
 
                     try:
                         f0, _, voiced_prob = librosa.pyin(

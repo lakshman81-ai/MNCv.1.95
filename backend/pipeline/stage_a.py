@@ -468,6 +468,8 @@ def load_and_preprocess(
     bpm_enabled = bool(bpm_cfg.get("enabled", True))
     bpm_tightness = float(bpm_cfg.get("tightness", 100.0))
     bpm_trim = bool(bpm_cfg.get("trim", True))
+    min_bpm = float(bpm_cfg.get("min_bpm", 0.0) or 0.0)
+    max_bpm = float(bpm_cfg.get("max_bpm", 1e9) or 1e9)
 
     # Diagnostics for BPM
     bpm_diag = {"method": "librosa", "enabled": bpm_enabled, "run": False}
@@ -492,8 +494,17 @@ def load_and_preprocess(
         )
         if beat_times:
             beat_times = sorted(list(set(beat_times)))
+
+        # Patch OPT5: BPM Clamping / Octave Correction
+        if tempo_bpm and tempo_bpm > 0:
+            while tempo_bpm < min_bpm:
+                tempo_bpm *= 2.0
+            while tempo_bpm > max_bpm:
+                tempo_bpm *= 0.5
+
         bpm_diag["run"] = True
         bpm_diag["result"] = "success" if tempo_bpm else "no_tempo"
+        bpm_diag["clamped_bpm"] = tempo_bpm
     else:
         bpm_diag["run"] = False
         bpm_diag["reason"] = "disabled" if not bpm_enabled else "too_short"
@@ -545,7 +556,7 @@ def load_and_preprocess(
 
         # Instrument (Patch C1)
         # Attempt to set instrument if explicitly provided in kwargs or config, but don't force default.
-        instrument=str(kwargs.get("instrument") or "") or None,
+        instrument=str(kwargs.get("instrument") or getattr(config, "instrument", None) or "") or None,
 
         # Resolved values
         hop_length=hop_length,
