@@ -482,6 +482,10 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             if not mids:
                 continue
 
+            # Enforce RMS gate (important for noise floor handling)
+            if rmss and np.mean(rmss) < min_rms:
+                continue
+
             midi_note = int(round(float(np.median(mids))))
             pitch_hz = float(np.median(hzs)) if hzs else 0.0
             confidence = float(np.mean(confs)) if confs else 0.0
@@ -677,8 +681,19 @@ def quantize_notes(
             if qbe <= qbs:
                 qbe = qbs + max(int(min_steps), 1) * step_beats
 
+            # Convert back to seconds
             qs = _beat_index_to_sec(qbs, beat_times)
             qe = _beat_index_to_sec(qbe, beat_times)
+
+            # Clamp negative times from backward extrapolation
+            qs = max(0.0, qs)
+            qe = max(0.0, qe)
+
+            # Re-enforce duration in seconds after clamping
+            if qe <= qs:
+                # Fallback step sec estimation if needed, but we can try to respect grid
+                # Just bump qe
+                qe = qs + 0.05
 
             # For NoteEvent metrics
             beat_idx = qbs

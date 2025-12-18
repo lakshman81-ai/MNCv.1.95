@@ -142,12 +142,29 @@ def quantize_and_render(
 
     # Use beat grid if available
     beat_times = list(getattr(analysis_data, "beats", []) or [])
+    beat_source = "analysis_data.beats"
+
     if not beat_times:
         meta = getattr(analysis_data, "meta", None)
         if meta is not None:
             beat_times = list(getattr(meta, "beat_times", []) or getattr(meta, "beats", []) or [])
+            beat_source = "meta.beat_times"
+
+    # Sanitize beat grid
+    if beat_times:
+        # Filter Nones/NaNs and ensure floats
+        beat_times = [float(b) for b in beat_times if b is not None and np.isfinite(b)]
+        # Sort and unique
+        beat_times = sorted(list(set(beat_times)))
 
     use_beat_grid = len(beat_times) > 1
+
+    if pipeline_logger and use_beat_grid:
+        pipeline_logger.log_event("stage_d", "beat_grid_selected", payload={
+            "source": beat_source,
+            "count": len(beat_times),
+            "range": [beat_times[0], beat_times[-1]] if beat_times else []
+        })
 
     def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
         start_beats = 0.0

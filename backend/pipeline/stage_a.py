@@ -452,6 +452,23 @@ def load_and_preprocess(
         tightness=bpm_tightness,
         trim=bpm_trim
     )
+    if beat_times:
+        beat_times = sorted(list(set(beat_times)))
+
+    if pipeline_logger:
+        pipeline_logger.log_event("stage_a", "params_resolved", payload={
+            "bpm_detection": {
+                "enabled": bpm_enabled,
+                "tightness": bpm_tightness,
+                "trim": bpm_trim
+            },
+            "high_pass_filter": {
+                "enabled": hpf_enabled,
+                "cutoff_hz": hpf_cutoff,
+                "order": hpf_order,
+                "legacy_fallback_used": (not getattr(a_conf, "high_pass_filter", None)) and (legacy_cut is not None)
+            }
+        })
 
     # 6. Detect texture (mono / poly) and optionally run separation
     detected_type = detect_audio_type(audio, sr)

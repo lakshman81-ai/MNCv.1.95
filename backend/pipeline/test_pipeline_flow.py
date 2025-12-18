@@ -16,9 +16,17 @@ from backend.pipeline.transcribe import transcribe
 
 
 def create_sine_wave(freq: float = 440.0, duration: float = 1.0, sr: int = 44100):
-    """Simple pure tone generator for regression tests."""
-    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-    y = 0.5 * np.sin(2 * np.pi * freq * t)
+    """
+    Simple pure tone generator for regression tests.
+    Includes silence padding to ensure noise floor estimation doesn't treat the sine as noise.
+    """
+    t_active = np.linspace(0, duration, int(sr * duration), endpoint=False)
+    y_active = 0.5 * np.sin(2 * np.pi * freq * t_active)
+
+    # Pad with 0.5s silence on both sides
+    silence = np.zeros(int(sr * 0.5), dtype=np.float32)
+    y = np.concatenate([silence, y_active, silence])
+
     return y, sr
 
 
