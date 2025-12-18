@@ -83,6 +83,7 @@ def quantize_and_render(
 
     # D2: Divisions/measure integrity aligned to quantization grid
     # Compute divisions based on grid
+    # (P9: Ensure quantization respects grid resolution)
     grid_val = int(getattr(d_conf, "quantization_grid", 16))
     divisions_per_quarter = _lcm(4, grid_val)
     # Note: we don't explicitly force music21 divisions often, but we can try setting it on stream if needed.
