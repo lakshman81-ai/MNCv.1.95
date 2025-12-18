@@ -483,7 +483,7 @@ def load_and_preprocess(
     is_too_short = (len(audio) / sr) < 6.0 # explicit 6s gate per requirements
 
     if bpm_enabled and not is_too_short:
-        tempo_bpm, beat_times = _detect_tempo_and_beats(
+        tempo_bpm, beat_times = detect_tempo_and_beats(
             audio,
             sr=target_sr,
             enabled=True,
