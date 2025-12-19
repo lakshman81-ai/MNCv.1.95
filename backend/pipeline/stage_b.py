@@ -1092,7 +1092,15 @@ def extract_features(
         voicing_thr_global = float(b_conf.confidence_voicing_threshold)
 
         # Apply polyphonic relaxation (if any) to the GLOBAL gate only
-        poly_relax = float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0) or 0.0)
+        # GUARD: Only apply this relaxation if we are truly in a polyphonic mode (AudioType check).
+        # This prevents monophonic paths (L0/L1) from using over-relaxed gates which can leak noise.
+        is_true_poly = _is_polyphonic(getattr(stage_a_out, "audio_type", None))
+
+        if is_true_poly:
+            poly_relax = float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0) or 0.0)
+        else:
+            poly_relax = 0.0
+
         voicing_thr_effective = voicing_thr_global - poly_relax
 
         # Melody filter threshold stays a *post-filter* knob (do not silently lower global gate)
@@ -1132,7 +1140,8 @@ def extract_features(
         track_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         track_conf_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         primary_track = np.zeros(max_frames, dtype=np.float32)
-        select_top_voice = polyphonic_context and "top_voice" in str(skyline_mode)
+        # GUARD: Do not use top_voice logic for Monophonic files (L0/L1) even if polyphonic_context=True
+        select_top_voice = is_true_poly and polyphonic_context and "top_voice" in str(skyline_mode)
 
         # B3: Apply tuning offset during MIDI conversion
         tuning_semitones = tuning_cents / 100.0
