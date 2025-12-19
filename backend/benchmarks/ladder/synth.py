@@ -1,6 +1,6 @@
 import numpy as np
 import soundfile as sf
-from music21 import stream, note, chord
+from music21 import stream, note, chord, tempo
 
 def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050):
     """
@@ -14,6 +14,26 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
     # 1. Calculate total duration
     # Find the last release time
     max_end = 0.0
+
+    def _extract_bpm(score) -> float:
+        # Try finding in parts first (more reliable than recurse sometimes)
+        if hasattr(score, 'parts'):
+            for p in score.parts:
+                mms = list(p.getElementsByClass(tempo.MetronomeMark))
+                if mms:
+                     return float(mms[0].number)
+
+        # Fallback to recurse
+        mms = list(score.recurse().getElementsByClass(tempo.MetronomeMark))
+        for mm in mms:
+            if getattr(mm, "number", None):
+                try:
+                    return float(mm.number)
+                except Exception:
+                    pass
+        return 100.0
+
+    current_bpm = _extract_bpm(score_stream)
 
     # We need to process chords and notes
     # music21.chord.Chord contains notes.
@@ -30,26 +50,17 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
     # Let's use a simpler approach: Iterate elements and track time.
     # But for polyphony (different parts), we need to be careful.
 
-    # Simplest accurate way: Use secondsMap from music21 if it works without external Musescore.
-    # It usually works.
+    # Calculate duration using our BPM to be consistent
+    # score.flatten() puts everything in one timeline
     try:
-        # This converts offsets to seconds based on tempo marks
-        seconds_map = score_stream.secondsMap
-        total_dur_sec = score_stream.duration.quarterLength * (60 / 120) # Fallback guess
-        if seconds_map:
-            total_dur_sec = seconds_map[-1]['endTimeSeconds']
+        total_dur_sec = score_stream.highestTime * (60.0 / current_bpm)
     except:
-        # Fallback: assume 100 BPM (default in our generators)
-        # score.flatten() puts everything in one timeline
-        total_dur_sec = score_stream.highestTime * (60.0 / 100.0)
+        total_dur_sec = 10.0
 
     # Buffer
     # Add 1 second tail
     n_samples = int((total_dur_sec + 2.0) * sr)
     audio = np.zeros(n_samples, dtype=np.float32)
-
-    # Default BPM if not found
-    current_bpm = 100.0
 
     # We will process flattened notes.
     # To handle tempo changes correctly in a custom loop is hard.
