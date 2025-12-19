@@ -181,6 +181,11 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
         },
     }
 
+def make_config(audio_type: AudioType = AudioType.MONOPHONIC) -> PipelineConfig:
+    """Factory for pipeline config based on audio type."""
+    config = PipelineConfig()
+    return config
+
 def midi_to_freq(m: int) -> float:
     return 440.0 * 2 ** ((m - 69) / 12.0)
 

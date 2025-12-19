@@ -388,6 +388,8 @@ class InstrumentProfile:
 @dataclass
 class PipelineConfig:
     device: str = "cpu"  # "cpu" | "cuda" | "mps"
+    seed: Optional[int] = None  # deterministic runs when set
+    instrument_override: Optional[str] = None  # e.g. "bass_guitar", "guitar_distorted"
     stage_a: StageAConfig = field(default_factory=StageAConfig)
     stage_b: StageBConfig = field(default_factory=StageBConfig)
     stage_c: StageCConfig = field(default_factory=StageCConfig)
