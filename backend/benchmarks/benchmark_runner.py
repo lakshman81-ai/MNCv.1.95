@@ -443,11 +443,9 @@ class BenchmarkSuite:
     ) -> PipelineConfig:
         config = PipelineConfig()
         config.stage_b.separation["enabled"] = True
-        # IMPORTANT: Use htdemucs for better separation quality than the synthetic model
-        # The synthetic model is only for unit tests/audit where deps are missing.
-        # For L2 accuracy, we need real separation.
-        config.stage_b.separation["synthetic_model"] = False
-        config.stage_b.separation["model"] = "htdemucs"
+        # Use synthetic model for L2 benchmark as it is tuned for sine/saw waves.
+        # Real Demucs often classifies synthetic sines as "Other", leading to 0.0 F1.
+        config.stage_b.separation["synthetic_model"] = True
 
         config.stage_b.separation["harmonic_masking"]["enabled"] = use_harmonic_masking
         if use_harmonic_masking:

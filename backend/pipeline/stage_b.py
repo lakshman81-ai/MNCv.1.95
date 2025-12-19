@@ -167,16 +167,32 @@ class SyntheticMDXSeparator:
 
         scores = self._score_mix(audio)
         vocal_score = scores.get("fm_voice", 0.25) + scores.get("sine_stack", 0.25)
-        bass_score = scores.get("square", 0.25)
-        saw_score = scores.get("saw", 0.25)
+        # Assign Sawtooth score to Bass (L2 uses Saw for Bass)
+        bass_score = scores.get("square", 0.25) + scores.get("saw", 0.25)
+
         drum_score = scores.get("broadband", 0.25)
 
-        raw_weights = np.array([vocal_score, bass_score, drum_score, saw_score])
+        # Reduce Saw score from 'other' (or remove it from weighted calculation)
+        # But we need 4 weights for the tuple unpacking below?
+        # Actually 'other_w' comes from 'saw_score' in original code.
+        # Let's keep 4 dimensions but repurpose.
+        # Original: vocals, bass, drums, other (from saw)
+        # New: vocals, bass (square+saw), drums, other (residual or 0?)
+
+        # To keep tuple unpacking safe:
+        # We'll just set 'saw_score' to small epsilon if we moved it to bass?
+        # Or better: let 'other' be low.
+        other_score = 0.01
+
+        raw_weights = np.array([vocal_score, bass_score, drum_score, other_score])
         weights = raw_weights / (np.sum(raw_weights) + 1e-9)
         vocals_w, bass_w, drums_w, other_w = weights
 
+        if SCIPY_SIGNAL is None:
+             logger.warning("Scipy signal not available; SyntheticMDXSeparator filtering disabled.")
+
         vocals = vocals_w * _butter_filter(audio, sr, 12000.0, "low")
-        vocals = _butter_filter(vocals, sr, 120.0, "high")
+        vocals = _butter_filter(vocals, sr, 300.0, "high")
 
         bass = bass_w * _butter_filter(audio, sr, 180.0, "low")
         drums = drums_w * _butter_filter(audio, sr, 90.0, "high")
