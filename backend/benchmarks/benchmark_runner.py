@@ -478,6 +478,7 @@ class BenchmarkSuite:
         config.stage_c.pitch_tolerance_cents = max(getattr(config.stage_c, "pitch_tolerance_cents", 50.0), 60.0)
         config.stage_c.min_note_duration_ms_poly = max(getattr(config.stage_c, "min_note_duration_ms_poly", 120.0), 150.0)
         config.stage_c.confidence_hysteresis.update({"start": 0.6, "end": 0.4})
+        config.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
         return config
 
     def _apply_poly_dominant_segmentation(self, config: PipelineConfig) -> None:
