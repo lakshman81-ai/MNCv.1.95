@@ -226,15 +226,42 @@ def _run_htdemucs(
 
     model_sr = getattr(model, "samplerate", sr)
 
+    # Handle Mono vs Stereo input logic
+    # Demucs expects (Channels, Time)
+    # If input is (Time,), make it (1, Time) first for logic consistency
+    if audio.ndim == 1:
+        audio = audio[None, :]  # (1, T)
+
+    # Resample if needed
     if model_sr != sr:
-        # simple linear resample
+        import torch.nn.functional as F
+        # Use torch for resampling if available to handle channels correctly
+        # or use scipy/numpy carefully.
+        # Simple numpy interp works for 1D, but for (C, T) we need loop.
+        # Let's stick to numpy for minimal deps, but handle channels.
         ratio = float(model_sr) / float(sr)
-        indices = np.arange(0, len(audio) * ratio) / ratio
-        resampled = np.interp(indices, np.arange(len(audio)), audio)
+        new_len = int(audio.shape[-1] * ratio)
+        resampled_channels = []
+        for ch in range(audio.shape[0]):
+            indices = np.arange(0, new_len) / ratio
+            # clamp indices to valid range
+            indices = np.clip(indices, 0, audio.shape[-1] - 1)
+            res_ch = np.interp(indices, np.arange(audio.shape[-1]), audio[ch])
+            resampled_channels.append(res_ch)
+        resampled = np.stack(resampled_channels)
     else:
         resampled = audio
 
-    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, None, :].to(dev)
+    # Demucs expects stereo (2, T)
+    # If mono (1, T), duplicate. If > 2, trim.
+    C, T = resampled.shape
+    if C == 1:
+        resampled = np.concatenate([resampled, resampled], axis=0)
+    elif C > 2:
+        resampled = resampled[:2, :]
+
+    # Prepare tensor: (Batch, Channels, Time) -> (1, 2, T)
+    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, :, :].to(dev)
     try:
         with torch.no_grad():
             demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts, device=dev)

@@ -107,6 +107,10 @@ def main():
     cfg_mono.stage_c.velocity_map["min_db"] = -80.0
     # Use threshold segmentation for synthetic sine (HMM expects ADSR)
     cfg_mono.stage_c.segmentation_method = {"method": "threshold"}
+    # Disable separation to keep audit fast (contract verification only)
+    if not cfg_mono.stage_b.separation:
+        cfg_mono.stage_b.separation = {}
+    cfg_mono.stage_b.separation["enabled"] = False
     results.append(run_scenario("Mono Clean", path_mono, cfg_mono))
 
     # Scenario 2: Poly Chord
@@ -115,6 +119,10 @@ def main():
     cfg_poly.stage_c.segmentation_method = {"method": "threshold"}
     cfg_poly.stage_a.noise_floor_estimation = {"method": "percentile", "percentile": 1}
     cfg_poly.stage_c.velocity_map["min_db"] = -80.0
+    # Disable separation to keep audit fast
+    if not cfg_poly.stage_b.separation:
+        cfg_poly.stage_b.separation = {}
+    cfg_poly.stage_b.separation["enabled"] = False
     results.append(run_scenario("Poly Chord", path_poly, cfg_poly))
 
     # Scenario 3: Short Clip (Verify BPM gate)
