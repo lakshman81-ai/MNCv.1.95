@@ -1154,6 +1154,9 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
+            # Preserve raw detector/layer candidates for skyline selection in Stage C
+            active_candidates = list(candidates)
+
             tracked_pitches, tracked_confs = tracker.step(candidates)
             for voice_idx in range(tracker.max_tracks):
                 track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
@@ -1175,11 +1178,9 @@ def extract_features(
                 midi_float = 69.0 + 12.0 * np.log2(chosen_pitch / 440.0)
                 midi = int(round(midi_float - tuning_semitones))
 
-            active = [
-                (float(p), float(track_conf_buffers[idx][i]))
-                for idx, p in enumerate(tracked_pitches)
-                if p > 0.0
-            ]
+            # Use the raw candidates (pre-tracking) to expose all available pitches
+            # to downstream skyline selection instead of only the tracked voices.
+            active = [(float(p), float(c)) for (p, c) in active_candidates if p > 0.0]
 
             timeline.append(
                 FramePitch(
