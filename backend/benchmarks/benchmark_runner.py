@@ -977,7 +977,7 @@ def main():
             elif lvl == "L4":
                 runner.run_L4_real_songs()
     except Exception as e:
-        logger.error(f"Benchmark Suite Failed: {e}")
+        logger.exception(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
         runner.generate_summary()
         sys.exit(1)

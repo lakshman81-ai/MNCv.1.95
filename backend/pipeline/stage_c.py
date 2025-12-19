@@ -646,6 +646,35 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         if not timeline or len(timeline) < 2:
             continue
 
+        # Patch: Skyline Top Voice Selection
+        # If active, derive frame pitch from the highest confident active pitch
+        if poly_filter_mode == "skyline_top_voice":
+            new_tl = []
+            for fp in timeline:
+                ap = getattr(fp, "active_pitches", []) or []
+                # Filter by confidence floor
+                cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= conf_thr]
+                if cand:
+                    # Pick highest pitch
+                    p_best, c_best = max(cand, key=lambda x: x[0])
+                    # Recompute MIDI
+                    midi_new = int(round(69 + 12 * np.log2(p_best / 440.0)))
+                    # Create updated frame (assuming immutable-ish usage, creating new is safer)
+                    fp2 = FramePitch(
+                        time=fp.time,
+                        pitch_hz=p_best,
+                        midi=midi_new,
+                        confidence=c_best,
+                        rms=fp.rms,
+                        active_pitches=fp.active_pitches
+                    )
+                    new_tl.append(fp2)
+                else:
+                    # Fallback to original Stage B choice
+                    new_tl.append(fp)
+            # Replace the timeline for processing
+            timeline = new_tl
+
         # Detect polyphonic context based on active pitch annotations
         poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
 
@@ -694,6 +723,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                  continue
 
              use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+
+             # WI Patch: If using Skyline Top Voice, we must rely on pitch changes for segmentation,
+             # so we disable Viterbi (which only tracks voicing state) to use the pitch-sensitive segmenter.
+             if poly_filter_mode == "skyline_top_voice":
+                 use_viterbi = False
+
              segs = []
 
              if use_viterbi:
