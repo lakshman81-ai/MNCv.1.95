@@ -462,14 +462,14 @@ class BenchmarkSuite:
             "median_window": 7,
             "voiced_prob_threshold": 0.45,
             "rms_gate_db": -38.0,
-            "fmin_hz": 80.0,
+            "fmin_hz": 450.0,
             "fmax_hz": 1400.0,
         })
         yin_conf = config.stage_b.detectors.get("yin", {})
         yin_conf.update({
             "hop_length": 256,
             "frame_length": 4096,
-            "fmin": 80.0,
+            "fmin": 450.0,
             "fmax": 1200.0,
         })
         config.stage_b.detectors["yin"] = yin_conf

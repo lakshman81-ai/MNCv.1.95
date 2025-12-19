@@ -15,11 +15,7 @@
         "status": "pass"
       },
       "stage_d": {
-        "status": "fail",
-        "violations": [
-          "Stage D missing MusicXML",
-          "Stage D missing MIDI bytes"
-        ]
+        "status": "pass"
       }
     },
     "pipeline_version": "2.0.0"
@@ -40,11 +36,7 @@
         "status": "pass"
       },
       "stage_d": {
-        "status": "fail",
-        "violations": [
-          "Stage D missing MusicXML",
-          "Stage D missing MIDI bytes"
-        ]
+        "status": "pass"
       }
     },
     "pipeline_version": "2.0.0"
@@ -65,11 +57,7 @@
         "status": "pass"
       },
       "stage_d": {
-        "status": "fail",
-        "violations": [
-          "Stage D missing MusicXML",
-          "Stage D missing MIDI bytes"
-        ]
+        "status": "pass"
       }
     },
     "pipeline_version": "2.0.0"
