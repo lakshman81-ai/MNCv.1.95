@@ -650,10 +650,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         # If active, derive frame pitch from the highest confident active pitch
         if poly_filter_mode == "skyline_top_voice":
             new_tl = []
+            # Use lower threshold to catch melody candidates if present but weak
+            skyline_conf_thr = min(conf_thr, 0.2)
             for fp in timeline:
                 ap = getattr(fp, "active_pitches", []) or []
                 # Filter by confidence floor
-                cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= conf_thr]
+                cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
                 if cand:
                     # Pick highest pitch
                     p_best, c_best = max(cand, key=lambda x: x[0])
