@@ -100,6 +100,7 @@ def main():
 
     # Scenario 1: Mono Clean
     cfg_mono = dataclasses.replace(PIANO_61KEY_CONFIG)
+    cfg_mono.stage_b.separation["enabled"] = False
     cfg_mono.stage_b.detectors["yin"]["enabled"] = True # Force robust detector
     # Ensure sine wave isn't gated by noise floor estimation
     cfg_mono.stage_a.noise_floor_estimation = {"method": "percentile", "percentile": 1}
@@ -111,6 +112,7 @@ def main():
 
     # Scenario 2: Poly Chord
     cfg_poly = dataclasses.replace(PIANO_61KEY_CONFIG)
+    cfg_poly.stage_b.separation["enabled"] = False
     # Use threshold segmentation for synthetic sine
     cfg_poly.stage_c.segmentation_method = {"method": "threshold"}
     cfg_poly.stage_a.noise_floor_estimation = {"method": "percentile", "percentile": 1}
