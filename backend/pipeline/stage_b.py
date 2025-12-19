@@ -1131,6 +1131,8 @@ def extract_features(
 
         track_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         track_conf_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
+        primary_track = np.zeros(max_frames, dtype=np.float32)
+        select_top_voice = polyphonic_context and "top_voice" in str(skyline_mode)
 
         # B3: Apply tuning offset during MIDI conversion
         tuning_semitones = tuning_cents / 100.0
@@ -1148,8 +1150,15 @@ def extract_features(
                 track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
                 track_conf_buffers[voice_idx][i] = tracked_confs[voice_idx]
 
-            chosen_pitch = float(tracked_pitches[0]) if tracked_pitches.size else 0.0
-            chosen_conf = float(tracked_confs[0]) if tracked_confs.size else 0.0
+            primary_idx = 0
+            if select_top_voice and tracked_pitches.size:
+                primary_idx = int(np.argmax(tracked_pitches))
+                if tracked_pitches[primary_idx] <= 0.0:
+                    primary_idx = 0
+
+            chosen_pitch = float(tracked_pitches[primary_idx]) if tracked_pitches.size else 0.0
+            chosen_conf = float(tracked_confs[primary_idx]) if tracked_confs.size else 0.0
+            primary_track[i] = chosen_pitch
 
             midi = None
             if chosen_pitch > 0.0:
@@ -1200,7 +1209,7 @@ def extract_features(
                 all_layers.append(alt)
 
         # Set main f0 (prefer vocals, then mix)
-        main_track = track_buffers[0]
+        main_track = primary_track if select_top_voice else track_buffers[0]
         if stem_name == "vocals":
             f0_main = main_track
         elif stem_name == "mix" and f0_main is None:

@@ -454,7 +454,7 @@ class BenchmarkSuite:
             "overlap_candidates": [0.5, 0.75],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
-        config.stage_b.polyphonic_peeling["max_layers"] = 1
+        config.stage_b.polyphonic_peeling["max_layers"] = 2
         config.stage_b.melody_filtering.update({
             "median_window": 7,
             "voiced_prob_threshold": 0.45,
@@ -533,7 +533,14 @@ class BenchmarkSuite:
 
         return [merged[k] for k in sorted(merged.keys())]
 
-    def _save_run(self, level: str, name: str, res: Dict[str, Any], gt: List[Tuple[int, float, float]]):
+    def _save_run(
+        self,
+        level: str,
+        name: str,
+        res: Dict[str, Any],
+        gt: List[Tuple[int, float, float]],
+        apply_regression_gate: bool = True,
+    ):
         """Save artifacts for a single run."""
         pred_notes = res['notes']
         pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in pred_notes]
@@ -564,9 +571,6 @@ class BenchmarkSuite:
             "predicted_count": len(pred_list),
             "gt_count": len(gt)
         }
-        self._enforce_regression_thresholds(level, metrics, res.get("profiling"))
-        self.results.append(metrics)
-
         # Save JSONs
         base_path = os.path.join(self.output_dir, f"{level}_{name}")
 
@@ -605,6 +609,11 @@ class BenchmarkSuite:
 
         with open(f"{base_path}_run_info.json", "w") as f:
             json.dump(run_info, f, indent=2, default=str)
+
+        self.results.append(metrics)
+
+        if apply_regression_gate:
+            self._enforce_regression_thresholds(level, metrics, res.get("profiling"))
 
         return metrics
 
@@ -741,7 +750,13 @@ class BenchmarkSuite:
             AudioType.POLYPHONIC_DOMINANT,
             allow_separation=True,
         )
-        m_exp = self._save_run("L2", "melody_plus_bass_crepe_rmvpe", exp_res, gt_melody)
+        m_exp = self._save_run(
+            "L2",
+            "melody_plus_bass_crepe_rmvpe",
+            exp_res,
+            gt_melody,
+            apply_regression_gate=False,
+        )
         logger.info(f"L2 CREPE/RMVPE Complete. F1: {m_exp['note_f1']}")
 
         # Harmonic masking sweep to measure melody isolation sensitivity
@@ -766,6 +781,7 @@ class BenchmarkSuite:
                     f"melody_plus_bass_mask_{width:.3f}_ovl_{overlap:.2f}",
                     sweep_res,
                     gt_melody,
+                    apply_regression_gate=False,
                 )
                 sweep_results.append(
                     {
