@@ -779,6 +779,7 @@ def extract_features(
     # Priority: kwargs -> config intended instrument -> meta.instrument -> fallback
     instrument = (
         kwargs.get("instrument")
+        or (getattr(config, "instrument_override", None) if config else None)
         or (getattr(config, "intended_instrument", None) if config else None)
         or getattr(stage_a_out.meta, "instrument", None)
         or b_conf.instrument

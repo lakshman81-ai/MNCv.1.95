@@ -386,6 +386,17 @@ def transcribe(
     if config is None:
         config = PIANO_61KEY_CONFIG
 
+    # Deterministic seeding if requested
+    if config.seed is not None:
+        import random
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        try:
+            import torch
+            torch.manual_seed(config.seed)
+        except ImportError:
+            pass
+
     pipeline_logger = pipeline_logger or PipelineLogger()
     stage_metrics: dict[str, dict[str, float]] = {}
     stage_b_out: Optional[StageBOutput] = None
