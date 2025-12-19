@@ -474,6 +474,8 @@ class BenchmarkSuite:
             self._enable_high_capacity_frontend(config, use_crepe_viterbi)
         if use_poly_dominant_segmentation:
             self._apply_poly_dominant_segmentation(config)
+        # Keep tracker search tight for poly-dominant melody/bass pairs
+        config.stage_b.voice_tracking["max_alt_voices"] = 1
         config.stage_c.gap_tolerance_s = max(getattr(config.stage_c, "gap_tolerance_s", 0.07), 0.07)
         config.stage_c.pitch_tolerance_cents = max(getattr(config.stage_c, "pitch_tolerance_cents", 50.0), 60.0)
         config.stage_c.min_note_duration_ms_poly = max(getattr(config.stage_c, "min_note_duration_ms_poly", 120.0), 150.0)
