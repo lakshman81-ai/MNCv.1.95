@@ -14,6 +14,7 @@ It validates algorithm selection (Stage B), records polyphonic diagnostics, and 
 from __future__ import annotations
 
 import os
+import sys
 import json
 import time
 import argparse
@@ -959,7 +960,8 @@ def main():
     except Exception as e:
         logger.error(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
-        pass
+        runner.generate_summary()
+        sys.exit(1)
 
     runner.generate_summary()
 
