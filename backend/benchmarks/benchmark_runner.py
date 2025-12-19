@@ -40,6 +40,7 @@ from backend.benchmarks.metrics import note_f1, onset_offset_mae, dtw_note_f1, d
 from backend.benchmarks.run_real_songs import run_song as run_real_song
 from backend.benchmarks.ladder.generators import generate_benchmark_example
 from backend.benchmarks.ladder.synth import midi_to_wav_synth
+import music21
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -55,13 +56,14 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
 
     return {
         "ladder": {
-            "levels": ["L0", "L1", "L2", "L3", "L4"],
+            "levels": ["L0", "L1", "L2", "L3", "L4", "L5"],
             "coverage": {
                 "L0": "sine_regression",
                 "L1": "monophonic_scale",
                 "L2": "poly_dominant",
                 "L3": "full_poly_musicxml",
                 "L4": "real_songs",
+                "L5": "user_midi",
             },
             "metrics": ["note_f1", "onset_mae_ms", "offset_mae_ms"],
             "artifacts": ["metrics_json", "leaderboard_json", "summary_csv"],
@@ -883,6 +885,50 @@ class BenchmarkSuite:
         except Exception as e:
             logger.error(f"L4 Failed: {e}")
 
+    def run_L5_my_song(self):
+        logger.info("Running L5: User Provided Song")
+        midi_path = os.path.join("backend", "benchmarks", "ladder", "L5_my_song.mid")
+        if not os.path.exists(midi_path):
+             raise FileNotFoundError(f"L5 MIDI not found at {midi_path}")
+
+        # 1. Load Ground Truth
+        score = music21.converter.parse(midi_path)
+        gt = self._score_to_gt(score)
+
+        # 2. Synthesize Audio
+        sr = 22050
+        wav_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+            midi_to_wav_synth(score, wav_path, sr=sr)
+            audio, read_sr = sf.read(wav_path)
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+
+        # 3. Configure Pipeline
+        config = PipelineConfig()
+        config.stage_b.separation['enabled'] = False
+        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        # Enable all detectors
+        for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
+            if det in config.stage_b.detectors:
+                config.stage_b.detectors[det]["enabled"] = True
+
+        # 4. Run Pipeline
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+
+        m = self._save_run("L5", "my_song", res, gt, apply_regression_gate=False)
+
+        logger.info(f"L5 Complete. F1: {m['note_f1']}")
+
     def _save_real_song_result(self, level, name, res):
         # Adapt run_real_songs output dict to our metrics
         metrics = {
@@ -958,13 +1004,13 @@ class BenchmarkSuite:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
-    parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4"], default="all",
+    parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4", "L5"], default="all",
                         help="Run a specific benchmark level or all levels")
     args = parser.parse_args()
 
     runner = BenchmarkSuite(args.output)
 
-    level_order = ["L0", "L1", "L2", "L3", "L4"]
+    level_order = ["L0", "L1", "L2", "L3", "L4", "L5"]
     to_run = level_order if args.level == "all" else [args.level]
 
     try:
@@ -979,6 +1025,8 @@ def main():
                 runner.run_L3_full_poly()
             elif lvl == "L4":
                 runner.run_L4_real_songs()
+            elif lvl == "L5":
+                runner.run_L5_my_song()
     except Exception as e:
         logger.exception(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
