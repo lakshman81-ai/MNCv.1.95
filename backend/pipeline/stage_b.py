@@ -226,15 +226,36 @@ def _run_htdemucs(
 
     model_sr = getattr(model, "samplerate", sr)
 
+    # audio can be (T,) or (C, T). Time is always last dimension.
+    n = int(audio.shape[-1]) if hasattr(audio, "shape") else len(audio)
+
     if model_sr != sr:
-        # simple linear resample
         ratio = float(model_sr) / float(sr)
-        indices = np.arange(0, len(audio) * ratio) / ratio
-        resampled = np.interp(indices, np.arange(len(audio)), audio)
+        indices = np.arange(0, n * ratio) / ratio
+        base = np.arange(n)
+
+        if audio.ndim == 1:
+            resampled = np.interp(indices, base, audio)
+        else:
+            # channel-first expected: (C, T)
+            resampled = np.vstack([np.interp(indices, base, ch) for ch in audio])
     else:
         resampled = audio
 
-    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, None, :].to(dev)
+    # Demucs expects [B, 2, T]. If mono, duplicate to stereo.
+    if resampled.ndim == 1:
+        resampled = np.stack([resampled, resampled], axis=0)   # (2, T)
+    elif resampled.ndim == 2:
+        # if (1, T) -> repeat; if (>2, T) -> take first two
+        if resampled.shape[0] == 1:
+            resampled = np.repeat(resampled, 2, axis=0)
+        elif resampled.shape[0] > 2:
+            resampled = resampled[:2]
+    else:
+        logger.warning(f"Unexpected audio shape for Demucs: {getattr(resampled,'shape',None)}; skipping.")
+        return None
+
+    mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, :, :].to(dev)  # [1, 2, T]
     try:
         with torch.no_grad():
             demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts, device=dev)
