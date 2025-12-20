@@ -984,8 +984,9 @@ class BenchmarkSuite:
         from backend.pipeline.config import PIANO_61KEY_CONFIG
         import copy
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
-        config.stage_b.separation['enabled'] = False
-        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['model'] = 'htdemucs'
+        config.stage_b.polyphonic_peeling["max_layers"] = 8
         # Enable all detectors
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
