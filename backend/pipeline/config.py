@@ -148,8 +148,8 @@ class StageBConfig:
             "validator_min_disagree_frames": 2,
             "max_harmonics": 12,
             "force_on_mix": True,
-            # Adaptive ISS (WI Feature E)
-            "iss_adaptive": False,
+            # Adaptive ISS (WI Feature E) - ENABLED by default for better L4/L5
+            "iss_adaptive": True,
             "strength_min": 0.8,
             "strength_max": 1.2,
             "flatness_thresholds": [0.3, 0.6],  # [low, high]
@@ -194,8 +194,8 @@ class StageBConfig:
                 "hop_length": 256,
                 "frame_length": 4096,
                 "threshold": 0.08,
-                # Multi-resolution + Octave Correction (WI Feature C)
-                "enable_multires_f0": False,
+                # Multi-resolution + Octave Correction (WI Feature C) - ENABLED for L5 accuracy
+                "enable_multires_f0": True,
                 "enable_octave_correction": False,
                 "octave_jump_penalty": 0.35,
             },
@@ -258,8 +258,8 @@ class StageCConfig:
     # WI: 30 ms for piano/guitar; captures fast grace notes/trills.
     min_note_duration_ms: float = 30.0
 
-    # Polyphonic-specific minimum duration to suppress bass-induced flutter
-    min_note_duration_ms_poly: float = 80.0
+    # Polyphonic-specific minimum duration - REDUCED for fast ornaments in L5
+    min_note_duration_ms_poly: float = 45.0
 
     # HMM frame stability (used in HMMProcessor)
     frame_stability: Dict[str, Any] = field(
@@ -284,8 +284,9 @@ class StageCConfig:
     )
 
     # Confidence gates for polyphonic timelines (melody vs accompaniment)
+    # Relaxed accompaniment threshold to 0.40 to capture quiet inner voices
     polyphonic_confidence: Dict[str, float] = field(
-        default_factory=lambda: {"melody": 0.55, "accompaniment": 0.5}
+        default_factory=lambda: {"melody": 0.55, "accompaniment": 0.40}
     )
 
     # RMS → MIDI velocity mapping
@@ -359,8 +360,8 @@ class SegmentedTranscriptionConfig:
     overlap_sec: float = 2.0
     retry_quality_threshold: float = 0.9
     retry_max_candidates: int = 3
-    # Density heuristic parameters
-    density_target_notes_per_sec: float = 4.0
+    # Density heuristic parameters - INCREASED for complex L5 pieces
+    density_target_notes_per_sec: float = 8.0
     density_penalty_span: float = 6.0
 
 
@@ -594,7 +595,7 @@ PIANO_61KEY_CONFIG = PipelineConfig(
             "swiftf0": {"enabled": True, "fmin": 60.0, "fmax": 2000.0, "confidence_threshold": 0.9},
             "sacf":    {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "window_size": 4096, "threshold": 0.3},
             "cqt":     {"enabled": True, "fmin": 60.0, "fmax": 4000.0, "bins_per_octave": 48, "n_bins": 240, "max_peaks": 8},
-            "yin":     {"enabled": False, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1},
+            "yin":     {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1, "enable_multires_f0": True},
             "rmvpe":   {"enabled": False},
             "crepe":   {"enabled": False},
         },
