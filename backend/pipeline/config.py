@@ -259,7 +259,7 @@ class StageCConfig:
     min_note_duration_ms: float = 30.0
 
     # Polyphonic-specific minimum duration to suppress bass-induced flutter
-    min_note_duration_ms_poly: float = 120.0
+    min_note_duration_ms_poly: float = 80.0
 
     # HMM frame stability (used in HMMProcessor)
     frame_stability: Dict[str, Any] = field(
@@ -273,7 +273,7 @@ class StageCConfig:
     gap_tolerance_s: float = 0.05
 
     # Base confidence threshold and hysteresis for note activation
-    confidence_threshold: float = 0.25
+    confidence_threshold: float = 0.20
     confidence_hysteresis: Dict[str, float] = field(
         default_factory=lambda: {"start": 0.6, "end": 0.4}
     )
@@ -285,7 +285,7 @@ class StageCConfig:
 
     # Confidence gates for polyphonic timelines (melody vs accompaniment)
     polyphonic_confidence: Dict[str, float] = field(
-        default_factory=lambda: {"melody": 0.55, "accompaniment": 0.6}
+        default_factory=lambda: {"melody": 0.55, "accompaniment": 0.5}
     )
 
     # RMS → MIDI velocity mapping
@@ -608,7 +608,7 @@ PIANO_61KEY_CONFIG = PipelineConfig(
         min_note_duration_ms=50.0,
         segmentation_method={
             "method": "hmm",
-            "min_onset_frames": 3,
+            "min_onset_frames": 2,
             "release_frames": 2,
             "time_merge_frames": 1,
             "split_semitone": 0.7,

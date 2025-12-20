@@ -455,7 +455,7 @@ class BenchmarkSuite:
         config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
         config.stage_b.separation["polyphonic_dominant_preset"].update({
             "overlap": 0.75,
-            "shift_range": [2, 5],
+            "shift_range": [2, 8],
             "overlap_candidates": [0.5, 0.75],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
@@ -913,12 +913,13 @@ class BenchmarkSuite:
             ]
 
         config = PipelineConfig()
-        config.stage_b.separation['enabled'] = False
-        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['model'] = 'htdemucs'
+        config.stage_b.polyphonic_peeling["max_layers"] = 8
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC, allow_separation=True)
 
         m = self._save_run("L3", "old_macdonald_poly_full", res, gt)
 
@@ -980,11 +981,46 @@ class BenchmarkSuite:
             audio = np.mean(audio, axis=1)
 
         # 3. Configure Pipeline
-        config = PipelineConfig()
-        config.stage_b.separation['enabled'] = False
-        config.stage_b.polyphonic_peeling["max_layers"] = 3
-        # Enable all detectors
-        for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
+        from backend.pipeline.config import PIANO_61KEY_CONFIG
+        import copy
+        config = copy.deepcopy(PIANO_61KEY_CONFIG)
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['model'] = 'htdemucs'
+        config.stage_b.separation['synthetic_model'] = True
+        config.stage_b.separation['overlap'] = 0.75
+        config.stage_b.separation['shifts'] = 2
+
+        config.stage_a.high_pass_filter["cutoff_hz"] = 20.0
+        config.stage_b.apply_instrument_profile = False
+        config.stage_c.apply_instrument_profile = False
+        config.stage_b.confidence_voicing_threshold = 0.3
+        config.stage_c.confidence_threshold = 0.15
+        config.stage_c.min_note_duration_ms_poly = 50.0
+
+        # Fix fmin for deep bass notes (MIDI 36 ~ 65Hz, safe margin 30Hz)
+        for d in ["crepe", "swiftf0", "yin"]:
+             if d in config.stage_b.detectors:
+                 config.stage_b.detectors[d]["fmin"] = 30.0
+        config.stage_b.melody_filtering["fmin_hz"] = 30.0
+
+        # Optimize for Sine waves (synth)
+        config.stage_b.polyphonic_peeling["max_layers"] = 4
+        config.stage_b.polyphonic_peeling["max_harmonics"] = 1
+        config.stage_b.polyphonic_peeling["residual_flatness_stop"] = 1.0
+        config.stage_b.polyphonic_peeling["harmonic_snr_stop_db"] = -100.0
+        config.stage_b.polyphonic_peeling["mask_width"] = 0.03
+        config.stage_b.polyphonic_peeling["iss_adaptive"] = True
+
+        # Enable all detectors but favor CREPE/SwiftF0 for pure tones
+        config.stage_b.ensemble_weights = {
+            "swiftf0": 0.4,
+            "crepe": 0.4,
+            "yin": 0.1,
+            "sacf": 0.1,
+            "cqt": 0.0,
+            "rmvpe": 0.0,
+        }
+        for det in ["swiftf0", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
 
