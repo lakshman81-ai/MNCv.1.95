@@ -1083,9 +1083,12 @@ class BenchmarkSuite:
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
-        config.stage_b.separation['synthetic_model'] = True
+        # Real song -> Use real separation (HTDemucs), not synthetic
+        config.stage_b.separation['synthetic_model'] = False
         config.stage_b.separation['overlap'] = 0.75
         config.stage_b.separation['shifts'] = 2
+        # Enable harmonic masking as fallback if separation fails or for reinforcement
+        config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
 
         config.stage_a.high_pass_filter["cutoff_hz"] = 20.0
         config.stage_b.apply_instrument_profile = False
@@ -1174,7 +1177,15 @@ class BenchmarkSuite:
 
         # 3. Configure Pipeline
         config = PipelineConfig()
-        config.stage_b.separation['enabled'] = False
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['model'] = 'htdemucs'
+        config.stage_b.separation['synthetic_model'] = False # Real song
+        config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
+
+        # Enable polyphonic decomposition (non-skyline) for dense chorus
+        # Use new "decomposed_melody" mode to isolate the best vocal line from poly tracks
+        config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
+
         config.stage_b.polyphonic_peeling["max_layers"] = 3
         # Enable all detectors
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
