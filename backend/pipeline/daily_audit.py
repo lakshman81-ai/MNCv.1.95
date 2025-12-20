@@ -179,6 +179,8 @@ LEVEL_MAP: Dict[str, str] = {
     "L2_POLY_DOMINANT": "L2",
     "L3_FULL_POLY": "L3",
     "L4_REAL_SONGS": "L4",
+    "L5.1_KAL_HO_NA_HO": "L5.1",
+    "L5.2_TUMHARE_HI_RAHENGE": "L5.2",
 }
 
 

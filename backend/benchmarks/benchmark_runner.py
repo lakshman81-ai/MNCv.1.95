@@ -56,14 +56,15 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
 
     return {
         "ladder": {
-            "levels": ["L0", "L1", "L2", "L3", "L4", "L5"],
+            "levels": ["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"],
             "coverage": {
                 "L0": "sine_regression",
                 "L1": "monophonic_scale",
                 "L2": "poly_dominant",
                 "L3": "full_poly_musicxml",
                 "L4": "real_songs",
-                "L5": "user_midi",
+                "L5.1": "kal_ho_na_ho",
+                "L5.2": "tumhare_hi_rahenge",
             },
             "metrics": ["note_f1", "onset_mae_ms", "offset_mae_ms"],
             "artifacts": ["metrics_json", "leaderboard_json", "summary_csv"],
@@ -941,21 +942,21 @@ class BenchmarkSuite:
 
         try:
             # Happy Birthday
-            res_hb = run_real_song('happy_birthday')
+            res_hb = run_real_song('happy_birthday', max_duration=30.0)
             self._save_real_song_result("L4", "happy_birthday", res_hb)
 
             # Old Macdonald
-            res_om = run_real_song('old_macdonald')
+            res_om = run_real_song('old_macdonald', max_duration=30.0)
             self._save_real_song_result("L4", "old_macdonald", res_om)
 
         except Exception as e:
             logger.error(f"L4 Failed: {e}")
 
-    def run_L5_my_song(self):
-        logger.info("Running L5: User Provided Song")
-        midi_path = os.path.join("backend", "benchmarks", "ladder", "L5_my_song.mid")
+    def run_L5_1_kal_ho_na_ho(self):
+        logger.info("Running L5.1: Kal Ho Na Ho")
+        midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.1_kal_ho_na_ho.mid")
         if not os.path.exists(midi_path):
-             raise FileNotFoundError(f"L5 MIDI not found at {midi_path}")
+             raise FileNotFoundError(f"L5.1 MIDI not found at {midi_path}")
 
         # 1. Load Ground Truth
         score = music21.converter.parse(midi_path)
@@ -979,6 +980,16 @@ class BenchmarkSuite:
         if audio.ndim > 1:
             audio = np.mean(audio, axis=1)
 
+        # Limit to 30s
+        max_duration = 30.0
+        if len(audio) > int(max_duration * read_sr):
+            audio = audio[: int(max_duration * read_sr)]
+            gt = [
+                (m, s, min(e, max_duration))
+                for m, s, e in gt
+                if s < max_duration
+            ]
+
         # 3. Configure Pipeline
         config = PipelineConfig()
         config.stage_b.separation['enabled'] = False
@@ -991,9 +1002,63 @@ class BenchmarkSuite:
         # 4. Run Pipeline
         res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
 
-        m = self._save_run("L5", "my_song", res, gt, apply_regression_gate=False)
+        m = self._save_run("L5.1", "kal_ho_na_ho", res, gt, apply_regression_gate=False)
 
-        logger.info(f"L5 Complete. F1: {m['note_f1']}")
+        logger.info(f"L5.1 Complete. F1: {m['note_f1']}")
+
+    def run_L5_2_tumhare_hi_rahenge(self):
+        logger.info("Running L5.2: Tumhare Hi Rahenge")
+        midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.2_tumhare_hi_rahenge.mid")
+        if not os.path.exists(midi_path):
+             raise FileNotFoundError(f"L5.2 MIDI not found at {midi_path}")
+
+        # 1. Load Ground Truth
+        score = music21.converter.parse(midi_path)
+        gt = self._score_to_gt(score)
+
+        # 2. Synthesize Audio
+        sr = 22050
+        wav_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+            midi_to_wav_synth(score, wav_path, sr=sr)
+            audio, read_sr = sf.read(wav_path)
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+
+        # Limit to 30s
+        max_duration = 30.0
+        if len(audio) > int(max_duration * read_sr):
+            audio = audio[: int(max_duration * read_sr)]
+            gt = [
+                (m, s, min(e, max_duration))
+                for m, s, e in gt
+                if s < max_duration
+            ]
+
+        # 3. Configure Pipeline
+        config = PipelineConfig()
+        config.stage_b.separation['enabled'] = False
+        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        # Enable all detectors
+        for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
+            if det in config.stage_b.detectors:
+                config.stage_b.detectors[det]["enabled"] = True
+
+        # 4. Run Pipeline
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+
+        m = self._save_run("L5.2", "tumhare_hi_rahenge", res, gt, apply_regression_gate=False)
+
+        logger.info(f"L5.2 Complete. F1: {m['note_f1']}")
 
     def _save_real_song_result(self, level, name, res):
         # Adapt run_real_songs output dict to our metrics
@@ -1070,14 +1135,20 @@ class BenchmarkSuite:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
-    parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4", "L5"], default="all",
+    parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4", "L5", "L5.1", "L5.2"], default="all",
                         help="Run a specific benchmark level or all levels")
     args = parser.parse_args()
 
     runner = BenchmarkSuite(args.output)
 
-    level_order = ["L0", "L1", "L2", "L3", "L4", "L5"]
+    level_order = ["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"]
     to_run = level_order if args.level == "all" else [args.level]
+
+    # Handle legacy L5 arg if user still passes it by mapping it to new ones?
+    # For now, let's assume explicit L5.1/L5.2 or all.
+    # If "L5" was passed but not in choices, argparse catches it.
+    # If we want "L5" to mean "L5.1 and L5.2", we could add it to choices and handle here.
+    # But user requirement says: "Replace L5 with L5.1 and L5.2".
 
     try:
         for lvl in to_run:
@@ -1091,8 +1162,10 @@ def main():
                 runner.run_L3_full_poly()
             elif lvl == "L4":
                 runner.run_L4_real_songs()
-            elif lvl == "L5":
-                runner.run_L5_my_song()
+            elif lvl == "L5.1":
+                runner.run_L5_1_kal_ho_na_ho()
+            elif lvl == "L5.2":
+                runner.run_L5_2_tumhare_hi_rahenge()
     except Exception as e:
         logger.exception(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
