@@ -58,6 +58,9 @@ L5_OVERRIDE_FIELD_DOC = (
 )
 
 
+LEVEL_ORDER = ["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"]
+
+
 def accuracy_benchmark_plan() -> Dict[str, Any]:
     """Structured description of the accuracy-focused benchmark plan.
 
@@ -1259,6 +1262,18 @@ class BenchmarkSuite:
         logger.info(f"Summary saved to {summary_path}")
 
 
+def resolve_levels(level_arg: str) -> List[str]:
+    """Expand user level selection into runnable benchmark levels."""
+
+    if level_arg == "all":
+        return LEVEL_ORDER
+
+    if level_arg == "L5":
+        return ["L5.1", "L5.2"]
+
+    return [level_arg]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
@@ -1302,14 +1317,7 @@ def main():
 
     runner = BenchmarkSuite(args.output)
 
-    level_order = ["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"]
-    to_run = level_order if args.level == "all" else [args.level]
-
-    # Handle legacy L5 arg if user still passes it by mapping it to new ones?
-    # For now, let's assume explicit L5.1/L5.2 or all.
-    # If "L5" was passed but not in choices, argparse catches it.
-    # If we want "L5" to mean "L5.1 and L5.2", we could add it to choices and handle here.
-    # But user requirement says: "Replace L5 with L5.1 and L5.2".
+    to_run = resolve_levels(args.level)
 
     try:
         for lvl in to_run:
