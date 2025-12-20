@@ -455,7 +455,7 @@ class BenchmarkSuite:
         config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
         config.stage_b.separation["polyphonic_dominant_preset"].update({
             "overlap": 0.75,
-            "shift_range": [2, 5],
+            "shift_range": [2, 8],
             "overlap_candidates": [0.5, 0.75],
         })
         config.stage_b.polyphonic_peeling["force_on_mix"] = True
@@ -913,12 +913,13 @@ class BenchmarkSuite:
             ]
 
         config = PipelineConfig()
-        config.stage_b.separation['enabled'] = False
-        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        config.stage_b.separation['enabled'] = True
+        config.stage_b.separation['model'] = 'htdemucs'
+        config.stage_b.polyphonic_peeling["max_layers"] = 8
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC, allow_separation=True)
 
         m = self._save_run("L3", "old_macdonald_poly_full", res, gt)
 
@@ -980,7 +981,9 @@ class BenchmarkSuite:
             audio = np.mean(audio, axis=1)
 
         # 3. Configure Pipeline
-        config = PipelineConfig()
+        from backend.pipeline.config import PIANO_61KEY_CONFIG
+        import copy
+        config = copy.deepcopy(PIANO_61KEY_CONFIG)
         config.stage_b.separation['enabled'] = False
         config.stage_b.polyphonic_peeling["max_layers"] = 3
         # Enable all detectors
