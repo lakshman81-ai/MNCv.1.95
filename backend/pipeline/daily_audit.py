@@ -292,6 +292,29 @@ class DailyPipelineAudit:
 
         return level_run
 
+    def print_summary_table(self, results: List[LevelRun]) -> None:
+        print("\n" + "=" * 60)
+        print(f"{'LEVEL':<10} | {'STATUS':<10} | {'NOTE F1':<10} | {'NOTES PREDICTED':<15}")
+        print("-" * 60)
+        for res in results:
+            status = "PASS" if res.returncode == 0 else "FAIL"
+
+            f1 = "N/A"
+            pred_count = "N/A"
+
+            if res.accuracy and res.accuracy.get("summary_last_row"):
+                row = res.accuracy["summary_last_row"]
+                f1_val = row.get("note_f1")
+                if f1_val:
+                    try:
+                        f1 = f"{float(f1_val):.4f}"
+                    except ValueError:
+                        f1 = str(f1_val)
+                pred_count = row.get("predicted_count", "N/A")
+
+            print(f"{res.level:<10} | {status:<10} | {f1:<10} | {pred_count:<15}")
+        print("=" * 60 + "\n")
+
     def run(
         self,
         extra_args: Optional[List[str]] = None,
@@ -311,8 +334,10 @@ class DailyPipelineAudit:
         write_json(self.run_dir / "audit_index.json", index)
 
         all_ok = True
+        run_results = []
         for lvl in self.levels:
             res = self.run_level(lvl, extra_args=extra_args, timeout_sec=timeout_sec, env=env)
+            run_results.append(res)
             index["bench"].append({
                 "level": res.level,
                 "returncode": res.returncode,
@@ -325,6 +350,8 @@ class DailyPipelineAudit:
                 all_ok = False
                 if not self.continue_on_fail:
                     break
+
+        self.print_summary_table(run_results)
 
         index["status"] = "ok" if all_ok else "failed"
         write_json(self.run_dir / "audit_index.json", index)
@@ -345,8 +372,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--levels",
         nargs="*",
-        default=["L0", "L1"],
-        help="Benchmark levels to run in order. Stops on first failure unless --continue-on-fail.",
+        default=["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"],
+        help="Benchmark levels to run in order. Use --stop-on-fail to halt on the first error.",
     )
     p.add_argument(
         "--benchmark-module",
@@ -370,9 +397,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional timeout per level (0 = no timeout).",
     )
     p.add_argument(
-        "--continue-on-fail",
-        action="store_true",
-        help="Run all requested levels even if one fails (still reports failed overall).",
+        "--stop-on-fail",
+        dest="continue_on_fail",
+        action="store_false",
+        default=True,
+        help="Stop on first failure (default is to continue).",
     )
     p.add_argument(
         "--extra-arg",
