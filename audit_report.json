@@ -1,0 +1,65 @@
+[
+  {
+    "name": "Mono Clean",
+    "status": "success",
+    "notes": 0,
+    "beats": 0,
+    "contracts": {
+      "stage_c": {
+        "status": "pass"
+      },
+      "stage_a": {
+        "status": "pass"
+      },
+      "stage_b": {
+        "status": "pass"
+      },
+      "stage_d": {
+        "status": "pass"
+      }
+    },
+    "pipeline_version": "2.0.0"
+  },
+  {
+    "name": "Poly Chord",
+    "status": "success",
+    "notes": 0,
+    "beats": 0,
+    "contracts": {
+      "stage_c": {
+        "status": "pass"
+      },
+      "stage_a": {
+        "status": "pass"
+      },
+      "stage_b": {
+        "status": "pass"
+      },
+      "stage_d": {
+        "status": "pass"
+      }
+    },
+    "pipeline_version": "2.0.0"
+  },
+  {
+    "name": "Short Clip",
+    "status": "success",
+    "notes": 0,
+    "beats": 0,
+    "contracts": {
+      "stage_c": {
+        "status": "pass"
+      },
+      "stage_a": {
+        "status": "pass"
+      },
+      "stage_b": {
+        "status": "pass"
+      },
+      "stage_d": {
+        "status": "pass"
+      }
+    },
+    "pipeline_version": "2.0.0"
+  }
+]

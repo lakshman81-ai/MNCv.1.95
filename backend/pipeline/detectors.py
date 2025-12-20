@@ -918,7 +918,12 @@ class CREPEDetector(BasePitchDetector):
 
         except Exception as e:
             self._warn_once("crepe_error", f"CREPE inference failed: {e}")
-            return np.zeros((n_frames,), dtype=np.float32), np.zeros((n_frames,), dtype=np.float32)
+            # Fallback to ACF if CREPE fails (e.g. missing tensorflow or shape error)
+            # This ensures we always return *some* pitch data rather than silence.
+            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+            conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
+            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            return f0, conf
 
 
 # Alias for backwards compatibility
