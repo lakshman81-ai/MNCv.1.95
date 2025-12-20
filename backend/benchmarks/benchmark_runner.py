@@ -13,6 +13,7 @@ It validates algorithm selection (Stage B), records polyphonic diagnostics, and 
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import json
@@ -24,7 +25,7 @@ import warnings
 import tempfile
 import soundfile as sf
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from music21 import tempo, chord
 
 from backend.pipeline.config import PipelineConfig, InstrumentProfile
@@ -45,6 +46,16 @@ import music21
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("benchmark_runner")
+
+L5_OVERRIDE_FIELD_DOC = (
+    "Override keys mirror PipelineConfig: stage_b.separation.(enabled/model/overlap/shifts/"
+    "synthetic_model), stage_b.detectors.<name>.(enabled/fmin/fmax/hop_length), "
+    "stage_b.ensemble_weights.<name>, stage_b.polyphonic_peeling.(max_layers/max_harmonics/"
+    "mask_width/residual_flatness_stop/harmonic_snr_stop_db/iss_adaptive), "
+    "stage_b.melody_filtering.(fmin_hz/voiced_prob_threshold), stage_c.(confidence_threshold/"
+    "min_note_duration_ms_poly), and "
+    "stage_a.high_pass_filter.(cutoff_hz)."
+)
 
 
 def accuracy_benchmark_plan() -> Dict[str, Any]:
@@ -412,6 +423,75 @@ class BenchmarkSuite:
         self.output_dir = output_dir
         self.results = []
         os.makedirs(output_dir, exist_ok=True)
+
+    def _deep_merge_config(self, target: Any, updates: Dict[str, Any], path: str = "config") -> None:
+        """Recursively merge a dict of overrides into a PipelineConfig or nested dicts."""
+
+        if not isinstance(updates, dict):
+            raise ValueError("Overrides must be provided as a dict")
+
+        for key, value in updates.items():
+            if is_dataclass(target):
+                if not hasattr(target, key):
+                    logger.warning(f"Unknown override key {path}.{key} - skipping")
+                    continue
+                current = getattr(target, key)
+                container_type = "dataclass"
+            elif isinstance(target, dict):
+                current = target.get(key)
+                container_type = "dict"
+            else:
+                logger.warning(f"Cannot merge overrides into {path} (type={type(target)})")
+                continue
+
+            if isinstance(current, dict) and isinstance(value, dict):
+                self._deep_merge_config(current, value, path=f"{path}.{key}")
+            elif is_dataclass(current) and isinstance(value, dict):
+                self._deep_merge_config(current, value, path=f"{path}.{key}")
+            else:
+                if container_type == "dataclass":
+                    setattr(target, key, value)
+                else:
+                    target[key] = copy.deepcopy(value)
+
+    def _load_override_from_path(self, override_path: Optional[str]) -> Dict[str, Any]:
+        if not override_path:
+            return {}
+        with open(override_path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError("Override file must contain a JSON object")
+        return payload
+
+    def _prepare_l5_config(
+        self,
+        baseline_config: PipelineConfig,
+        overrides: Optional[Dict[str, Any]] = None,
+        override_path: Optional[str] = None,
+    ) -> PipelineConfig:
+        """Return an L5-ready config with optional inline/file overrides applied.
+
+        Commonly tuned fields for sweeps include:
+        - stage_b.separation: enabled/model/synthetic_model/overlap/shifts
+        - stage_b.detectors.<name>: enabled/fmin/fmax/hop_length
+        - stage_b.ensemble_weights.<name>
+        - stage_b.polyphonic_peeling: max_layers/max_harmonics/mask_width/
+          residual_flatness_stop/harmonic_snr_stop_db/iss_adaptive
+        - stage_b.melody_filtering: fmin_hz/voiced_prob_threshold
+        - stage_c: confidence_threshold/min_note_duration_ms_poly
+        - stage_a.high_pass_filter: cutoff_hz
+        """
+
+        config = copy.deepcopy(baseline_config)
+        merged_sources = [src for src in (overrides, self._load_override_from_path(override_path)) if src]
+
+        if merged_sources:
+            logger.info("Applying %d override payload(s) to L5 config", len(merged_sources))
+
+        for src in merged_sources:
+            self._deep_merge_config(config, src)
+
+        return config
 
     def _enforce_regression_thresholds(self, level: str, metrics: Dict[str, Any], profiling: Optional[Dict[str, Any]] = None):
         plan = accuracy_benchmark_plan()
@@ -953,11 +1033,15 @@ class BenchmarkSuite:
         except Exception as e:
             logger.error(f"L4 Failed: {e}")
 
-    def run_L5_1_kal_ho_na_ho(self):
+    def run_L5_1_kal_ho_na_ho(
+        self,
+        overrides: Optional[Dict[str, Any]] = None,
+        override_path: Optional[str] = None,
+    ):
         logger.info("Running L5.1: Kal Ho Na Ho")
         midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.1_kal_ho_na_ho.mid")
         if not os.path.exists(midi_path):
-             raise FileNotFoundError(f"L5.1 MIDI not found at {midi_path}")
+            raise FileNotFoundError(f"L5.1 MIDI not found at {midi_path}")
 
         # 1. Load Ground Truth
         score = music21.converter.parse(midi_path)
@@ -993,7 +1077,6 @@ class BenchmarkSuite:
 
         # 3. Configure Pipeline
         from backend.pipeline.config import PIANO_61KEY_CONFIG
-        import copy
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
@@ -1010,8 +1093,8 @@ class BenchmarkSuite:
 
         # Fix fmin for deep bass notes (MIDI 36 ~ 65Hz, safe margin 30Hz)
         for d in ["crepe", "swiftf0", "yin"]:
-             if d in config.stage_b.detectors:
-                 config.stage_b.detectors[d]["fmin"] = 30.0
+            if d in config.stage_b.detectors:
+                config.stage_b.detectors[d]["fmin"] = 30.0
         config.stage_b.melody_filtering["fmin_hz"] = 30.0
 
         # Optimize for Sine waves (synth)
@@ -1035,6 +1118,8 @@ class BenchmarkSuite:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
 
+        config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
+
         # 4. Run Pipeline
         res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
 
@@ -1042,11 +1127,15 @@ class BenchmarkSuite:
 
         logger.info(f"L5.1 Complete. F1: {m['note_f1']}")
 
-    def run_L5_2_tumhare_hi_rahenge(self):
+    def run_L5_2_tumhare_hi_rahenge(
+        self,
+        overrides: Optional[Dict[str, Any]] = None,
+        override_path: Optional[str] = None,
+    ):
         logger.info("Running L5.2: Tumhare Hi Rahenge")
         midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.2_tumhare_hi_rahenge.mid")
         if not os.path.exists(midi_path):
-             raise FileNotFoundError(f"L5.2 MIDI not found at {midi_path}")
+            raise FileNotFoundError(f"L5.2 MIDI not found at {midi_path}")
 
         # 1. Load Ground Truth
         score = music21.converter.parse(midi_path)
@@ -1088,6 +1177,8 @@ class BenchmarkSuite:
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
+
+        config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
         # 4. Run Pipeline
         res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
@@ -1173,7 +1264,41 @@ def main():
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
     parser.add_argument("--level", choices=["all", "L0", "L1", "L2", "L3", "L4", "L5", "L5.1", "L5.2"], default="all",
                         help="Run a specific benchmark level or all levels")
+    parser.add_argument(
+        "--l5_1_overrides",
+        help=f"Inline JSON overrides for L5.1 config. {L5_OVERRIDE_FIELD_DOC}",
+    )
+    parser.add_argument(
+        "--l5_1_config",
+        help="Path to JSON file with L5.1 config overrides (merged after inline overrides).",
+    )
+    parser.add_argument(
+        "--l5_2_overrides",
+        help=f"Inline JSON overrides for L5.2 config. {L5_OVERRIDE_FIELD_DOC}",
+    )
+    parser.add_argument(
+        "--l5_2_config",
+        help="Path to JSON file with L5.2 config overrides (merged after inline overrides).",
+    )
     args = parser.parse_args()
+
+    def _parse_override_json(raw: Optional[str], label: str) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON for {label}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{label} overrides must be a JSON object")
+        return parsed
+
+    try:
+        l5_1_overrides = _parse_override_json(args.l5_1_overrides, "L5.1 inline")
+        l5_2_overrides = _parse_override_json(args.l5_2_overrides, "L5.2 inline")
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
     runner = BenchmarkSuite(args.output)
 
@@ -1199,9 +1324,15 @@ def main():
             elif lvl == "L4":
                 runner.run_L4_real_songs()
             elif lvl == "L5.1":
-                runner.run_L5_1_kal_ho_na_ho()
+                runner.run_L5_1_kal_ho_na_ho(
+                    overrides=l5_1_overrides,
+                    override_path=args.l5_1_config,
+                )
             elif lvl == "L5.2":
-                runner.run_L5_2_tumhare_hi_rahenge()
+                runner.run_L5_2_tumhare_hi_rahenge(
+                    overrides=l5_2_overrides,
+                    override_path=args.l5_2_config,
+                )
     except Exception as e:
         logger.exception(f"Benchmark Suite Failed: {e}")
         # Make sure we still save what we have
