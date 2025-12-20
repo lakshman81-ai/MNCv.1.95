@@ -76,6 +76,7 @@ def _autocorr_pitch_per_frame(
     """
     Lightweight ACF pitch estimator: returns (f0, conf) per frame.
     conf ~ normalized ACF peak (0..1).
+    Vectorized for performance.
     """
     n_frames, frame_length = frames.shape
     f0 = np.zeros((n_frames,), dtype=np.float32)
@@ -89,32 +90,55 @@ def _autocorr_pitch_per_frame(
     lag_max = max(lag_min + 1, int(sr / max(fmin, 1e-6)))
     lag_max = min(lag_max, frame_length - 2)
 
+    if lag_min >= lag_max:
+        return f0, conf
+
+    # 1. Windowing and Centering
     win = np.hanning(frame_length).astype(np.float32)
+    windowed = frames * win  # Broadcasting (N, L)
+    means = np.mean(windowed, axis=1, keepdims=True)
+    centered = windowed - means
 
-    for i in range(n_frames):
-        x = frames[i] * win
-        x = x - np.mean(x)
-        denom = float(np.dot(x, x)) + 1e-12
-        if denom <= 1e-10:
-            continue
+    # 2. Energy Check
+    denoms = np.sum(centered**2, axis=1)
+    low_energy_mask = denoms <= 1e-10
 
-        ac = scipy.signal.correlate(x, x, mode="full", method="auto")
-        ac = ac[ac.size // 2 :]  # keep non-negative lags
-        ac0 = float(ac[0]) + 1e-12
+    # 3. Autocorrelation via FFT
+    # Pad to 2*L - 1 for linear convolution
+    n_fft = 2 * frame_length - 1
+    # Next power of 2 for speed
+    n_fft_p2 = 1 << (n_fft - 1).bit_length()
 
-        seg = ac[lag_min:lag_max]
-        if seg.size <= 0:
-            continue
+    spec = np.fft.rfft(centered, n=n_fft_p2, axis=1)
+    ac_all = np.fft.irfft(spec * np.conj(spec), n=n_fft_p2, axis=1)
 
-        k = int(np.argmax(seg)) + lag_min
-        peak = float(ac[k]) / ac0
-        peak = float(np.clip(peak, 0.0, 1.0))
+    # Keep only valid non-negative lags [0, frame_length-1]
+    ac_all = ac_all[:, :frame_length]
 
-        if peak <= 0.0:
-            continue
+    # 4. Peak Picking
+    # Normalize by energy (ac[0])
+    ac0 = ac_all[:, 0] + 1e-12
+    ac_norm = ac_all / ac0[:, None]
 
-        f0[i] = float(sr / k)
-        conf[i] = float(peak)
+    # Search for peak in [lag_min, lag_max]
+    # Mask out invalid regions for argmax
+    ac_search = ac_norm.copy()
+    ac_search[:, :lag_min] = -1.0
+    ac_search[:, lag_max:] = -1.0
+
+    k = np.argmax(ac_search, axis=1)
+    peaks = ac_search[np.arange(n_frames), k]
+
+    # Filter bad peaks / low energy
+    peaks = np.clip(peaks, 0.0, 1.0)
+    valid_peaks = (peaks > 0.0) & (~low_energy_mask)
+
+    # Compute F0
+    k_safe = np.maximum(k, 1)  # prevent div/0
+    estimated_f0 = sr / k_safe
+
+    f0 = np.where(valid_peaks, estimated_f0, 0.0).astype(np.float32)
+    conf = np.where(valid_peaks, peaks, 0.0).astype(np.float32)
 
     return f0, conf
 
