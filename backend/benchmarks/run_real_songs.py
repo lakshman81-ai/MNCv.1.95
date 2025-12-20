@@ -78,8 +78,15 @@ def load_ground_truth(song: str) -> List[Dict[str, Any]]:
         return json.load(f)["notes"]
 
 
-def run_song(song: str) -> Dict[str, Any]:
+def run_song(song: str, max_duration: float = None) -> Dict[str, Any]:
     gt = load_ground_truth(song)
+
+    if max_duration is not None:
+        gt = [n for n in gt if n['start_sec'] < max_duration]
+        for n in gt:
+            if n['end_sec'] > max_duration:
+                n['end_sec'] = max_duration
+
     # Build (midi_note, duration) list
     notes_dur = [(n['midi_note'], n['end_sec'] - n['start_sec']) for n in gt]
     sr = 44100
