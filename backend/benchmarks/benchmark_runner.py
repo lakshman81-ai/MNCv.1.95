@@ -986,9 +986,32 @@ class BenchmarkSuite:
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
-        config.stage_b.polyphonic_peeling["max_layers"] = 8
-        # Enable all detectors
-        for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
+        config.stage_b.separation['synthetic_model'] = True
+        config.stage_b.separation['overlap'] = 0.75
+        config.stage_b.separation['shifts'] = 2
+        config.stage_b.apply_instrument_profile = False
+        config.stage_c.apply_instrument_profile = False
+        config.stage_b.confidence_voicing_threshold = 0.4
+        config.stage_c.confidence_threshold = 0.15
+
+        # Optimize for Sine waves (synth)
+        config.stage_b.polyphonic_peeling["max_layers"] = 12
+        config.stage_b.polyphonic_peeling["max_harmonics"] = 1
+        config.stage_b.polyphonic_peeling["residual_flatness_stop"] = 1.0
+        config.stage_b.polyphonic_peeling["mask_width"] = 0.01
+        config.stage_b.polyphonic_peeling["min_mask_width"] = 0.005
+        config.stage_b.polyphonic_peeling["iss_adaptive"] = True
+
+        # Enable all detectors but favor CREPE/SwiftF0 for pure tones
+        config.stage_b.ensemble_weights = {
+            "swiftf0": 0.4,
+            "crepe": 0.4,
+            "yin": 0.1,
+            "sacf": 0.1,
+            "cqt": 0.0,
+            "rmvpe": 0.0,
+        }
+        for det in ["swiftf0", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
 
