@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 import json
 import dataclasses
+import copy
 from typing import Dict, Any
 
 from backend.pipeline.config import PIANO_61KEY_CONFIG, PipelineConfig
@@ -76,30 +77,31 @@ def run_scenario(name: str, audio_path: str, config: PipelineConfig) -> Dict[str
 def main():
     parser = argparse.ArgumentParser(description="Pipeline Audit Runner")
     parser.add_argument("--output", default="audit_report.json")
+    parser.add_argument("--output-root", default="results/audit_assets", help="Directory for synthetic assets")
     args = parser.parse_args()
 
     # Create synthetic assets
-    os.makedirs("audit_assets", exist_ok=True)
+    os.makedirs(args.output_root, exist_ok=True)
 
     # 1. Mono Clean
-    path_mono = "audit_assets/mono_sine.wav"
+    path_mono = os.path.join(args.output_root, "mono_sine.wav")
     y, sr = generate_sine_wave()
     sf.write(path_mono, y, sr)
 
     # 2. Poly Chord
-    path_poly = "audit_assets/poly_chord.wav"
+    path_poly = os.path.join(args.output_root, "poly_chord.wav")
     y, sr = generate_poly_chord()
     sf.write(path_poly, y, sr)
 
     # 3. Short Clip (BPM gate)
-    path_short = "audit_assets/short_clip.wav"
+    path_short = os.path.join(args.output_root, "short_clip.wav")
     y, sr = generate_sine_wave(duration=4.0) # < 6s
     sf.write(path_short, y, sr)
 
     results = []
 
     # Scenario 1: Mono Clean
-    cfg_mono = dataclasses.replace(PIANO_61KEY_CONFIG)
+    cfg_mono = copy.deepcopy(PIANO_61KEY_CONFIG)
     cfg_mono.stage_b.detectors["yin"]["enabled"] = True # Force robust detector
     # Ensure sine wave isn't gated by noise floor estimation
     cfg_mono.stage_a.noise_floor_estimation = {"method": "percentile", "percentile": 1}
@@ -114,7 +116,7 @@ def main():
     results.append(run_scenario("Mono Clean", path_mono, cfg_mono))
 
     # Scenario 2: Poly Chord
-    cfg_poly = dataclasses.replace(PIANO_61KEY_CONFIG)
+    cfg_poly = copy.deepcopy(PIANO_61KEY_CONFIG)
     # Use threshold segmentation for synthetic sine
     cfg_poly.stage_c.segmentation_method = {"method": "threshold"}
     cfg_poly.stage_a.noise_floor_estimation = {"method": "percentile", "percentile": 1}

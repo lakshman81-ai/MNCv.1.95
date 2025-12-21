@@ -1059,18 +1059,33 @@ class BenchmarkSuite:
 
         logger.info(f"L3 Complete. F1: {m['note_f1']}")
 
-    def run_L4_real_songs(self):
+    def run_L4_real_songs(self, use_preset: bool = False):
         logger.info("Running L4: Real Songs")
         # Reuse run_real_songs logic but integrate here
         # We need to adapt it to return metrics and save to our dir
 
         try:
+            from backend.pipeline.config import PIANO_61KEY_CONFIG
+
+            if use_preset:
+                base_config = copy.deepcopy(PIANO_61KEY_CONFIG)
+            else:
+                base_config = None  # run_real_song will use PipelineConfig() default
+
             # Happy Birthday
-            res_hb = run_real_song('happy_birthday', max_duration=30.0)
+            res_hb = run_real_song(
+                'happy_birthday',
+                max_duration=30.0,
+                config=base_config
+            )
             self._save_real_song_result("L4", "happy_birthday", res_hb)
 
             # Old Macdonald
-            res_om = run_real_song('old_macdonald', max_duration=30.0)
+            res_om = run_real_song(
+                'old_macdonald',
+                max_duration=30.0,
+                config=base_config
+            )
             self._save_real_song_result("L4", "old_macdonald", res_om)
 
         except Exception as e:
@@ -1177,6 +1192,7 @@ class BenchmarkSuite:
         self,
         overrides: Optional[Dict[str, Any]] = None,
         override_path: Optional[str] = None,
+        use_preset: bool = False,
     ):
         logger.info("Running L5.2: Tumhare Hi Rahenge")
         midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.2_tumhare_hi_rahenge.mid")
@@ -1216,7 +1232,12 @@ class BenchmarkSuite:
             ]
 
         # 3. Configure Pipeline
-        config = PipelineConfig()
+        if use_preset:
+            from backend.pipeline.config import PIANO_61KEY_CONFIG
+            config = copy.deepcopy(PIANO_61KEY_CONFIG)
+        else:
+            config = PipelineConfig()
+
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
         config.stage_b.separation['synthetic_model'] = False # Real song
@@ -1346,6 +1367,12 @@ def main():
         "--l5_2_config",
         help="Path to JSON file with L5.2 config overrides (merged after inline overrides).",
     )
+    parser.add_argument(
+        "--preset",
+        choices=["none", "piano_61key"],
+        default="none",
+        help="Use a specific config preset as the baseline (for L4/L5.2).",
+    )
     args = parser.parse_args()
 
     def _parse_override_json(raw: Optional[str], label: str) -> Optional[Dict[str, Any]]:
@@ -1369,6 +1396,7 @@ def main():
     runner = BenchmarkSuite(args.output)
 
     to_run = resolve_levels(args.level)
+    use_preset = (args.preset == "piano_61key")
 
     try:
         for lvl in to_run:
@@ -1381,7 +1409,7 @@ def main():
             elif lvl == "L3":
                 runner.run_L3_full_poly()
             elif lvl == "L4":
-                runner.run_L4_real_songs()
+                runner.run_L4_real_songs(use_preset=use_preset)
             elif lvl == "L5.1":
                 runner.run_L5_1_kal_ho_na_ho(
                     overrides=l5_1_overrides,
@@ -1391,6 +1419,7 @@ def main():
                 runner.run_L5_2_tumhare_hi_rahenge(
                     overrides=l5_2_overrides,
                     override_path=args.l5_2_config,
+                    use_preset=use_preset,
                 )
     except Exception as e:
         logger.exception(f"Benchmark Suite Failed: {e}")

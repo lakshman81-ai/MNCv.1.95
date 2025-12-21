@@ -23,10 +23,11 @@ does not rely on external MIDI or audio files.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -78,7 +79,11 @@ def load_ground_truth(song: str) -> List[Dict[str, Any]]:
         return json.load(f)["notes"]
 
 
-def run_song(song: str, max_duration: float = None) -> Dict[str, Any]:
+def run_song(
+    song: str,
+    max_duration: Optional[float] = None,
+    config: Optional[PipelineConfig] = None,
+) -> Dict[str, Any]:
     gt = load_ground_truth(song)
 
     if max_duration is not None:
@@ -93,7 +98,11 @@ def run_song(song: str, max_duration: float = None) -> Dict[str, Any]:
     audio = synthesize_audio(notes_dur, sr=sr)
 
     # Construct StageAOutput manually
-    config = PipelineConfig()
+    if config is not None:
+        config = copy.deepcopy(config)
+    else:
+        config = PipelineConfig()
+
     # disable separation for synthetic audio
     config.stage_b.separation['enabled'] = False
     # Tune Stage C for synthetic audio (tight segmentation)
