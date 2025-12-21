@@ -1,0 +1,19 @@
+{
+  "stage_b": {
+    "polyphonic_peeling": {
+      "max_harmonics": 20,
+      "residual_flatness_stop": 0.0,
+      "harmonic_snr_stop_db": -60.0,
+      "max_layers": 8
+    },
+    "ensemble_weights": {
+      "crepe": 0.4,
+      "swiftf0": 0.4,
+      "yin": 0.2
+    }
+  },
+  "stage_c": {
+    "confidence_threshold": 0.05,
+    "min_note_duration_ms_poly": 40.0
+  }
+}
