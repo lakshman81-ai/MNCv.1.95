@@ -37,7 +37,9 @@ from backend.pipeline.stage_a import load_and_preprocess
 from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory, quantize_notes
 from backend.pipeline.stage_d import quantize_and_render
-from backend.benchmarks.metrics import note_f1, onset_offset_mae, dtw_note_f1, dtw_onset_error_ms
+from backend.benchmarks.metrics import (
+    note_f1, onset_offset_mae, dtw_note_f1, dtw_onset_error_ms, compute_symptom_metrics
+)
 from backend.benchmarks.run_real_songs import run_song as run_real_song
 from backend.benchmarks.ladder.generators import generate_benchmark_example
 from backend.benchmarks.ladder.synth import midi_to_wav_synth
@@ -698,6 +700,7 @@ class BenchmarkSuite:
         if dtw_onset_ms is not None and np.isnan(dtw_onset_ms):
             dtw_onset_ms = None
 
+        symptoms = compute_symptom_metrics(pred_list)
         metrics = {
             "level": level,
             "name": name,
@@ -711,6 +714,8 @@ class BenchmarkSuite:
             "pitch_jump_rate_cents_sec": pitch_jump_rate,
             "voicing_ratio": voicing_ratio,
             "note_density": note_density,
+            # Merge symptom metrics for tuner visibility
+            **symptoms,
         }
         # Save JSONs
         base_path = os.path.join(self.output_dir, f"{level}_{name}")
@@ -1290,7 +1295,9 @@ class BenchmarkSuite:
         latest_path = os.path.join("results", "benchmark_latest.json")
 
         # CSV
-        header = ["level", "name", "note_f1", "onset_mae_ms", "predicted_count", "gt_count"]
+        header = ["level", "name", "note_f1", "onset_mae_ms", "predicted_count", "gt_count",
+                  "fragmentation_score", "note_count_per_10s", "median_note_len_ms",
+                  "octave_jump_rate", "voiced_ratio", "note_count"]
         with open(summary_path, "w") as f:
             f.write(",".join(header) + "\n")
             for r in self.results:
