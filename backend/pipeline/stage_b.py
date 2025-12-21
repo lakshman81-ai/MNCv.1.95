@@ -303,8 +303,14 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") 
     Resolve separation strategy and track which path actually executed.
     Returns (stems, diagnostics).
     """
+    sep_enabled = b_conf.separation.get("enabled", True)
+    # Patch 6: explicit auto handling
+    is_auto = (isinstance(sep_enabled, str) and sep_enabled.lower() == "auto")
+    should_run = bool(sep_enabled)  # True or "auto" are truthy
+
     diag = {
-        "requested": bool(b_conf.separation.get("enabled", True)),
+        "requested": sep_enabled,
+        "is_auto": is_auto,
         "synthetic_requested": bool(b_conf.separation.get("synthetic_model", False)),
         "mode": "disabled",
         "synthetic_ran": False,
@@ -316,7 +322,7 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") 
         "shift_range": None,
     }
 
-    if not diag["requested"]:
+    if not should_run:
         return stage_a_out.stems, diag
 
     if len(stage_a_out.stems) > 1 and any(k != "mix" for k in stage_a_out.stems.keys()):
@@ -384,6 +390,9 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") 
         } | {"mix": mix_stem}, diag
 
     diag["mode"] = "passthrough"
+    if is_auto:
+        diag["fallback_reason"] = "htdemucs_failed_or_missing_in_auto"
+
     return stage_a_out.stems, diag
 
 def _arrays_to_timeline(
@@ -800,6 +809,16 @@ class MultiVoiceTracker:
         return updated_pitches.copy(), updated_confs.copy()
 
 
+def _validate_config_keys(name: str, cfg: dict, allowed: set[str], pipeline_logger: Optional[Any] = None) -> None:
+    unknown = set(cfg.keys()) - allowed
+    if unknown:
+        msg = f"Config unknown keys in {name}: {sorted(list(unknown))}"
+        if pipeline_logger:
+            pipeline_logger.log_event("stage_b", "config_unknown_keys", payload={"section": name, "keys": sorted(list(unknown))})
+        else:
+            logger.warning(msg)
+
+
 def extract_features(
     stage_a_out: StageAOutput,
     config: Optional[PipelineConfig] = None,
@@ -836,6 +855,19 @@ def extract_features(
     detector_cfgs = deepcopy(b_conf.detectors)
     weights_eff = dict(b_conf.ensemble_weights)
     melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
+
+    # Patch 1C: Filter weights for enabled detectors only
+    enabled_dets = {k for k, v in detector_cfgs.items() if v.get("enabled", False)}
+    weights_eff = {k: v for k, v in weights_eff.items() if k in enabled_dets}
+
+    # Patch 7: Config Validator
+    common_keys = {"enabled", "fmin", "fmax", "hop_length", "frame_length", "threshold"}
+    _validate_config_keys("detectors.crepe", detector_cfgs.get("crepe", {}),
+                          common_keys | {"model_capacity", "step_ms", "confidence_threshold", "conf_threshold"}, pipeline_logger)
+    _validate_config_keys("detectors.yin", detector_cfgs.get("yin", {}),
+                          common_keys | {"enable_multires_f0", "enable_octave_correction", "octave_jump_penalty", "trough_threshold"}, pipeline_logger)
+    _validate_config_keys("detectors.swiftf0", detector_cfgs.get("swiftf0", {}),
+                          common_keys | {"confidence_threshold", "n_fft"}, pipeline_logger)
 
     # Apply Optional nested overrides first
     nested = profile_special.get("stage_b_detectors") or {}

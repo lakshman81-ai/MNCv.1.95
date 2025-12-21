@@ -606,8 +606,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         nf = 0.0
 
     if nf > 0.0:
-        # require ~+6 dB above estimated noise floor
-        min_rms = max(min_rms, nf * (10 ** (6.0 / 20.0)))
+        # require ~+6 dB above estimated noise floor (Patch 5B)
+        margin = float(_get(config, "stage_c.velocity_map.noise_floor_db_margin", 6.0))
+        min_rms = max(min_rms, nf * (10 ** (margin / 20.0)))
 
     # Build list of timelines to process.
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]

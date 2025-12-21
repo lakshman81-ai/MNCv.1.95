@@ -251,6 +251,11 @@ class StageCConfig:
             "stay_bonus": 0.05,
             "silence_bias": 0.1,
             "energy_weight": 0.35,
+            # Validation defaults (Patch 1B)
+            "min_onset_frames": 2,
+            "release_frames": 2,
+            "time_merge_frames": 1,
+            "split_semitone": 0.7,
         }
     )
 
@@ -296,6 +301,7 @@ class StageCConfig:
             "max_db": -4.0,
             "min_vel": 20.0,
             "max_vel": 105.0,
+            "noise_floor_db_margin": 6.0,  # (Patch 5B)
         }
     )
 
@@ -581,32 +587,41 @@ PIANO_61KEY_CONFIG = PipelineConfig(
     stage_a=StageAConfig(
         target_sample_rate=22050,
         silence_trimming={"enabled": True, "top_db": 40.0},
-        high_pass_filter={"enabled": True, "cutoff_hz": 60.0, "order": 4},
+        high_pass_filter={"enabled": True, "cutoff_hz": 50.0, "order": 2},
         dc_offset_removal=True,
-        peak_limiter={"enabled": True, "ceiling_db": -1.0, "mode": "tanh", "drive": 2.5},
+        peak_limiter={"enabled": True, "ceiling_db": -1.0, "mode": "soft", "drive": 1.2},
         bpm_detection={"enabled": True, "tightness": 100},
     ),
     stage_b=StageBConfig(
         confidence_voicing_threshold=0.5,
         confidence_priority_floor=0.5,
-        pitch_disagreement_cents=70.0,
-        ensemble_weights={"swiftf0": 0.5, "sacf": 0.3, "cqt": 0.2, "yin": 0.1, "crepe": 1.0},
+        pitch_disagreement_cents=50.0,
+        ensemble_weights={"swiftf0": 0.6, "sacf": 0.2, "cqt": 0.3, "yin": 0.1, "crepe": 0.2},
+        separation={
+            "enabled": "auto",
+            "model": "htdemucs",
+            "synthetic_model": False,
+            "overlap": 0.25,
+            "shifts": 1,
+            "harmonic_masking": {"enabled": True, "mask_width": 0.02, "n_harmonics": 12}
+        },
         detectors={
             "swiftf0": {"enabled": True, "fmin": 60.0, "fmax": 2000.0, "confidence_threshold": 0.9},
             "sacf":    {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "window_size": 4096, "threshold": 0.3},
             "cqt":     {"enabled": True, "fmin": 60.0, "fmax": 4000.0, "bins_per_octave": 48, "n_bins": 240, "max_peaks": 8},
-            "yin":     {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1, "enable_multires_f0": True},
+            "yin":     {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1, "enable_multires_f0": True, "enable_octave_correction": True, "octave_jump_penalty": 0.6},
             "rmvpe":   {"enabled": False},
             "crepe":   {"enabled": True, "model_capacity": "small", "confidence_threshold": 0.5},
         },
         melody_filtering={
              "median_window": 7,
-             "voiced_prob_threshold": 0.0,
-             "rms_gate_db": -40.0,
+             "voiced_prob_threshold": 0.45,
+             "rms_gate_db": -45.0,
         },
     ),
     stage_c=StageCConfig(
-        min_note_duration_ms=50.0,
+        min_note_duration_ms=35.0,
+        min_note_duration_ms_poly=50.0,
         segmentation_method={
             "method": "hmm",
             "min_onset_frames": 2,
