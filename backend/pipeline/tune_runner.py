@@ -524,7 +524,7 @@ def run_benchmark_inprocess(
 
     # Construct args
     # Note: --output must be passed.
-    cmd_args = [sys.executable, "-m", benchmark_module, "--level", level, "--output", str(outdir)]
+    cmd_args = [benchmark_module, "--level", level, "--output", str(outdir)]
     if use_preset:
         cmd_args.extend(["--preset", "piano_61key"])
 
