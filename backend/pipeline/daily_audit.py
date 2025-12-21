@@ -235,8 +235,22 @@ class DailyPipelineAudit:
         }
         write_json(self.run_dir / "manifest.json", manifest)
 
-    def _snapshot_results(self, dst: Path) -> None:
-        snapshot_results_light(self.results_root, dst)
+    def _snapshot_results(self, dst: Path, specific_runs: List[Path]) -> None:
+        ensure_dir(dst)
+
+        # 1. Copy summary artifacts (always relevant)
+        for fname in ["summary.csv", "leaderboard.json", "benchmark_latest.json", "summary.json"]:
+            src = self.results_root / fname
+            if src.exists():
+                shutil.copy2(src, dst)
+
+        # 2. Copy only the specific new runs created during this level
+        for run_dir in specific_runs:
+            if run_dir.exists() and run_dir.is_dir():
+                dst_run = dst / run_dir.name
+                if dst_run.exists():
+                    shutil.rmtree(dst_run)
+                shutil.copytree(run_dir, dst_run)
 
     def run_level(
         self,
@@ -252,6 +266,8 @@ class DailyPipelineAudit:
         stderr_path = level_dir / f"benchmark_{level}.stderr.txt"
 
         cmd = [sys.executable, "-m", self.benchmark_module, "--level", level] + extra_args
+
+        # Snapshot state before run to identify new artifacts
         before_runs = sorted([p for p in self.results_root.glob("run_*") if p.is_dir()])
 
         rc = run_subprocess(
@@ -263,11 +279,13 @@ class DailyPipelineAudit:
             env=env,
         )
 
-        snapshot_dir = level_dir / "results_snapshot"
-        self._snapshot_results(snapshot_dir)
-        accuracy = extract_accuracy_from_snapshot(snapshot_dir)
-
+        # Identify new runs
         new_runs = _find_new_run_dirs(self.results_root, before_runs)
+
+        snapshot_dir = level_dir / "results_snapshot"
+        self._snapshot_results(snapshot_dir, specific_runs=new_runs)
+
+        accuracy = extract_accuracy_from_snapshot(snapshot_dir)
         accuracy["new_run_dirs_created"] = [str(p) for p in new_runs]
 
         level_run = LevelRun(
@@ -358,6 +376,12 @@ def parse_args() -> argparse.Namespace:
         default="results",
         help="Where benchmark_runner writes outputs (default: results).",
     )
+    # Alias --output-root to --results-root for consistency with WI requirements
+    p.add_argument(
+        "--output-root",
+        dest="results_root",
+        help="Alias for --results-root",
+    )
     p.add_argument(
         "--audit-root",
         default=str(Path("results") / "audit"),
@@ -379,6 +403,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Extra arg to pass to benchmark_runner (repeatable).",
+    )
+    p.add_argument(
+        "--light-snapshot",
+        action="store_true",
+        help="Deprecated: now standard behavior (smart snapshot).",
     )
     return p.parse_args()
 
