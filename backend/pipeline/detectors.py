@@ -896,7 +896,8 @@ class CREPEDetector(BasePitchDetector):
         super().__init__(sr=sr, hop_length=hop_length, n_fft=n_fft, **kwargs)
         self.model_capacity = str(kwargs.get("model_capacity", "small"))
         self.step_ms = int(kwargs.get("step_ms", 10))
-        self.conf_threshold = float(kwargs.get("conf_threshold", 0.5))
+        # Support both keys (Patch 1A)
+        self.conf_threshold = float(kwargs.get("confidence_threshold", kwargs.get("conf_threshold", 0.5)))
 
     def predict(self, audio: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
         try:
