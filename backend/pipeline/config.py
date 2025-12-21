@@ -124,7 +124,7 @@ class StageBConfig:
             "sacf": 0.3,
             "cqt": 0.2,
             "yin": 0.3,
-            "rmvpe": 0.5,   # Dominant for vocals / cello profiles
+            "rmvpe": 0.5,
             "crepe": 1.0,   # Boost Crepe as it is now installed and generally superior
         }
     )
