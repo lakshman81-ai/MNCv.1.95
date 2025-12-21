@@ -678,8 +678,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                         scored_candidates = []
                         for p, c in contestants:
                             score = c
-                            # Bonus for vocal band
-                            if 80.0 <= p <= 1000.0:
+                            # Bonus for vocal band - Expanded to 1400Hz (approx F6) for female vocals/flutes
+                            if 80.0 <= p <= 1400.0:
                                 score += 0.05
 
                             # Bonus for continuity
@@ -747,8 +747,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     for fp in tl:
                         if fp.pitch_hz > 0:
                             s = fp.confidence
-                            # Boost vocal range (80-1000Hz)
-                            if 80.0 <= fp.pitch_hz <= 1000.0:
+                            # Boost vocal range (80-1400Hz)
+                            if 80.0 <= fp.pitch_hz <= 1400.0:
                                  s *= 1.2
                             score += s
 

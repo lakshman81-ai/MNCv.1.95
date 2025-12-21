@@ -1228,9 +1228,9 @@ def extract_features(
                     # Apply penalty for jumps from previous frame's selected pitch
                     if prev_p > 0.0:
                          cents = abs(1200.0 * np.log2(p / prev_p))
-                         # Penalty: 0.001 per cent -> 0.1 per semitone (100 cents)
-                         # This helps stick to the melody line
-                         penalty = cents * 0.001
+                         # Penalty: 0.0005 per cent -> 0.05 per semitone
+                         # Reduced from 0.001 to strictly punish octave jumps but allow melodic steps
+                         penalty = cents * 0.0005
                          score -= penalty
 
                     if score > best_score:

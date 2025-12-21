@@ -652,6 +652,42 @@ class BenchmarkSuite:
         dtw_f1 = dtw_note_f1(pred_list, gt, onset_tol=0.05)
         dtw_onset_ms = dtw_onset_error_ms(pred_list, gt)
 
+        # Diagnostic Metrics for L5.*
+        # % frames within vocal band (80-1400Hz)
+        total_frames = 0
+        vocal_frames = 0
+        jump_cents_sum = 0.0
+        jump_count = 0
+        last_p = 0.0
+
+        # We need the timeline from stage_b_out or transcription for frame-level metrics
+        # Use stage_b_out.timeline if available
+        timeline = getattr(res.get("stage_b_out"), "timeline", []) or []
+        for fp in timeline:
+            if fp.pitch_hz > 0:
+                total_frames += 1
+                if 80.0 <= fp.pitch_hz <= 1400.0:
+                    vocal_frames += 1
+
+                if last_p > 0:
+                    cents = abs(1200.0 * np.log2(fp.pitch_hz / last_p))
+                    jump_cents_sum += cents
+                    jump_count += 1
+                last_p = fp.pitch_hz
+            else:
+                last_p = 0.0
+
+        vocal_band_ratio = (vocal_frames / total_frames) if total_frames > 0 else 0.0
+        # Average pitch jump per second (assuming ~100 frames/sec, jump is per frame)
+        # We want jumps/sec? Or avg jump size?
+        # User asked: "pitch jump rate (cents/sec)" -> implies accumulating cents per second
+        # If we sum cents over the whole clip duration:
+        duration_sec = float(res.get("stage_b_out").meta.duration_sec) if res.get("stage_b_out") else 1.0
+        pitch_jump_rate = (jump_cents_sum / duration_sec) if duration_sec > 0 else 0.0
+
+        voicing_ratio = (total_frames * 0.01) / duration_sec if duration_sec > 0 else 0.0 # Approx
+        note_density = len(pred_list) / duration_sec if duration_sec > 0 else 0.0
+
         # Normalize NaNs for downstream checks/serialization
         if np.isnan(f1):
             f1 = 0.0
@@ -670,7 +706,11 @@ class BenchmarkSuite:
             "dtw_note_f1": dtw_f1,
             "dtw_onset_error_ms": dtw_onset_ms,
             "predicted_count": len(pred_list),
-            "gt_count": len(gt)
+            "gt_count": len(gt),
+            "vocal_band_ratio": vocal_band_ratio,
+            "pitch_jump_rate_cents_sec": pitch_jump_rate,
+            "voicing_ratio": voicing_ratio,
+            "note_density": note_density,
         }
         # Save JSONs
         base_path = os.path.join(self.output_dir, f"{level}_{name}")
