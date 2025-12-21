@@ -103,34 +103,52 @@ def _autocorr_pitch_per_frame(
     # 3. Compute energy (denom) for later validation
     denom = np.sum(x**2, axis=1) + 1e-12
 
-    # 4. Vectorized Autocorrelation using FFT
-    # Pad to >= 2*L - 1 to get linear convolution
+    # 4. Vectorized Autocorrelation using FFT (Batched to manage memory)
+    # Pad to >= 2*L - 1 to get linear convolution (Wiener-Khinchin)
     n_fft = 2 ** int(np.ceil(np.log2(2 * frame_length - 1)))
-    X = np.fft.rfft(x, n=n_fft, axis=1)
-    P = X * np.conj(X)
-    ac = np.fft.irfft(P, n=n_fft, axis=1)
 
-    # 5. Extract non-negative lags (0 to frame_length-1)
-    # The first 'frame_length' samples of irfft result correspond to lags 0..L-1
-    ac = ac[:, :frame_length]
-    ac0 = ac[:, 0] + 1e-12
+    # Process in chunks to avoid OOM on long audio files
+    BATCH_SIZE = 2000
 
-    # 6. Peak picking in the valid lag range
-    seg = ac[:, lag_min:lag_max]
-    if seg.shape[1] == 0:
-        return f0, conf
+    for start_idx in range(0, n_frames, BATCH_SIZE):
+        end_idx = min(start_idx + BATCH_SIZE, n_frames)
+        x_batch = x[start_idx:end_idx]
+        denom_batch = denom[start_idx:end_idx]
 
-    k_seg = np.argmax(seg, axis=1)
-    k = k_seg + lag_min
-    peaks = ac[np.arange(n_frames), k]
+        # FFT based autocorrelation
+        X = np.fft.rfft(x_batch, n=n_fft, axis=1)
+        P = X * np.conj(X)
+        ac = np.fft.irfft(P, n=n_fft, axis=1)
 
-    # 7. Compute confidence and filter
-    peaks_norm = np.clip(peaks / ac0, 0.0, 1.0)
-    valid = (denom > 1e-10) & (peaks_norm > 0.0)
+        # 5. Extract non-negative lags (0 to frame_length-1)
+        # The first 'frame_length' samples of irfft result correspond to lags 0..L-1
+        ac = ac[:, :frame_length]
+        ac0 = ac[:, 0] + 1e-12
 
-    # 8. Assign
-    f0[valid] = sr / k[valid]
-    conf[valid] = peaks_norm[valid]
+        # 6. Peak picking in the valid lag range
+        seg = ac[:, lag_min:lag_max]
+        if seg.shape[1] == 0:
+            continue
+
+        k_seg = np.argmax(seg, axis=1)
+        k = k_seg + lag_min
+        # Advanced indexing relative to the batch
+        peaks = ac[np.arange(len(x_batch)), k]
+
+        # 7. Compute confidence and filter
+        peaks_norm = np.clip(peaks / ac0, 0.0, 1.0)
+        valid = (denom_batch > 1e-10) & (peaks_norm > 0.0)
+
+        # 8. Assign to global arrays
+        # Map batch indices to global indices
+        f0_batch = np.zeros_like(peaks_norm)
+        conf_batch = np.zeros_like(peaks_norm)
+
+        f0_batch[valid] = sr / k[valid]
+        conf_batch[valid] = peaks_norm[valid]
+
+        f0[start_idx:end_idx] = f0_batch
+        conf[start_idx:end_idx] = conf_batch
 
     return f0, conf
 
