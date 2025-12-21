@@ -8,6 +8,7 @@ Design goals:
 - Uses in-process execution of benchmark_runner with monkeypatched PIANO_61KEY_CONFIG
 - Isolated output per level/iteration under results/tuning/<date>/...
 - Robust metric discovery (metrics.json or fallback)
+- Strict dependency management
 """
 
 from __future__ import annotations
@@ -23,9 +24,62 @@ import runpy
 import sys
 import time
 import traceback
+import subprocess
+import importlib.util
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# -----------------------------
+# Dependency Management
+# -----------------------------
+
+REQUIRED_PACKAGES = [
+    "numpy", "scipy", "librosa", "soundfile", "torch", "torchaudio",
+    "demucs", "crepe", "music21"
+]
+
+def check_dependencies(strict: bool = False, auto_install: bool = True) -> None:
+    """
+    Check for required packages.
+    If strict=True:
+      - Attempt auto-install if missing.
+      - Raise RuntimeError if still missing.
+    Else:
+      - Log warning if missing.
+    """
+    missing = []
+    for pkg in REQUIRED_PACKAGES:
+        if importlib.util.find_spec(pkg) is None:
+            missing.append(pkg)
+
+    if not missing:
+        return
+
+    print(f"[{'STRICT' if strict else 'WARN'}] Missing packages: {missing}")
+
+    if strict:
+        if auto_install:
+            print("Attempting auto-install via pip...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to install missing packages {missing}: {e}")
+
+            # Re-verify
+            still_missing = []
+            for pkg in missing:
+                if importlib.util.find_spec(pkg) is None:
+                    still_missing.append(pkg)
+
+            if still_missing:
+                raise RuntimeError(f"Critical: Packages still missing after install: {still_missing}")
+            print("Dependencies installed successfully.")
+        else:
+            raise RuntimeError(f"Missing required packages: {missing}. Auto-install disabled.")
+    else:
+        print("Proceeding despite missing dependencies (non-strict mode).")
 
 
 # -----------------------------
@@ -47,6 +101,13 @@ def write_json(path: Path, obj: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
+
+
+def append_jsonl(path: Path, obj: Any) -> None:
+    """Append a single JSON line to a file."""
+    ensure_dir(path.parent)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
 
 
 def read_json(path: Path) -> Optional[Any]:
@@ -275,6 +336,7 @@ def propose_candidate_overrides(
     """
     Guided search: generate a small set of candidate override dicts.
     Returns ordered candidates (best-first heuristically).
+    STRICT CONSTRAINT: Max 3 parameter changes per candidate vs base_overrides.
     """
     cands: List[Dict[str, Any]] = []
 
@@ -291,6 +353,9 @@ def propose_candidate_overrides(
     def bump(d: Dict[str, Any], path: str, delta: float, floor: Optional[float] = None, ceil: Optional[float] = None):
         cur = d.get(path, None)
         if cur is None or not is_number(cur):
+            # Treat missing as 0.0 or sensible default for purpose of bump if needed,
+            # but usually we want to modify existing. If missing, we might assume a default.
+            # For this simple tuner, we'll try to find it in base or assume reasonable default
             return
         v = float(cur) + float(delta)
         if floor is not None:
@@ -299,95 +364,81 @@ def propose_candidate_overrides(
             v = min(float(ceil), v)
         d[path] = v
 
-    # Start from base
-    base = dict(base_overrides)
+    # --- Baseline defaults for reference (to allow bumping if not in base) ---
+    # We populate these in a temp dict to perform logic, but valid candidate
+    # MUST contain the values.
+    # The 'base' here is strictly what we carry over.
 
-    # Ensure baseline has reasonable defaults if not already present
-    base.setdefault("stage_b.voice_tracking.smoothing", 0.0)
-    base.setdefault("stage_c.confidence_threshold", None)  # leave None unless we can infer
-    base.setdefault("stage_c.gap_tolerance_s", None)
-    base.setdefault("stage_c.pitch_tolerance_cents", None)
-    base.setdefault("stage_c.min_note_duration_ms_poly", None)
-    base.setdefault("stage_c.polyphony_filter.mode", None)
-    base.setdefault("stage_b.polyphonic_peeling.iss_adaptive", None)
-    base.setdefault("stage_c.segmentation_method.transition_penalty", None)
+    # Helper to create a candidate with limited changes
+    def make_cand():
+        # returns a copy of base
+        return dict(base_overrides)
 
-    # Candidate 1: Stabilize fragmentation (most common for L5.*)
+    # Candidate 1: Fragmentation A (Durations) - Max 2 knobs
     if fragmentation_high:
-        c1 = dict(base_overrides)
-        # poly min duration bump (if present)
-        if "stage_c.min_note_duration_ms_poly" in c1 and is_number(c1["stage_c.min_note_duration_ms_poly"]):
-            bump(c1, "stage_c.min_note_duration_ms_poly", +20.0, floor=40.0, ceil=140.0)
-        else:
-            c1["stage_c.min_note_duration_ms_poly"] = 70.0
+        c = make_cand()
+        # 1. Min duration
+        c.setdefault("stage_c.min_note_duration_ms_poly", 70.0)
+        bump(c, "stage_c.min_note_duration_ms_poly", +20.0, floor=40.0, ceil=140.0)
 
-        # confidence up a touch
-        if "stage_c.confidence_threshold" in c1 and is_number(c1["stage_c.confidence_threshold"]):
-            bump(c1, "stage_c.confidence_threshold", +0.03, floor=0.05, ceil=0.60)
-        else:
-            c1["stage_c.confidence_threshold"] = 0.18
+        # 2. Gap tolerance
+        c.setdefault("stage_c.gap_tolerance_s", 0.07)
+        bump(c, "stage_c.gap_tolerance_s", +0.02, floor=0.01, ceil=0.20)
 
-        # gap tolerance up a touch
-        if "stage_c.gap_tolerance_s" in c1 and is_number(c1["stage_c.gap_tolerance_s"]):
-            bump(c1, "stage_c.gap_tolerance_s", +0.02, floor=0.01, ceil=0.20)
-        else:
-            c1["stage_c.gap_tolerance_s"] = 0.07
+        cands.append(c)
 
-        # smoothing up
-        if "stage_b.voice_tracking.smoothing" in c1 and is_number(c1["stage_b.voice_tracking.smoothing"]):
-            bump(c1, "stage_b.voice_tracking.smoothing", +0.10, floor=0.0, ceil=0.95)
-        else:
-            c1["stage_b.voice_tracking.smoothing"] = 0.4
+    # Candidate 2: Fragmentation B (Confidence/Smoothing) - Max 2 knobs
+    if fragmentation_high:
+        c = make_cand()
+        # 1. Confidence
+        c.setdefault("stage_c.confidence_threshold", 0.18)
+        bump(c, "stage_c.confidence_threshold", +0.03, floor=0.05, ceil=0.60)
 
-        # poly filter: try decomposed melody first for L5.*
-        if level.startswith("L5"):
-            c1["stage_c.polyphony_filter.mode"] = "decomposed_melody"
+        # 2. Smoothing
+        c.setdefault("stage_b.voice_tracking.smoothing", 0.4)
+        bump(c, "stage_b.voice_tracking.smoothing", +0.10, floor=0.0, ceil=0.95)
 
-        cands.append(c1)
+        cands.append(c)
 
-    # Candidate 2: Improve recall (if too sparse)
+    # Candidate 3: Recall (Confidence/PitchTol) - Max 3 knobs
     if recall_low:
-        c2 = dict(base_overrides)
-        # confidence down a touch
-        if "stage_c.confidence_threshold" in c2 and is_number(c2["stage_c.confidence_threshold"]):
-            bump(c2, "stage_c.confidence_threshold", -0.03, floor=0.02, ceil=0.60)
-        else:
-            c2["stage_c.confidence_threshold"] = 0.10
+        c = make_cand()
+        # 1. Confidence
+        c.setdefault("stage_c.confidence_threshold", 0.10)
+        bump(c, "stage_c.confidence_threshold", -0.03, floor=0.02, ceil=0.60)
 
-        # poly min duration down a touch
-        if "stage_c.min_note_duration_ms_poly" in c2 and is_number(c2["stage_c.min_note_duration_ms_poly"]):
-            bump(c2, "stage_c.min_note_duration_ms_poly", -10.0, floor=20.0, ceil=140.0)
-        else:
-            c2["stage_c.min_note_duration_ms_poly"] = 50.0
+        # 2. Min duration
+        c.setdefault("stage_c.min_note_duration_ms_poly", 50.0)
+        bump(c, "stage_c.min_note_duration_ms_poly", -10.0, floor=20.0, ceil=140.0)
 
-        # pitch tolerance up
-        if "stage_c.pitch_tolerance_cents" in c2 and is_number(c2["stage_c.pitch_tolerance_cents"]):
-            bump(c2, "stage_c.pitch_tolerance_cents", +10.0, floor=20.0, ceil=120.0)
-        else:
-            c2["stage_c.pitch_tolerance_cents"] = 60.0
+        # 3. Pitch Tolerance
+        c.setdefault("stage_c.pitch_tolerance_cents", 60.0)
+        bump(c, "stage_c.pitch_tolerance_cents", +10.0, floor=20.0, ceil=120.0)
 
-        cands.append(c2)
+        cands.append(c)
 
-    # Candidate 3: Reduce octave chaos
+    # Candidate 4: Octave Stability - Max 1 knob
     if octave_high:
-        c3 = dict(base_overrides)
-        if "stage_b.voice_tracking.smoothing" in c3 and is_number(c3["stage_b.voice_tracking.smoothing"]):
-            bump(c3, "stage_b.voice_tracking.smoothing", +0.15, floor=0.0, ceil=0.95)
-        else:
-            c3["stage_b.voice_tracking.smoothing"] = 0.55
-        cands.append(c3)
+        c = make_cand()
+        c.setdefault("stage_b.voice_tracking.smoothing", 0.55)
+        bump(c, "stage_b.voice_tracking.smoothing", +0.15, floor=0.0, ceil=0.95)
+        cands.append(c)
 
-    # Candidate 4+: Explore polyphony filter modes (L5.* only)
+    # Candidate 5: L5 Poly Modes - Max 1 knob
     if level.startswith("L5"):
-        for mode in ("skyline_top_voice", "process_all", "decomposed_melody"):
-            c = dict(base_overrides)
-            c["stage_c.polyphony_filter.mode"] = mode
-            cands.append(c)
+        # Just try switching modes
+        for mode in ("skyline_top_voice", "decomposed_melody"):
+            current_mode = base_overrides.get("stage_c.polyphony_filter.mode", None)
+            if current_mode != mode:
+                c = make_cand()
+                c["stage_c.polyphony_filter.mode"] = mode
+                cands.append(c)
 
-    # If we generated nothing, make a gentle default exploration
+    # Fallback exploration if no specific symptoms triggered
     if not cands:
-        c = dict(base_overrides)
-        c["stage_b.voice_tracking.smoothing"] = float(c.get("stage_b.voice_tracking.smoothing", 0.0) or 0.0) + 0.1
+        c = make_cand()
+        c.setdefault("stage_b.voice_tracking.smoothing", 0.0)
+        bump(c, "stage_b.voice_tracking.smoothing", +0.1, floor=0.0, ceil=0.95)
         cands.append(c)
 
     # Deduplicate candidates (by JSON repr)
@@ -399,8 +450,24 @@ def propose_candidate_overrides(
             seen.add(key)
             uniq.append(c)
 
-    # Keep candidates bounded
-    return uniq[:8]
+    # Enforce strict 3-knob limit check (just in case)
+    final_cands = []
+    for c in uniq:
+        diff_count = 0
+        for k, v in c.items():
+            if k not in base_overrides or base_overrides[k] != v:
+                diff_count += 1
+
+        # New keys count as changes
+        # Also keys removed count (but we don't remove here)
+
+        if diff_count <= 3:
+            final_cands.append(c)
+        else:
+            # If we somehow exceeded, we drop it to be strict.
+            pass
+
+    return final_cands[:8]
 
 
 # -----------------------------
@@ -419,6 +486,7 @@ def run_benchmark_inprocess(
     overrides: Dict[str, Any],
     benchmark_module: str = "backend.benchmarks.benchmark_runner",
     extra_args: Optional[List[str]] = None,
+    use_preset: bool = False,
 ) -> Dict[str, Any]:
     """
     Run benchmark_runner as if `python -m ...` but in-process, with monkeypatched config.
@@ -453,8 +521,16 @@ def run_benchmark_inprocess(
 
     # Run the module with redirected stdout/stderr
     argv_old = sys.argv[:]
-    # FORCE preset=piano_61key so the tuning affects L4/L5.2
-    sys.argv = [sys.executable, "-m", benchmark_module, "--level", level, "--output", str(outdir), "--preset", "piano_61key"] + extra_args
+
+    # Construct args
+    # Note: --output must be passed.
+    cmd_args = [sys.executable, "-m", benchmark_module, "--level", level, "--output", str(outdir)]
+    if use_preset:
+        cmd_args.extend(["--preset", "piano_61key"])
+
+    cmd_args.extend(extra_args)
+
+    sys.argv = cmd_args
 
     rc = 0
     out_buf = io.StringIO()
@@ -483,6 +559,7 @@ def run_benchmark_inprocess(
         "stdout": str(stdout_path),
         "stderr": str(stderr_path),
         "applied_overrides": applied,
+        "command_args": cmd_args[2:], # capture effective args
     }
 
 
@@ -493,25 +570,37 @@ def run_benchmark_inprocess(
 def main() -> int:
     p = argparse.ArgumentParser(description="BENCH_TUNE_MODE: benchmark + autotune runner")
     p.add_argument("--levels", nargs="*", default=["L4", "L5.1", "L5.2"])
-    p.add_argument("--threshold", type=float, default=0.75)
+    p.add_argument("--threshold", type=float, default=0.75, help="Legacy alias for --target-f1")
+    p.add_argument("--target-f1", type=float, default=None, help="Target Note F1 score (default: 0.75)")
     p.add_argument("--max-iters", type=int, default=12)
+    p.add_argument("--strict-deps", action="store_true", help="Enforce required dependencies and fail if missing")
+    p.add_argument("--use-preset", action="store_true", help="Use --preset piano_61key for supported levels")
     p.add_argument("--output-root", default=str(Path("results") / "tuning"))
     p.add_argument("--benchmark-module", default="backend.benchmarks.benchmark_runner")
     p.add_argument("--extra-arg", action="append", default=[], help="Extra arg to pass to benchmark_runner (repeatable).")
     args = p.parse_args()
 
+    # Resolve target F1
+    target_f1 = args.target_f1 if args.target_f1 is not None else args.threshold
+
+    # 1. Dependency Preflight
+    check_dependencies(strict=args.strict_deps, auto_install=True)
+
     date_s, time_s = now_stamp()
     root = ensure_dir(Path(args.output_root) / date_s / f"run_{time_s}")
+    trials_log_path = root / "tuning_trials.jsonl"
 
     manifest = {
         "date": date_s,
         "time": time_s,
         "levels": args.levels,
-        "threshold": args.threshold,
+        "target_f1": target_f1,
         "max_iters": args.max_iters,
         "benchmark_module": args.benchmark_module,
         "cwd": str(Path.cwd()),
         "python": sys.version,
+        "strict_deps": args.strict_deps,
+        "use_preset": args.use_preset,
     }
     write_json(root / "manifest.json", manifest)
 
@@ -530,14 +619,28 @@ def main() -> int:
             overrides=global_best_overrides,
             benchmark_module=args.benchmark_module,
             extra_args=list(args.extra_arg) if args.extra_arg else None,
+            use_preset=args.use_preset,
         )
         metrics = load_metrics(base_out, level)
         symptoms = extract_symptoms(metrics.get("raw"))
+        note_f1_val = metrics.get("note_f1", 0.0)
+
+        # Log Baseline Trial
+        append_jsonl(trials_log_path, {
+            "level": level,
+            "iter_idx": 0,
+            "params_changed": {}, # Baseline has no changes relative to global best at start
+            "score": note_f1_val,
+            "pass": note_f1_val >= target_f1,
+            "run_dir": str(base_out),
+            "timestamp": datetime.now().isoformat(),
+            "command": run_info.get("command_args"),
+        })
 
         baseline = {
             "outdir": str(base_out),
             "returncode": run_info["returncode"],
-            "note_f1": metrics["note_f1"],
+            "note_f1": note_f1_val,
             "missing_metric": metrics["missing_metric"],
             "metrics_path": metrics["metrics_path"],
             "symptoms": symptoms,
@@ -547,11 +650,11 @@ def main() -> int:
         level_report["baseline"] = baseline
 
         best_overrides = dict(global_best_overrides)
-        best_f1 = float(metrics["note_f1"])
+        best_f1 = float(note_f1_val)
         best_iter_dir = str(base_out)
 
         # --- Tune loop ---
-        if best_f1 < float(args.threshold):
+        if best_f1 < target_f1:
             no_improve_streak = 0
             last_best = best_f1
 
@@ -564,21 +667,43 @@ def main() -> int:
                 # Evaluate candidates
                 for ci, cand_overrides in enumerate(candidates):
                     cand_dir = ensure_dir(iter_dir / f"cand_{ci:02d}")
+
+                    # Calculate params changed for logging
+                    diff = {}
+                    for k, v in cand_overrides.items():
+                        if k not in best_overrides or best_overrides[k] != v:
+                            diff[k] = v
+
                     ri = run_benchmark_inprocess(
                         level=level,
                         outdir=cand_dir,
                         overrides=cand_overrides,
                         benchmark_module=args.benchmark_module,
                         extra_args=list(args.extra_arg) if args.extra_arg else None,
+                        use_preset=args.use_preset,
                     )
                     m = load_metrics(cand_dir, level)
                     s = extract_symptoms(m.get("raw"))
+                    score = float(m["note_f1"])
+
+                    # Log Candidate Trial
+                    append_jsonl(trials_log_path, {
+                        "level": level,
+                        "iter_idx": it,
+                        "candidate_idx": ci,
+                        "params_changed": diff,
+                        "score": score,
+                        "pass": score >= target_f1,
+                        "run_dir": str(cand_dir),
+                        "timestamp": datetime.now().isoformat(),
+                        "command": ri.get("command_args"),
+                    })
 
                     write_json(cand_dir / "run_result.json", {"run_info": ri, "metrics": m, "symptoms": s, "overrides": cand_overrides})
 
-                    if float(m["note_f1"]) > float(iter_best_local["note_f1"]):
+                    if score > float(iter_best_local["note_f1"]):
                         iter_best_local = {
-                            "note_f1": float(m["note_f1"]),
+                            "note_f1": score,
                             "overrides": cand_overrides,
                             "dir": str(cand_dir),
                             "metrics": m,
@@ -586,15 +711,31 @@ def main() -> int:
                         }
 
                     # Early break if threshold reached
-                    if float(m["note_f1"]) >= float(args.threshold):
+                    if score >= target_f1:
                         break
 
                 # Adopt best candidate from this iteration
                 if iter_best_local["overrides"] is not None:
-                    best_overrides = dict(iter_best_local["overrides"])
-                    best_f1 = max(best_f1, float(iter_best_local["note_f1"]))
-                    best_iter_dir = str(iter_best_local["dir"])
-                    symptoms = dict(iter_best_local["symptoms"] or {})
+                    # Only adopt if it improved or we are exploring?
+                    # Greedy: always take the best of this iteration if it's better than nothing.
+                    # But we should compare to `best_f1` of the Level.
+
+                    # However, typical hill climbing moves to the best neighbor.
+                    # We will update `best_overrides` to `iter_best_local` even if it's not better than absolute best?
+                    # No, we should ensure strict improvement or at least non-regression if we want to drift.
+                    # But for simple tuning, let's track the absolute best.
+
+                    if iter_best_local["note_f1"] > best_f1:
+                        best_overrides = dict(iter_best_local["overrides"])
+                        best_f1 = float(iter_best_local["note_f1"])
+                        best_iter_dir = str(iter_best_local["dir"])
+                        symptoms = dict(iter_best_local["symptoms"] or {})
+                    else:
+                        # If no candidate improved on global best, do we keep the old best?
+                        # Yes. But we might want to take the best of *this* iteration to continue searching?
+                        # This script logic: "best_overrides" is the starting point for the next iteration.
+                        # If we didn't improve, we stick with the old best_overrides for the next generation.
+                        pass
 
                 level_report["iterations"].append({
                     "iter": it,
@@ -605,7 +746,7 @@ def main() -> int:
                 write_json(iter_dir / "iter_best.json", level_report["iterations"][-1])
 
                 # Stop if threshold reached
-                if best_f1 >= float(args.threshold):
+                if best_f1 >= target_f1:
                     break
 
                 # Stagnation stop
@@ -635,7 +776,7 @@ def main() -> int:
     write_json(root / "best_overrides.json", global_best_overrides)
 
     # Return non-zero if any level failed threshold (soft signal)
-    any_fail = any((lvl.get("best", {}).get("note_f1", 0.0) < float(args.threshold)) for lvl in report["levels"])
+    any_fail = any((lvl.get("best", {}).get("note_f1", 0.0) < target_f1) for lvl in report["levels"])
     return 2 if any_fail else 0
 
 
