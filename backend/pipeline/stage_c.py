@@ -657,8 +657,47 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 # Filter by confidence floor
                 cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
                 if cand:
-                    # Pick highest pitch
-                    p_best, c_best = max(cand, key=lambda x: x[0])
+                    # Fix L5 failure mode: Pick by confidence + continuity + vocal band preference
+                    # Previous choice: highest pitch (caused overtones/flute capture)
+
+                    # 1. Sort by confidence descending
+                    cand.sort(key=lambda x: x[1], reverse=True)
+
+                    # 2. Prefer vocal band (80-1400Hz) if confidence is close
+                    # We take the top few candidates within 10% confidence of the winner
+                    top_conf = cand[0][1]
+                    contestants = [x for x in cand if x[1] >= top_conf * 0.9]
+
+                    best_cand = contestants[0]
+
+                    # If we have a previous selected pitch (from previous frame in new_tl), use it for continuity
+                    prev_pitch = new_tl[-1].pitch_hz if new_tl else 0.0
+
+                    if len(contestants) > 1:
+                        # Tie-breaker logic
+                        scored_candidates = []
+                        for p, c in contestants:
+                            score = c
+                            # Bonus for vocal band - Expanded to 1400Hz (approx F6) for female vocals/flutes
+                            if 80.0 <= p <= 1400.0:
+                                score += 0.05
+
+                            # Bonus for continuity
+                            if prev_pitch > 0.0:
+                                cents_diff = abs(1200.0 * np.log2(p / prev_pitch))
+                                if cents_diff < 100: # Within semitone
+                                    score += 0.1
+                                elif cents_diff < 1200: # Within octave
+                                    score += 0.05
+                                else:
+                                    score -= 0.05 # Large jumps penalized
+
+                            scored_candidates.append(((p, c), score))
+
+                        best_cand = max(scored_candidates, key=lambda x: x[1])[0]
+
+                    p_best, c_best = best_cand
+
                     # Recompute MIDI
                     midi_new = int(round(69 + 12 * np.log2(p_best / 440.0)))
                     # Create updated frame (assuming immutable-ish usage, creating new is safer)
@@ -694,6 +733,32 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                  pitch_tolerance_cents=poly_pitch_tolerance,
                  max_tracks=max_tracks
              )
+
+             # Feature: Decomposed Melody Mode (L5.2)
+             # If mode is "decomposed_melody", pick only the best track as the "melody"
+             # This avoids outputting accompaniment tracks for monophonic benchmarks
+             if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
+                # Score tracks by total confidence mass in vocal range
+                best_idx = 0
+                best_score = -1.0
+
+                for i, tl in enumerate(voice_timelines):
+                    score = 0.0
+                    for fp in tl:
+                        if fp.pitch_hz > 0:
+                            s = fp.confidence
+                            # Boost vocal range (80-1400Hz)
+                            if 80.0 <= fp.pitch_hz <= 1400.0:
+                                 s *= 1.2
+                            score += s
+
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+                # Keep only the best track
+                voice_timelines = [voice_timelines[best_idx]]
+
         else:
              voice_timelines = [timeline]
 

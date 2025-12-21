@@ -1207,8 +1207,39 @@ def extract_features(
 
             primary_idx = 0
             if select_top_voice and tracked_pitches.size:
-                primary_idx = int(np.argmax(tracked_pitches))
-                if tracked_pitches[primary_idx] <= 0.0:
+                # Fix L5 failure mode: Select by confidence, not highest pitch
+                # Improved: Argmax of (conf - jump_penalty) to maintain continuity
+                prev_p = primary_track[i-1] if i > 0 else 0.0
+
+                best_score = -999.0
+                best_idx = 0
+                found_valid = False
+
+                for idx in range(len(tracked_confs)):
+                    p = tracked_pitches[idx]
+                    c = tracked_confs[idx]
+
+                    if p <= 0.0:
+                        continue
+
+                    found_valid = True
+                    score = float(c)
+
+                    # Apply penalty for jumps from previous frame's selected pitch
+                    if prev_p > 0.0:
+                         cents = abs(1200.0 * np.log2(p / prev_p))
+                         # Penalty: 0.0005 per cent -> 0.05 per semitone
+                         # Reduced from 0.001 to strictly punish octave jumps but allow melodic steps
+                         penalty = cents * 0.0005
+                         score -= penalty
+
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
+
+                if found_valid:
+                    primary_idx = best_idx
+                else:
                     primary_idx = 0
 
             chosen_pitch = float(tracked_pitches[primary_idx]) if tracked_pitches.size else 0.0
