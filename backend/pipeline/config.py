@@ -124,8 +124,8 @@ class StageBConfig:
             "sacf": 0.3,
             "cqt": 0.2,
             "yin": 0.3,
-            "rmvpe": 0.5,   # Dominant for vocals / cello profiles
-            "crepe": 0.5,   # Dominant for violin / flute profiles
+            "rmvpe": 0.5,
+            "crepe": 1.0,   # Boost Crepe as it is now installed and generally superior
         }
     )
 
@@ -590,14 +590,14 @@ PIANO_61KEY_CONFIG = PipelineConfig(
         confidence_voicing_threshold=0.5,
         confidence_priority_floor=0.5,
         pitch_disagreement_cents=70.0,
-        ensemble_weights={"swiftf0": 0.5, "sacf": 0.3, "cqt": 0.2, "yin": 0.1},
+        ensemble_weights={"swiftf0": 0.5, "sacf": 0.3, "cqt": 0.2, "yin": 0.1, "crepe": 1.0},
         detectors={
             "swiftf0": {"enabled": True, "fmin": 60.0, "fmax": 2000.0, "confidence_threshold": 0.9},
             "sacf":    {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "window_size": 4096, "threshold": 0.3},
             "cqt":     {"enabled": True, "fmin": 60.0, "fmax": 4000.0, "bins_per_octave": 48, "n_bins": 240, "max_peaks": 8},
             "yin":     {"enabled": True, "fmin": 60.0, "fmax": 2200.0, "frame_length": 4096, "threshold": 0.1, "enable_multires_f0": True},
             "rmvpe":   {"enabled": False},
-            "crepe":   {"enabled": False},
+            "crepe":   {"enabled": True, "model_capacity": "small", "confidence_threshold": 0.5},
         },
         melody_filtering={
              "median_window": 7,

@@ -15,10 +15,15 @@ def run_benchmark(level: str) -> float:
     ]
     print(f"Running benchmark {level}...")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "PYTHONPATH": "."})
+        # Pass env to ensure PYTHONPATH is set
+        env = os.environ.copy()
+        env["PYTHONPATH"] = "."
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
         if result.returncode != 0:
             print(f"Benchmark failed: {result.stderr}")
+            # print stdout too for debugging
+            print(f"Stdout: {result.stdout}")
             return 0.0
 
         # Try to find JSON first
@@ -45,6 +50,8 @@ def run_benchmark(level: str) -> float:
         if match:
             return float(match.group(1))
 
+        print(f"Could not parse F1 from output. Stdout:\n{result.stdout[:200]}...")
+
     except Exception as e:
         print(f"Error running benchmark: {e}")
         return 0.0
@@ -68,7 +75,6 @@ def patch_config(params: Dict[str, Any]):
                 new_content
             )
         elif key == "stage_b.polyphonic_peeling.mask_width":
-            # Use \g<1> to prevent ambiguity with digits in value
             new_content = re.sub(
                 r'("mask_width":\s*)([\d\.]+)(,\s*# Fractional bandwidth)',
                 f'\\g<1>{value}\\g<3>',
@@ -86,17 +92,34 @@ def patch_config(params: Dict[str, Any]):
                 f'\\g<1>{value}',
                 new_content
             )
+        elif key == "stage_c.polyphony_filter.mode":
+             # Match "mode": "value" inside polyphony_filter dict
+             # This is tricky with simple regex if not careful, but let's try specific context
+             # Pattern: "mode": "skyline_top_voice"
+             new_content = re.sub(
+                r'("mode":\s*")([a-zA-Z_]+)(")',
+                f'\\g<1>{value}\\g<3>',
+                new_content
+             )
+        elif key == "stage_b.polyphonic_peeling.iss_adaptive":
+             # "iss_adaptive": True
+             new_content = re.sub(
+                 r'("iss_adaptive":\s*)(True|False)',
+                 f'\\g<1>{value}',
+                 new_content
+             )
+
 
     with open("backend/pipeline/config.py", "w") as f:
         f.write(new_content)
 
 def main():
+    # Focused search
     grid = {
-        "stage_c.min_note_duration_ms_poly": [40.0, 45.0, 50.0],
-        "stage_b.polyphonic_peeling.mask_width": [0.025, 0.035],
-        "stage_c.segmentation_method.transition_penalty": [0.7, 0.9],
-        "stage_c.polyphonic_confidence.accompaniment": [0.35, 0.45],
-        "stage_b.detectors.yin.frame_length": [4096]
+        "stage_c.polyphony_filter.mode": ["process_all", "skyline_top_voice"],
+        "stage_b.polyphonic_peeling.iss_adaptive": [True, False],
+        # Keep others default for now to reduce space
+        # Defaults: 45.0, 0.03, 0.8, 0.40
     }
 
     keys = list(grid.keys())
