@@ -663,7 +663,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     # 1. Sort by confidence descending
                     cand.sort(key=lambda x: x[1], reverse=True)
 
-                    # 2. Prefer vocal band (80-1000Hz) if confidence is close
+                    # 2. Prefer vocal band (80-1400Hz) if confidence is close
                     # We take the top few candidates within 10% confidence of the winner
                     top_conf = cand[0][1]
                     contestants = [x for x in cand if x[1] >= top_conf * 0.9]
