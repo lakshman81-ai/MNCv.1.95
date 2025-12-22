@@ -13,6 +13,57 @@ graph TD
     StageD[Stage D: Rendering] -->|TranscriptionResult| Output
 ```
 
+## Algorithm Selection Logic
+
+The pipeline dynamically selects algorithms and processing paths based on the input audio texture (Mono/Poly) and configuration overrides.
+
+```mermaid
+flowchart TD
+    Start([Stage A: Detect Audio Type]) --> CheckType{Audio Type?}
+
+    CheckType -- Monophonic --> MonoPath[Processing Mode: Mono]
+    CheckType -- Polyphonic --> PolyPath[Processing Mode: Poly]
+
+    subgraph StageB [Stage B: Feature Extraction]
+        MonoPath --> DetectorSelect{Instrument?}
+        PolyPath --> SepCheck{Separation Enabled?}
+
+        SepCheck -- Yes --> RunDemucs[Run HTDemucs / SyntheticMDX]
+        SepCheck -- No --> ProcessMix[Process Mix Only]
+
+        RunDemucs --> MultiStem[Multi-Stem Processing]
+        ProcessMix --> SingleStem[Single Stem Processing]
+
+        MultiStem --> Detectors
+        SingleStem --> Detectors
+
+        Detectors --> Ensemble[Ensemble Merge]
+        Ensemble --> PeelingCheck{Poly Context + Max Layers > 0?}
+
+        PeelingCheck -- Yes --> ISS[Iterative Spectral Subtraction]
+        PeelingCheck -- No --> OutputB[Stage B Output]
+        ISS --> OutputB
+    end
+
+    subgraph StageC [Stage C: Segmentation]
+        OutputB --> PolyFilter{Filter Mode?}
+
+        PolyFilter -- "skyline_top_voice" --> Skyline[Skyline Selection\n(Confidence + Vocal Bias)]
+        PolyFilter -- "decomposed_melody" --> DecompMelody[Decompose + Pick Best Track]
+        PolyFilter -- "process_all" --> DecompAll[Decompose All Tracks]
+
+        Skyline --> SegMethod{Segmentation Method}
+        DecompMelody --> SegMethod
+        DecompAll --> SegMethod
+
+        SegMethod -- "hmm" --> Viterbi[HMM / Viterbi Path]
+        SegMethod -- "threshold" --> Gate[RMS/Confidence Gate]
+
+        Viterbi --> OutputC[Analysis Data]
+        Gate --> OutputC
+    end
+```
+
 ## Stage A: Load & Preprocess (`backend/pipeline/stage_a.py`)
 
 **Goal:** Normalize audio into a consistent, analysis-ready format (Mono, Fixed Sample Rate, Normalized Gain) and perform initial global analysis (BPM, Texture).
