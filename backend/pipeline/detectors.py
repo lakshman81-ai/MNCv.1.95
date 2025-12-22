@@ -172,7 +172,11 @@ def create_harmonic_mask(
     n_frames = int(f0_hz.shape[0])
     n_bins = n_fft // 2 + 1
 
-    mask = np.ones((n_bins, n_frames), dtype=np.float32)
+    # Optimization: Work in (n_frames, n_bins) to allow contiguous row updates
+    # which is significantly faster than strided column updates.
+    # We transpose back to (n_bins, n_frames) at the end.
+    mask_T = np.ones((n_frames, n_bins), dtype=np.float32)
+
     # Frequency per bin
     bin_hz = float(sr) / float(n_fft)
 
@@ -200,9 +204,10 @@ def create_harmonic_mask(
             idx_hi = min(n_bins - 1, idx_hi)
 
             if idx_lo <= idx_hi:
-                mask[idx_lo : idx_hi + 1, t] = 0.0
+                # Contiguous slice update on the transposed array
+                mask_T[t, idx_lo : idx_hi + 1] = 0.0
 
-    return mask
+    return mask_T.T
 
 
 def iterative_spectral_subtraction(
