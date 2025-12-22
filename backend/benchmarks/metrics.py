@@ -249,3 +249,51 @@ def onset_offset_mae(pred_notes: List[Tuple[int, float, float]], gt_notes: List[
     if not errors_start:
         return float('nan'), float('nan')
     return float(np.mean(errors_start)), float(np.mean(errors_end))
+
+
+def compute_symptom_metrics(pred_notes: List[Tuple[int, float, float]]) -> dict[str, float]:
+    """Compute diagnostic symptom metrics from predicted notes."""
+    if not pred_notes:
+        return {
+            "fragmentation_score": 0.0,
+            "note_count_per_10s": 0.0,
+            "median_note_len_ms": 0.0,
+            "octave_jump_rate": 0.0,
+            "note_count": 0.0
+        }
+
+    # Sort by start time
+    notes = sorted(pred_notes, key=lambda x: x[1])
+    durations = [(end - start) * 1000.0 for _, start, end in notes]
+    total_dur_s = max(n[2] for n in notes) - min(n[1] for n in notes) if notes else 0.0
+
+    # Fragmentation: ratio of notes < 80ms
+    short_notes = sum(1 for d in durations if d < 80.0)
+    fragmentation_score = short_notes / len(notes) if notes else 0.0
+
+    # Density
+    note_count_per_10s = (len(notes) / total_dur_s * 10.0) if total_dur_s > 0 else 0.0
+
+    # Median duration
+    median_note_len_ms = float(np.median(durations)) if durations else 0.0
+
+    # Octave jumps (intervals > 11 semitones)
+    jumps = 0
+    if len(notes) > 1:
+        for i in range(1, len(notes)):
+            prev = notes[i-1]
+            curr = notes[i]
+            # Only count if consecutive in time (gap < 200ms)
+            if (curr[1] - prev[2]) < 0.2:
+                interval = abs(curr[0] - prev[0])
+                if interval > 11:
+                    jumps += 1
+    octave_jump_rate = jumps / (len(notes) - 1) if len(notes) > 1 else 0.0
+
+    return {
+        "fragmentation_score": fragmentation_score,
+        "note_count_per_10s": note_count_per_10s,
+        "median_note_len_ms": median_note_len_ms,
+        "octave_jump_rate": octave_jump_rate,
+        "note_count": float(len(notes))
+    }

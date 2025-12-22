@@ -424,15 +424,44 @@ def propose_candidate_overrides(
         bump(c, "stage_b.voice_tracking.smoothing", +0.15, floor=0.0, ceil=0.95)
         cands.append(c)
 
-    # Candidate 5: L5 Poly Modes - Max 1 knob
+    # Candidate 5: L5 Poly Modes & Peeling - Max 2 knobs
     if level.startswith("L5"):
-        # Just try switching modes
+        # 1. Poly Mode
         for mode in ("skyline_top_voice", "decomposed_melody"):
             current_mode = base_overrides.get("stage_c.polyphony_filter.mode", None)
             if current_mode != mode:
                 c = make_cand()
                 c["stage_c.polyphony_filter.mode"] = mode
                 cands.append(c)
+
+        # 2. Harmonics
+        c = make_cand()
+        c.setdefault("stage_b.polyphonic_peeling.max_harmonics", 1)
+        bump(c, "stage_b.polyphonic_peeling.max_harmonics", +1, floor=1, ceil=12)
+        cands.append(c)
+
+        # 3. Layers
+        c = make_cand()
+        c.setdefault("stage_b.polyphonic_peeling.max_layers", 4)
+        bump(c, "stage_b.polyphonic_peeling.max_layers", +1, floor=1, ceil=8)
+        cands.append(c)
+
+    # Candidate 6: Octave Errors (Fmin/Fmax)
+    if octave_high:
+        c = make_cand()
+        # Try adjusting frequency bounds slightly
+        c.setdefault("stage_b.detectors.yin.fmin", 60.0)
+        c.setdefault("stage_b.detectors.crepe.fmin", 60.0)
+        bump(c, "stage_b.detectors.yin.fmin", -10.0, floor=20.0, ceil=100.0)
+        bump(c, "stage_b.detectors.crepe.fmin", -10.0, floor=20.0, ceil=100.0)
+        cands.append(c)
+
+    # Candidate 7: Onset Sensitivity
+    if nps10 > 20.0: # high density
+        c = make_cand()
+        c.setdefault("stage_a.diff_threshold", 0.5)
+        bump(c, "stage_a.diff_threshold", +0.1, floor=0.1, ceil=2.0)
+        cands.append(c)
 
     # Fallback exploration if no specific symptoms triggered
     if not cands:
@@ -524,7 +553,7 @@ def run_benchmark_inprocess(
 
     # Construct args
     # Note: --output must be passed.
-    cmd_args = [sys.executable, "-m", benchmark_module, "--level", level, "--output", str(outdir)]
+    cmd_args = [benchmark_module, "--level", level, "--output", str(outdir)]
     if use_preset:
         cmd_args.extend(["--preset", "piano_61key"])
 
