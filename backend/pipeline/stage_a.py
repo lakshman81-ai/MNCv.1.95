@@ -275,6 +275,10 @@ def detect_tempo_and_beats(
 
         # Skip short clips (WI rule: >= 6.0s)
         duration = float(len(y)) / float(sr)
+        if duration < 3.0:
+            # Silent skip for very short audio to avoid log noise
+            return None, []
+
         if duration < 6.0:
             if pipeline_logger:
                 pipeline_logger.log_event("stage_a", "bpm_detection_skipped_short_audio", {"duration": duration})
@@ -342,6 +346,10 @@ def load_and_preprocess(
         full_conf = PipelineConfig()
         a_conf = full_conf.stage_a
     elif isinstance(config, StageAConfig):
+        if logger:
+            logger.warning(
+                "StageAConfig provided; using default PipelineConfig for other stages. Pass PipelineConfig to configure Stage B/C/D."
+            )
         full_conf = PipelineConfig()
         full_conf.stage_a = config
         a_conf = config

@@ -315,6 +315,7 @@ def _stitch_events(
             new_end = max(current.end_sec, next_note.end_sec)
 
             # Max confidence
+            take_next = next_note.confidence > current.confidence
             new_conf = max(current.confidence, next_note.confidence)
             # Max velocity
             new_vel = max(current.velocity, next_note.velocity)
@@ -333,8 +334,8 @@ def _stitch_events(
             current.confidence = new_conf
             current.velocity = new_vel
             current.pitch_hz = new_hz
-            # Keep voice/staff from winner (conf based? or just current?)
-            if next_note.confidence > current.confidence:
+            # Keep voice/staff from winner
+            if take_next:
                 current.voice = next_note.voice
                 current.staff = next_note.staff
         else:
@@ -576,7 +577,16 @@ def transcribe(
                     )
 
                     if fb_beats:
-                        fb_beats = sorted(list(set(fb_beats)))
+                        # Sort and dedup with epsilon to preserve order and density
+                        fb_beats = sorted([float(b) for b in fb_beats])
+                        dedup = []
+                        last = None
+                        for t in fb_beats:
+                            if last is None or t > last + 1e-6:
+                                dedup.append(t)
+                                last = t
+                        fb_beats = dedup
+
                         # Update in-place
                         meta.beats = fb_beats
                         meta.beat_times = fb_beats # Alias
@@ -992,14 +1002,26 @@ def transcribe(
     # --------------------------------------------------------
     timeline_source = list(stage_b_out.timeline or [])
     if not timeline_source and getattr(stage_b_out, "time_grid", None) is not None:
-        for t, f0 in zip(getattr(stage_b_out, "time_grid", []), getattr(stage_b_out, "f0_main", [])):
-            timeline_source.append(
-                FramePitch(time=float(t), pitch_hz=float(f0), midi=int(round(69 + 12 * math.log2(f0 / 440.0)))) if f0 > 0 else FramePitch(time=float(t), pitch_hz=0.0, midi=None, confidence=0.0)
-            )
+        # Robustly rebuild timeline if missing from stage_b_out
+        tg = getattr(stage_b_out, "time_grid", []) or []
+        f0m = getattr(stage_b_out, "f0_main", []) or []
+        for t, f0 in zip(tg, f0m):
+            f0 = float(f0)
+            if f0 > 0.0:
+                midi = int(round(69 + 12 * math.log2(f0 / 440.0)))
+                timeline_source.append(FramePitch(time=float(t), pitch_hz=f0, midi=midi, confidence=0.0, rms=0.0))
+            else:
+                timeline_source.append(FramePitch(time=float(t), pitch_hz=0.0, midi=None, confidence=0.0, rms=0.0))
+
     total_frames = len(timeline_source) or int(getattr(stage_b_out, "f0_main", np.array([])).size)
     voiced_frames = [fp for fp in timeline_source if getattr(fp, "pitch_hz", 0.0) > 0]
     mean_conf = float(np.mean([getattr(fp, "confidence", 0.0) for fp in timeline_source])) if timeline_source else 0.0
-    zero_ratio = 1.0 - (len(voiced_frames) / total_frames) if total_frames else 1.0
+
+    # Use consistent denominator
+    den = max(1, len(timeline_source))
+    voiced_ratio = len(voiced_frames) / den
+    zero_ratio = 1.0 - voiced_ratio
+
     midi_series = [fp.midi for fp in timeline_source if fp.midi is not None]
     octave_jumps = 0
     for a, b in zip(midi_series, midi_series[1:]):
@@ -1007,7 +1029,7 @@ def transcribe(
             continue
         if abs(a - b) >= 12:
             octave_jumps += 1
-    voiced_ratio = (len(voiced_frames) / total_frames) if total_frames else 0.0
+
     stage_metrics["stage_b"] = {
         "voiced_ratio": float(voiced_ratio),
         "mean_confidence": float(mean_conf),

@@ -104,6 +104,7 @@ class SyntheticMDXSeparator:
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.templates = self._build_templates()
+        self._warned_no_scipy = False
 
     def _build_templates(self) -> Dict[str, np.ndarray]:
         sr = self.sample_rate
@@ -189,7 +190,27 @@ class SyntheticMDXSeparator:
         vocals_w, bass_w, drums_w, other_w = weights
 
         if SCIPY_SIGNAL is None:
-             logger.warning("Scipy signal not available; SyntheticMDXSeparator filtering disabled.")
+            if not getattr(self, "_warned_no_scipy", False):
+                logger.warning("SyntheticMDX: Scipy missing. Falling back to gain-based separation (no frequency filtering).")
+                self._warned_no_scipy = True
+
+            # Normalize to avoid clipping
+            s = vocals_w + bass_w
+            if s > 1.0:
+                vocals_w /= s
+                bass_w /= s
+
+            vocals = vocals_w * audio
+            bass = bass_w * audio
+            drums = drums_w * audio
+            other = audio - (vocals + bass + drums)
+
+            return {
+                "vocals": vocals,
+                "bass": bass,
+                "drums": drums,
+                "other": other,
+            }
 
         vocals = vocals_w * _butter_filter(audio, sr, 12000.0, "low")
         vocals = _butter_filter(vocals, sr, 300.0, "high")
@@ -269,15 +290,50 @@ def _run_htdemucs(
         resampled = audio
 
     # Demucs expects stereo (2, T)
-    # If mono (1, T), duplicate. If > 2, trim.
+    # Robust shape handling rules:
+    # (T,) -> (1, T) -> (2, T)
+    # (1, T) -> (2, T)
+    # (2, T) -> OK
+    # (T, C) -> (C, T) -> OK/Trim
+
+    # First, handle potentially transposed input (T, C) -> (C, T)
+    # Heuristic: if shape[0] > 10 and shape[1] <= 10, assume (T, C)
+    if resampled.ndim == 2:
+        d0, d1 = resampled.shape
+        if d0 > 10 and d1 <= 10:
+             resampled = resampled.T
+
+    # Ensure (C, T)
+    if resampled.ndim == 1:
+        resampled = resampled[None, :]
+
     C, T = resampled.shape
+
+    # Force stereo
     if C == 1:
         resampled = np.concatenate([resampled, resampled], axis=0)
     elif C > 2:
         resampled = resampled[:2, :]
 
+    # Final guard before inference
+    if resampled.shape[0] != 2:
+        # Should be unreachable given above logic, but safety first
+        logger.warning(f"HTDemucs input shape unexpected: {resampled.shape}. Forcing stereo duplication.")
+        if resampled.shape[0] == 1:
+             resampled = np.concatenate([resampled, resampled], axis=0)
+        else:
+             # Fallback: take mean and duplicate
+             mono = np.mean(resampled, axis=0, keepdims=True)
+             resampled = np.concatenate([mono, mono], axis=0)
+
     # Prepare tensor: (Batch, Channels, Time) -> (1, 2, T)
     mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, :, :].to(dev)
+
+    # Hard assert on shape to prevent model crash with cryptic error
+    if mix_tensor.shape[1] != 2:
+         logger.error(f"HTDemucs tensor shape invalid: {mix_tensor.shape}. Skipping.")
+         return None
+
     try:
         with torch.no_grad():
             demucs_out = apply_model(model, mix_tensor, overlap=overlap, shifts=shifts, device=dev)
