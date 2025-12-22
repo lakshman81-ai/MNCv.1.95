@@ -129,6 +129,16 @@ class StageBConfig:
         }
     )
 
+    # Ensemble fusion mode: "static" (weighted sum) | "adaptive" (reliability-gated weighted median)
+    ensemble_mode: str = "static"
+
+    # Smoothing method: "tracker" (Hungarian assignment) | "viterbi" (HMM-based)
+    smoothing_method: str = "tracker"
+
+    # Viterbi smoothing parameters
+    viterbi_transition_smoothness: float = 0.5
+    viterbi_jump_penalty: float = 0.6
+
     # Polyphonic peeling (ISS) settings
     polyphonic_peeling: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -335,6 +345,10 @@ class StageDConfig:
     staccato_marking: Dict[str, Any] = field(
         default_factory=lambda: {"threshold_beats": 0.25}
     )
+
+    # Quantization mode: "grid" (strict) | "light_rubato" (snap only if close)
+    quantization_mode: str = "grid"
+    light_rubato_snap_ms: float = 30.0
 
     # General glissando detection (disabled for piano by WI)
     glissando_threshold_general: Dict[str, Any] = field(

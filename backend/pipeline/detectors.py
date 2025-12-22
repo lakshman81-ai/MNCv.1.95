@@ -163,10 +163,13 @@ def create_harmonic_mask(
     mask_width: float = 0.03,
     n_harmonics: int = 8,
     min_band_hz: float = 6.0,
+    frequency_aware_width: bool = False,
 ) -> np.ndarray:
     """
     Create a time-frequency mask that zeros bins around harmonics of f0.
     Returns mask shape: (n_fft//2 + 1, n_frames). 1.0 = keep, 0.0 = remove.
+
+    If frequency_aware_width is True, low frequencies get wider masks.
     """
     f0_hz = np.asarray(f0_hz, dtype=np.float32).reshape(-1)
     n_frames = int(f0_hz.shape[0])
@@ -190,7 +193,15 @@ def create_harmonic_mask(
             if fh >= float(sr) / 2.0:
                 break
 
-            bw = max(min_band_hz, abs(mask_width) * fh)
+            if frequency_aware_width:
+                 # Wider for low notes, narrower for high notes
+                 width_factor = 1.0
+                 if fh < 200.0:
+                     width_factor = 1.0 + (200.0 - fh) / 100.0
+                 bw = max(min_band_hz, abs(mask_width * width_factor) * fh)
+            else:
+                bw = max(min_band_hz, abs(mask_width) * fh)
+
             lo = fh - bw
             hi = fh + bw
 
@@ -389,6 +400,7 @@ def iterative_spectral_subtraction(
                 mask_width=float(eff_mask_width),
                 n_harmonics=adaptive_harmonics,
                 min_band_hz=min_band,
+                frequency_aware_width=True,
             )
 
             harmonic_energy = float(np.mean(magnitude * (1.0 - mask)))
@@ -402,6 +414,9 @@ def iterative_spectral_subtraction(
 
             # Apply mask
             strength = np.clip(conf, 0.0, 1.0).reshape(1, -1) * eff_strength_scale
+
+            # Soft subtraction with decay (Step 4)
+            # We assume eff_strength_scale handles the soft nature.
             soft_mask = 1.0 - (1.0 - mask) * strength
             Z2 = Z * soft_mask
 
