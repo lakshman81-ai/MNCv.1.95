@@ -9,19 +9,19 @@ This chart explicitly details the Algorithm Selection Logic (Profile $\rightarro
 ```mermaid
 flowchart TD
     %% Main Entry Point
-    Start([Start: Audio Input]) --> StageA[Stage A: Signal Conditioning]
+    Start(["Start: Audio Input"]) --> StageA["Stage A: Signal Conditioning"]
 
     %% Stage A Summary
     subgraph StageA_Process [Stage A: Preprocessing]
-        SA1[Resample / Mono / Trim]
-        SA2[Loudness Norm EBU R128]
+        SA1["Resample / Mono / Trim"]
+        SA2["Loudness Norm EBU R128"]
         SA1 --> SA2
     end
     StageA --> SA1
 
     %% Decision: Neural E2E vs Standard
-    SA2 --> CheckE2E{E2E Mode?<br>Basic Pitch / Auto}
-    CheckE2E -- Yes --> NeuralTrans[Neural Transcription<br>Basic Pitch / O&F]
+    SA2 --> CheckE2E{"E2E Mode?<br>Basic Pitch / Auto"}
+    CheckE2E -- Yes --> NeuralTrans["Neural Transcription<br>Basic Pitch / O&F"]
     NeuralTrans --> StageD
 
     CheckE2E -- No --> LogicStart
@@ -36,18 +36,18 @@ flowchart TD
             LogicStart(Input Context)
 
             %% Logic 1: Instrument Profile
-            SL1{1. Instrument<br>Profile?}
+            SL1{"1. Instrument<br>Profile?"}
             LogicStart --> SL1
 
-            SL1 -- Yes --> SL1_Load[Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN]
-            SL1 -- No --> SL1_Def[Load Default Config]
+            SL1 -- Yes --> SL1_Load["Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN"]
+            SL1 -- No --> SL1_Def["Load Default Config"]
         end
 
         %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
         subgraph Detectors [Detector Bank]
             direction TB
             %% Setup Inputs
-            SL1_Load & SL1_Def --> D_Input(Run Detectors Parallel)
+            SL1_Load & SL1_Def --> D_Input("Run Detectors Parallel")
 
             %% The 6 Algorithms from Section 2
             D_Input --> Alg_YIN
@@ -57,53 +57,53 @@ flowchart TD
             D_Input --> Alg_RMVPE
             D_Input --> Alg_CQT
 
-            Alg_YIN[**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>]
-            Alg_Swift[**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>]
-            Alg_SACF[**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>]
-            Alg_CREPE[**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>]
-            Alg_RMVPE[**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>]
-            Alg_CQT[**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>]
+            Alg_YIN["**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>"]
+            Alg_Swift["**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>"]
+            Alg_SACF["**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>"]
+            Alg_CREPE["**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>"]
+            Alg_RMVPE["**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>"]
+            Alg_CQT["**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>"]
         end
 
         %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
         Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
 
         subgraph Ensemble_Logic [Ensemble & Smoothing]
-            Ensemble[**2. Ensemble Fusion**<br>Merge Outputs]
+            Ensemble["**2. Ensemble Fusion**<br>Merge Outputs"]
 
             %% Logic 2: Fusion Mode
-            Ensemble --> Fusion{Mode?}
-            Fusion -- Static --> W_Avg[Weighted Average]
-            Fusion -- Adaptive --> W_Med[Reliability-Gated<br>Weighted Median]
+            Ensemble --> Fusion{"Mode?"}
+            Fusion -- Static --> W_Avg["Weighted Average"]
+            Fusion -- Adaptive --> W_Med["Reliability-Gated<br>Weighted Median"]
 
-            W_Avg & W_Med --> Smoothing{Smoothing?}
-            Smoothing -- Tracker --> S_Track[Hungarian Tracker]
-            Smoothing -- Viterbi --> S_Vit[Viterbi Path]
+            W_Avg & W_Med --> Smoothing{"Smoothing?"}
+            Smoothing -- Tracker --> S_Track["Hungarian Tracker"]
+            Smoothing -- Viterbi --> S_Vit["Viterbi Path"]
 
-            S_Track & S_Vit --> ResultB([Main Stage B Output])
+            S_Track & S_Vit --> ResultB(["Main Stage B Output"])
         end
 
         %% --- ISS / POLYPHONY (Parallel Path 2) ---
         %% ISS runs independently using a primary detector to peel layers
-        LogicStart -.-> CheckPoly{Polyphonic?}
-        CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers<br>(Adaptive / Freq-Aware)]
-        ISS --> PolyLayers([Polyphonic Layers])
-        CheckPoly -- No --> NoPoly[No Peeling]
+        LogicStart -.-> CheckPoly{"Polyphonic?"}
+        CheckPoly -- Yes --> ISS["**Iterative Spectral Subtraction**<br>Peel multiple layers<br>(Adaptive / Freq-Aware)"]
+        ISS --> PolyLayers(["Polyphonic Layers"])
+        CheckPoly -- No --> NoPoly["No Peeling"]
     end
 
     %% Merge Paths
-    ResultB & PolyLayers --> StageC[Stage C: Apply Theory]
+    ResultB & PolyLayers --> StageC["Stage C: Apply Theory"]
     ResultB & NoPoly --> StageC
 
     subgraph StageC_Process [Stage C]
-        SC1["Segmentation<br>(Threshold / HMM / Decomposed)"] --> SC2[Duration/Velocity Filter]
+        SC1["Segmentation<br>(Threshold / HMM / Decomposed)"] --> SC2["Duration/Velocity Filter"]
     end
 
     subgraph StageD_Process [Stage D: Quantize & Render]
-        SC2 --> StageD_Quant[Quantization]
-        StageD_Quant --> StageD_Render[Export XML/MIDI]
+        SC2 --> StageD_Quant["Quantization"]
+        StageD_Quant --> StageD_Render["Export XML/MIDI"]
     end
-    StageD_Render --> End([Final Output])
+    StageD_Render --> End(["Final Output"])
 ```
 
 ## Flowchart Explainer
