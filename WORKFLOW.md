@@ -26,70 +26,75 @@ flowchart TD
 
     CheckOF -- No --> LogicStart
 
-    %% --- SECTION 3: SELECTION LOGIC ---
-    subgraph Selection_Logic [Section 3: Selection Logic]
+    %% --- STAGE B: FEATURE EXTRACTION ---
+    subgraph StageB_Process [Stage B: Feature Extraction]
         direction TB
-        LogicStart(Input Context)
 
-        %% Logic 1: Instrument Profile
-        SL1{1. Instrument<br>Profile?}
-        LogicStart --> SL1
+        %% --- SECTION 3: SELECTION LOGIC ---
+        subgraph Selection_Logic [Selection Logic]
+            direction TB
+            LogicStart(Input Context)
 
-        SL1 -- Yes --> SL1_Load[Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN]
-        SL1 -- No --> SL1_Def[Load Default Config]
+            %% Logic 1: Instrument Profile
+            SL1{1. Instrument<br>Profile?}
+            LogicStart --> SL1
 
-        %% Logic 3: Fallback
-        SL1_Load & SL1_Def --> SL3{3. Fallback Check<br>Neural Models Available?}
+            SL1 -- Yes --> SL1_Load[Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN]
+            SL1 -- No --> SL1_Def[Load Default Config]
 
-        SL3 -- Yes --> SL3_Neural[Enable Neural Models<br>SwiftF0 / CREPE / RMVPE]
-        SL3 -- No --> SL3_DSP[Fallback to DSP Only<br>YIN / SACF]
+            %% Logic 3: Fallback
+            SL1_Load & SL1_Def --> SL3{3. Fallback Check<br>Neural Models Available?}
+
+            SL3 -- Yes --> SL3_Neural[Enable Neural Models<br>SwiftF0 / CREPE / RMVPE]
+            SL3 -- No --> SL3_DSP[Fallback to DSP Only<br>YIN / SACF]
+        end
+
+        %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
+        subgraph Detectors [Note Extraction Algorithms]
+            direction TB
+            %% Setup Inputs
+            SL3_Neural --> D_Input
+            SL3_DSP --> D_Input(Run Detectors Parallel)
+
+            %% The 6 Algorithms from Section 2
+            D_Input --> Alg_YIN
+            D_Input --> Alg_Swift
+            D_Input --> Alg_SACF
+            D_Input --> Alg_CREPE
+            D_Input --> Alg_RMVPE
+            D_Input --> Alg_CQT
+
+            Alg_YIN[**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>]
+            Alg_Swift[**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>]
+            Alg_SACF[**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>]
+            Alg_CREPE[**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>]
+            Alg_RMVPE[**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>]
+            Alg_CQT[**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>]
+        end
+
+        %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
+        Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
+
+        subgraph Ensemble_Logic [Ensemble Weights]
+            Ensemble[**2. Ensemble Weights**<br>Merge Outputs]
+
+            %% Logic 2: Weighted Average
+            Ensemble --> Weights{Apply Weights}
+            Weights -- SwiftF0 --> W1[0.5]
+            Weights -- SACF --> W2[0.3]
+            Weights -- CREPE --> W3[High]
+            Weights -- Other --> W4[...]
+
+            W1 & W2 & W3 & W4 --> ResultB([Main Stage B Output])
+        end
+
+        %% --- ISS / POLYPHONY (Parallel Path 2) ---
+        %% ISS runs independently using a primary detector to peel layers
+        LogicStart -.-> CheckPoly{Polyphonic?}
+        CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers]
+        ISS --> PolyLayers([Polyphonic Layers])
+        CheckPoly -- No --> NoPoly[No Peeling]
     end
-
-    %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
-    subgraph Detectors [Section 2: Note Extraction Algorithms]
-        direction TB
-        %% Setup Inputs
-        SL3_Neural --> D_Input
-        SL3_DSP --> D_Input(Run Detectors Parallel)
-
-        %% The 6 Algorithms from Section 2
-        D_Input --> Alg_YIN
-        D_Input --> Alg_Swift
-        D_Input --> Alg_SACF
-        D_Input --> Alg_CREPE
-        D_Input --> Alg_RMVPE
-        D_Input --> Alg_CQT
-
-        Alg_YIN[**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>]
-        Alg_Swift[**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>]
-        Alg_SACF[**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>]
-        Alg_CREPE[**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>]
-        Alg_RMVPE[**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>]
-        Alg_CQT[**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>]
-    end
-
-    %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
-    Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
-
-    subgraph Ensemble_Logic [Section 3: Ensemble Weights]
-        Ensemble[**2. Ensemble Weights**<br>Merge Outputs]
-
-        %% Logic 2: Weighted Average
-        Ensemble --> Weights{Apply Weights}
-        Weights -- SwiftF0 --> W1[0.5]
-        Weights -- SACF --> W2[0.3]
-        Weights -- CREPE --> W3[High]
-        Weights -- Other --> W4[...]
-
-        W1 & W2 & W3 & W4 --> ResultB([Main Stage B Output])
-    end
-
-    %% --- ISS / POLYPHONY (Parallel Path 2) ---
-    %% ISS runs independently using a primary detector to peel layers
-    LogicStart -.-> CheckPoly{Polyphonic?}
-    CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers]
-    ISS --> PolyLayers([Polyphonic Layers])
-    CheckPoly -- No --> NoPoly[No Peeling]
 
     %% Merge Paths
     ResultB & PolyLayers --> StageC[Stage C: Apply Theory]
@@ -99,8 +104,11 @@ flowchart TD
         SC1["Segmentation<br>(Threshold / HMM)"] --> SC2[Duration/Velocity Filter]
     end
 
-    SC2 --> StageD[Stage D: Quantize & Render]
-    StageD --> End([Final Output])
+    subgraph StageD_Process [Stage D: Quantize & Render]
+        SC2 --> StageD_Quant[Quantization]
+        StageD_Quant --> StageD_Render[Export XML/MIDI]
+    end
+    StageD_Render --> End([Final Output])
 ```
 
 ## Flowchart Explainer
