@@ -32,6 +32,52 @@ except Exception:
 
 from copy import deepcopy
 
+def snap_onset(frame_idx: int, onset_strength: List[float], radius: int = 2) -> int:
+    """Refine frame_idx to local maximum of onset_strength within radius."""
+    if not onset_strength:
+        return frame_idx
+    lo = max(0, frame_idx - radius)
+    hi = min(len(onset_strength) - 1, frame_idx + radius)
+    # Find index of max value in range [lo, hi]
+    # Note: onset_strength is list[float]
+    best_i = frame_idx
+    best_val = -1.0
+    for i in range(lo, hi + 1):
+        if onset_strength[i] > best_val:
+            best_val = onset_strength[i]
+            best_i = i
+    return best_i
+
+def should_split_same_pitch(i: int, onset_strength: List[float], band_energy: List[float], thr_onset: float = 0.7, thr_bump: float = 0.15) -> bool:
+    """
+    Check if a repeated note split is warranted at index i.
+    i: current frame index
+    """
+    if not onset_strength or i >= len(onset_strength) or i < 2:
+        return False
+
+    if onset_strength[i] < thr_onset:
+        return False
+
+    # Check local energy bump in specific band
+    # band_energy should be energy of the specific pitch bin
+    # We might not have per-bin energy here easily unless we computed it.
+    # Fallback: just use onset strength peak + pitch stability
+    # But prompt says: "short-term pitch-band energy bump exists"
+    # If we don't have band_energy, we rely on onset_strength.
+
+    if not band_energy:
+         # Without band energy, we should be conservative.
+         # Only split if onset strength is very high?
+         return False # False to avoid over-splitting on L0/L1 without per-band data
+
+    prev = band_energy[max(0, i - 2):i]
+    if not prev:
+        return False
+
+    bump = band_energy[i] - (sum(prev) / len(prev))
+    return bump >= thr_bump
+
 def _get(obj: Any, path: str, default: Any = None) -> Any:
     if obj is None:
         return default
@@ -275,6 +321,31 @@ def _segment_monophonic(
     c_start = conf_start if conf_start is not None else conf_thr
     c_end = conf_end if conf_end is not None else conf_thr
 
+    # Step 5: Onset Refinement
+    # If we have onset_strength in timeline (FramePitch.rms used as proxy or new field?)
+    # FramePitch doesn't have onset_strength.
+    # We can try to infer it from RMS changes or if we added it (we added it to debug CSV but not FramePitch struct yet).
+    # Let's assume we use rms delta as weak proxy if no explicit data.
+    onset_strength = []
+    # Compute simple onset strength from RMS if not present
+    # Or check if we can add it to FramePitch (we didn't modify models.py yet).
+    # We can assume FramePitch has no extra field, so we calculate locally.
+    rms_values = [fp.rms for fp in timeline]
+    if rms_values:
+        # Simple Flux: diff(rms) > 0
+        onset_strength = [0.0] * len(rms_values)
+        for k in range(1, len(rms_values)):
+            d = rms_values[k] - rms_values[k-1]
+            if d > 0:
+                onset_strength[k] = d
+        # Normalize
+        m = max(onset_strength) if onset_strength else 0
+        if m > 0:
+            onset_strength = [x/m for x in onset_strength]
+
+    # Step 5.1: Snap onset
+    # We apply this when detecting 'active' transition.
+
     for i, fp in enumerate(timeline):
         # P2 Hysteresis logic
         if not active:
@@ -289,6 +360,86 @@ def _segment_monophonic(
                 diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
                 if diff > split_cents:
                      is_glitch = True
+
+            # Step 5.2: Check for repeated note split (same pitch, new onset)
+            is_repeated_split = False
+
+            # Feature Flag: Repeated Note Splitter
+            use_splitter = seg_cfg.get("use_repeated_note_splitter", True)
+            if active and not is_glitch and use_splitter:
+                # Use should_split_same_pitch logic
+                # Need band energy -> use fp.rms as proxy for now
+                if should_split_same_pitch(i, onset_strength, rms_values, thr_onset=0.6, thr_bump=0.1):
+                     is_repeated_split = True
+
+            if is_glitch or is_repeated_split:
+                if glitch_counter < MAX_GLITCH_FRAMES and is_glitch: # Only absorb pitch glitches
+                    # Absorb glitch: extend current note logically but don't update pitch ref
+                    # Treat as part of note
+                    current_end = i
+                    glitch_counter += 1
+                    continue
+                else:
+                    # Confirmed split (pitch jump or repeated note)
+                    glitch_counter = 0
+
+                    # Close current
+                    segs.append((current_start, current_end))
+
+                    # Start new
+                    active = True
+
+                    # Feature Flag: Onset Refinement
+                    use_refinement = seg_cfg.get("use_onset_refinement", True)
+
+                    # Snap onset?
+                    if use_refinement:
+                        refined_start = snap_onset(i, onset_strength) if onset_strength else i
+                    else:
+                        refined_start = i
+
+                    # Ensure refined start is causally valid (>= current_end + 1?)
+                    refined_start = max(refined_start, current_end + 1)
+
+                    current_start = refined_start
+                    current_end = i
+                    current_pitch_hz = fp.pitch_hz
+                    pitch_buffer = [fp.pitch_hz]
+                    stable = min_on # Assume stability resets? Or we trust this split?
+            else:
+                glitch_counter = 0
+
+            silent = 0
+            if not active:
+                stable += 1
+                if stable >= min_on:
+                    active = True
+
+                    # Feature Flag: Onset Refinement
+                    use_refinement = seg_cfg.get("use_onset_refinement", True)
+
+                    # Snap start
+                    start_idx = i - (min_on - 1)
+                    if use_refinement:
+                        refined_start = snap_onset(start_idx, onset_strength) if onset_strength else start_idx
+                    else:
+                        refined_start = start_idx
+
+                    current_start = refined_start
+
+                    current_end = i
+                    current_pitch_hz = fp.pitch_hz
+                    pitch_buffer = [fp.pitch_hz]
+            else:
+                # Extend note
+                # Check vibrato / pitch jump - C2
+                # (We already checked is_glitch above, so here diff <= split_cents)
+                current_end = i
+                # P5: Update pitch reference
+                pitch_buffer.append(fp.pitch_hz)
+                if len(pitch_buffer) > pitch_buffer_size:
+                    pitch_buffer.pop(0)
+                current_pitch_hz = float(np.median(pitch_buffer))
 
             if is_glitch:
                 if glitch_counter < MAX_GLITCH_FRAMES:
@@ -551,6 +702,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # Specifically map: stage_c_pitch_ref_window_frames, stage_c_conf_start/end
 
     seg_cfg = dict(resolve_val("segmentation_method", {}) or {})
+
+    # Inject robustness flags into seg_cfg
+    # Now config.stage_c has these fields directly, so we can use _get properly
+    seg_cfg["use_onset_refinement"] = _get(config, "stage_c.use_onset_refinement", True)
+    seg_cfg["use_repeated_note_splitter"] = _get(config, "stage_c.use_repeated_note_splitter", True)
+
     if "stage_c_pitch_ref_window_frames" in profile_special:
          # Note: stage_c_pitch_ref_window_frames doesn't exist in segmentation_method usually,
          # it's usually a local param or logic. But let's check.

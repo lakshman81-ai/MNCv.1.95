@@ -16,6 +16,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     linear_sum_assignment = None
 
+import math
+from collections import deque
+
 from .models import StageAOutput, FramePitch, AnalysisData, AudioType, StageBOutput, Stem
 from .config import PipelineConfig
 from .detectors import (
@@ -43,6 +46,126 @@ SCIPY_SIGNAL = None
 if importlib.util.find_spec("scipy.signal"):
     import scipy.signal as SCIPY_SIGNAL
 
+
+def sigmoid(x):  # safe-ish
+    x = max(-20.0, min(20.0, x))
+    return 1.0 / (1.0 + math.exp(-x))
+
+def weighted_median(values, weights):
+    # values: list[float], weights: list[float]
+    pairs = sorted(zip(values, weights), key=lambda x: x[0])
+    total = sum(w for _, w in pairs)
+    if total <= 0:
+        return float("nan")
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= 0.5 * total:
+            return v
+    return pairs[-1][0]
+
+class DetectorReliability:
+    def __init__(self, base_w: float, pop_penalty_frames=6):
+        self.base_w = base_w
+        self.pop_penalty = 0
+        self.pop_penalty_frames = pop_penalty_frames
+        self.prev_cents = None
+        self.recent = deque(maxlen=5)
+
+    def update(self, cents, conf, energy_ok=True):
+        # stability: small derivative over recent frames
+        if cents == cents:  # not NaN
+            self.recent.append(cents)
+        stability = 1.0
+        if len(self.recent) >= 3:
+            diffs = [abs(self.recent[i]-self.recent[i-1]) for i in range(1,len(self.recent))]
+            stability = 1.0 / (1.0 + (sum(diffs)/len(diffs))/80.0)  # 80 cents scale
+
+        # octave pop heuristic: ~1200 cents jump without energy change
+        if self.prev_cents is not None and cents == cents and self.prev_cents == self.prev_cents:
+            jump = abs(cents - self.prev_cents)
+            if 900.0 <= jump <= 1500.0 and energy_ok:
+                self.pop_penalty = self.pop_penalty_frames
+        self.prev_cents = cents
+
+        if self.pop_penalty > 0:
+            self.pop_penalty -= 1
+            pop_factor = 0.2
+        else:
+            pop_factor = 1.0
+
+        conf_factor = sigmoid((conf - 0.5) * 6.0)  # tune slope
+        w = self.base_w * conf_factor * stability * pop_factor
+        return w
+
+def viterbi_pitch(fused_cents, fused_conf, midi_states, transition_smoothness=0.5, jump_penalty=0.6):
+    # fused_cents: list[float] length T
+    T = len(fused_cents)
+    S = len(midi_states)
+    INF = 1e18
+
+    # precompute state cents
+    state_cents = [m*100.0 for m in midi_states]
+
+    # dp[t][s] cost, backpointers
+    dp = [[INF]*S for _ in range(T)]
+    bp = [[-1]*S for _ in range(T)]
+
+    def emission(t, s):
+        c = fused_cents[t]
+        if not (c == c) or c <= 0:
+            return 5.0  # allow gaps softly
+        dist = abs(c - state_cents[s])
+        conf = fused_conf[t] if t < len(fused_conf) and fused_conf[t] is not None else 0.5
+        # confidence penalty: if conf is high, we trust fused_cents more (higher cost for deviance)
+        return (dist/50.0) - 0.8*math.log(max(1e-3, conf))
+
+    def transition(s0, s1):
+        step = abs(midi_states[s1] - midi_states[s0])
+        # allow small steps (0–2) cheaply, penalize larger jumps
+        if step <= 2:
+            return transition_smoothness * step # 0.2 * step in snippet
+        return transition_smoothness * 2.5 + jump_penalty * (step - 2)
+
+    # init
+    for s in range(S):
+        dp[0][s] = emission(0, s)
+
+    # forward
+    for t in range(1, T):
+        # Optimization: prune search space to states near fused pitch if available
+        # But Viterbi is globally optimal, so pruning might hurt.
+        # Given S ~ 88 (or 61), it's fast enough.
+        for s1 in range(S):
+            e = emission(t, s1)
+            # Find best s0
+            # To speed up: inner loop is dense.
+            # But python is slow.
+            # We assume S is small (<100).
+            best_cost = INF
+            best_s0 = -1
+
+            for s0 in range(S):
+                # Transition matrix is symmetric and simple.
+                cost = dp[t-1][s0] + transition(s0, s1)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_s0 = s0
+
+            dp[t][s1] = best_cost + e
+            bp[t][s1] = best_s0
+
+    # backtrack
+    if T == 0:
+        return []
+
+    s = min(range(S), key=lambda k: dp[T-1][k])
+    path = [s]*T
+    for t in range(T-1, 0, -1):
+        s = bp[t][s]
+        path[t-1] = s
+    smoothed_hz = [440.0 * (2**((midi_states[i]-69)/12.0)) for i in path]
+    return smoothed_hz
 
 def _module_available(module_name: str) -> bool:
     """Helper to avoid importing heavy optional deps when missing."""
@@ -579,13 +702,14 @@ def _ensemble_merge(
     weights: Dict[str, float],
     disagreement_cents: float = 70.0,
     priority_floor: float = 0.0,
+    adaptive_fusion: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Merge multiple f0/conf tracks based on weights and disagreement.
 
     Strategy:
       * Align frame counts across detectors
-      * Choose the candidate with the highest weighted confidence
+      * Choose the candidate with the highest weighted confidence OR use weighted median (Step 2)
       * Down-weight winners that have little consensus (large disagreement)
     """
     if not results:
@@ -612,12 +736,34 @@ def _ensemble_merge(
             return float("inf")
         return float(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
 
+    # Initialize reliability trackers if adaptive
+    reliabilities = {}
+    if adaptive_fusion:
+        for name in aligned_results:
+            w = weights.get(name, 1.0)
+            reliabilities[name] = DetectorReliability(base_w=w)
+
     for i in range(max_len):
         candidates = []
+        detector_outputs = []
+
         for name, (f0, conf) in aligned_results.items():
             w = weights.get(name, 1.0)
             c = float(conf[i])
             f = float(f0[i])
+
+            # Prepare data for adaptive fusion
+            cents = float("nan")
+            if f > 0.0:
+                 cents = 1200.0 * math.log2(f / 440.0) + 6900.0
+
+            detector_outputs.append({
+                "name": name,
+                "cents": cents,
+                "conf": c,
+                "voiced": c > 0.0 and f > 0.0
+            })
+
             if c <= 0.0 or f <= 0.0:
                 continue
 
@@ -626,27 +772,57 @@ def _ensemble_merge(
             candidates.append((name, f, eff_conf, w))
 
         if not candidates:
+            # Still update reliabilities with unvoiced?
+            # Step 2 logic: update only if voiced or valid.
+            # Actually we should update tracking state even if unvoiced?
+            # The snippet updates if voiced.
             final_f0[i] = 0.0
             final_conf[i] = 0.0
             continue
 
-        # Pick winner by weighted confidence
-        best_name, best_f0, best_conf, best_w = max(
-            candidates, key=lambda x: x[2] * x[3]
-        )
+        if adaptive_fusion:
+            # Step 2: Fuse frame
+            vals, wts = [], []
+            for out in detector_outputs:
+                cents = out["cents"]
+                if not out.get("voiced", True) or not (cents == cents):
+                    continue
+                # Assuming energy_ok is True for now, as we don't pass frame rms here
+                w = reliabilities[out["name"]].update(cents, out["conf"], energy_ok=True)
+                if w > 1e-6:
+                    vals.append(cents); wts.append(w)
 
-        # Consensus weighting: measure how many other detectors agree
-        total_w = sum(c[3] for c in candidates)
-        support_w = best_w
-        for name, f, c, w in candidates:
-            if name == best_name:
-                continue
-            if abs(_cent_diff(f, best_f0)) <= float(disagreement_cents):
-                support_w += w
+            fused_cents = weighted_median(vals, wts) if vals else float("nan")
 
-        consensus = support_w / max(total_w, 1e-6)
-        final_f0[i] = best_f0
-        final_conf[i] = best_conf * consensus
+            if fused_cents == fused_cents: # not nan
+                fused_hz = 440.0 * (2.0 ** ((fused_cents - 6900.0) / 1200.0))
+                final_f0[i] = fused_hz
+                # Use max confidence of contributors? Or weighted avg?
+                # Weighted avg confidence seems appropriate
+                final_conf[i] = sum(c[2] for c in candidates) / len(candidates) # rough approx
+            else:
+                final_f0[i] = 0.0
+                final_conf[i] = 0.0
+
+        else:
+            # Original Static Fusion
+            # Pick winner by weighted confidence
+            best_name, best_f0, best_conf, best_w = max(
+                candidates, key=lambda x: x[2] * x[3]
+            )
+
+            # Consensus weighting: measure how many other detectors agree
+            total_w = sum(c[3] for c in candidates)
+            support_w = best_w
+            for name, f, c, w in candidates:
+                if name == best_name:
+                    continue
+                if abs(_cent_diff(f, best_f0)) <= float(disagreement_cents):
+                    support_w += w
+
+            consensus = support_w / max(total_w, 1e-6)
+            final_f0[i] = best_f0
+            final_conf[i] = best_conf * consensus
 
     return final_f0, final_conf
 
@@ -1084,12 +1260,16 @@ def extract_features(
                     logger.warning(f"Detector {name} failed on stem {stem_name}: {e}")
 
         # Ensemble Merge with disagreement and SwiftF0 priority floor
+        # Check config for adaptive mode
+        use_adaptive = getattr(b_conf, "ensemble_mode", "static") == "adaptive"
+
         if stem_results:
             merged_f0, merged_conf = _ensemble_merge(
                 stem_results,
                 b_conf.ensemble_weights,
                 b_conf.pitch_disagreement_cents,
                 b_conf.confidence_priority_floor,
+                adaptive_fusion=use_adaptive,
             )
         else:
             merged_f0 = np.zeros(1, dtype=np.float32)
@@ -1156,6 +1336,7 @@ def extract_features(
                     strength_min=b_conf.polyphonic_peeling.get("strength_min", 0.8),
                     strength_max=b_conf.polyphonic_peeling.get("strength_max", 1.2),
                     flatness_thresholds=b_conf.polyphonic_peeling.get("flatness_thresholds", [0.3, 0.6]),
+                    use_freq_aware_masks=bool(config.stage_b.polyphonic_peeling.get("use_freq_aware_masks", True)),
                     )
                     all_layers.extend([f0 for f0, _ in iss_layers])
                     iss_total_layers += len(iss_layers)
@@ -1219,6 +1400,37 @@ def extract_features(
             melody_filter_eff,
         )
 
+        # Capture pre-smoothing (fused) F0 for debug artifacts
+        fused_f0_debug = merged_f0.copy()
+
+        # Step 3: Viterbi Smoothing (Optional)
+        use_viterbi_smoothing = getattr(b_conf, "smoothing_method", "tracker") == "viterbi"
+        if use_viterbi_smoothing and np.any(merged_f0 > 0):
+             # Define state space: e.g. MIDI 21..108
+             midi_states = list(range(21, 109))
+             # Convert f0 to cents for viterbi
+             fused_cents = []
+             for f in merged_f0:
+                 if f > 0:
+                     fused_cents.append(1200.0 * math.log2(f/440.0) + 6900.0)
+                 else:
+                     fused_cents.append(float("nan"))
+
+             # Run Viterbi
+             # Note: merged_conf is used as confidence
+             smoothed_hz = viterbi_pitch(
+                 fused_cents,
+                 merged_conf,
+                 midi_states,
+                 transition_smoothness=getattr(b_conf, "viterbi_transition_smoothness", 0.5),
+                 jump_penalty=getattr(b_conf, "viterbi_jump_penalty", 0.6)
+             )
+
+             if len(smoothed_hz) == len(merged_f0):
+                 # Replace merged_f0 with smoothed (or blend?)
+                 # For now replace, but keep confidence?
+                 merged_f0 = np.array(smoothed_hz, dtype=np.float32)
+
         # Build timeline with optional skyline selection from poly layers
         voicing_thr_global = float(b_conf.confidence_voicing_threshold)
 
@@ -1240,12 +1452,23 @@ def extract_features(
         # Use voicing_thr_effective for deciding voiced/unvoiced frames
         voicing_thr = voicing_thr_effective
 
-        # Record into diagnostics (no schema change if diagnostics already exists)
-        diagnostics = locals().get("diagnostics", None)
-        # Note: diagnostics dict is created at the end of the function usually,
-        # but we need to inject tuning_cents.
-        # We'll rely on collecting tuning_cents into a separate dict for now
-        # and merging into diagnostics at the end.
+        # Record fused/smoothed curves for debugging
+        # We use fused_f0_debug (pre-smoothing) and merged_f0 (post-smoothing)
+        # Note: diagnostics is a local variable shadowing the outer one if we are not careful
+        # But here we just want to prepare data to put into the FINAL diagnostics object.
+        # We can store it in 'per_detector' temporarily? No, that's typed.
+        # Let's add it to a new field in StageBOutput if allowed, or put it in per_detector under reserved names.
+
+        # Actually, let's just use the 'diagnostics' dict that we construct at the end of the function.
+        # We need to persist these arrays outside this loop.
+        # Let's use a side-channel dict `stem_debug_curves`
+        if "stem_debug_curves" not in locals():
+            stem_debug_curves = {}
+
+        stem_debug_curves[stem_name] = {
+            "fused_f0": fused_f0_debug,
+            "smoothed_f0": merged_f0,
+        }
 
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
@@ -1344,6 +1567,11 @@ def extract_features(
             # to downstream skyline selection instead of only the tracked voices.
             active = [(float(p), float(c)) for (p, c) in active_candidates if p > 0.0]
 
+            # Step 5 prep: Calculate Onset Strength for this frame/stem?
+            # Ideally compute global onset strength once per stem and attach to FramePitch
+            # We don't have it here yet. We can do it in Stage C or compute here.
+            # Let's leave it to Stage C or future.
+
             timeline.append(
                 FramePitch(
                     time=float(i * hop_length) / float(sr),
@@ -1403,6 +1631,9 @@ def extract_features(
     # The requirement says "store it in diagnostics".
     tuning_cents_val = locals().get("tuning_cents", 0.0)
 
+    # Retrieve debug curves if any
+    stem_debug_curves = locals().get("stem_debug_curves", {})
+
     # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
         "instrument": str(instrument),
@@ -1429,6 +1660,7 @@ def extract_features(
             "max_jump_cents": tracker_cfg.get("max_jump_cents", 150.0),
         },
         "global_tuning_cents": tuning_cents_val,
+        "debug_curves": stem_debug_curves,
     }
 
     primary_timeline = (

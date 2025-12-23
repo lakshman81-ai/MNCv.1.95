@@ -33,6 +33,12 @@ from .stage_c import apply_theory
 from .stage_d import quantize_and_render
 from .neural_transcription import transcribe_onsets_frames
 from .models import AnalysisData, StageAOutput, TranscriptionResult, StageBOutput, NoteEvent, FramePitch, Stem, AudioType
+# Step 1: Import debug artifact writers
+try:
+    from .debug import write_frame_timeline_csv
+except ImportError:
+    write_frame_timeline_csv = None
+
 # Optional dependency: validation.py may not exist in minimal 10-file set.
 _VALIDATION_AVAILABLE = True
 try:
@@ -413,17 +419,94 @@ def transcribe(
             ad = d_out.analysis_data  # TranscriptionResult.analysis_data
             # timeline.json
             timeline_rows = []
+            csv_rows = []
+
             for fp in getattr(ad, "timeline", []) or []:
                 # FramePitch fields per your schema
-                timeline_rows.append({
+                t_row = {
                     "time_sec": getattr(fp, "time", None),
                     "f0_hz": getattr(fp, "pitch_hz", None),
                     "midi": getattr(fp, "midi", None),
                     "confidence": getattr(fp, "confidence", None),
                     "rms": getattr(fp, "rms", None),
                     "active_pitches": getattr(fp, "active_pitches", None),
-                })
+                }
+                timeline_rows.append(t_row)
+
+                # Step 1: Prepare CSV rows
+                if write_frame_timeline_csv:
+                     # Calculate cents for debugging
+                     hz = t_row["f0_hz"] or 0.0
+                     cents = 0.0
+                     if hz > 0.0:
+                         cents = 1200.0 * math.log2(hz / 440.0) + 6900.0
+                     else:
+                         cents = float("nan")
+
+                     # Extract fused/smoothed from diagnostics if available, or fallback
+                     # Use Stage B "debug_curves" from diagnostics
+                     # The timeline iteration is sequential, so we can index into the debug arrays
+                     # assuming they match timeline length and order.
+                     # NOTE: stage_b_out.timeline might be a processed version of the arrays.
+                     # But for debug, we rely on the arrays having the same length/index.
+
+                     fused_c = cents
+                     smoothed_c = cents
+
+                     # Try to fetch from diagnostics
+                     # We assume single-stem 'mix' or 'vocals' dominated the timeline
+                     # We need the current index in the loop.
+                     # Enumerate logic needs to be added to the loop.
+                     # Or we trust that timeline_rows is built sequentially.
+                     idx = len(timeline_rows) - 1
+
+                     if stage_b_out and stage_b_out.diagnostics and "debug_curves" in stage_b_out.diagnostics:
+                         # Try mix first, then any
+                         curves = stage_b_out.diagnostics["debug_curves"].get("mix") or next(iter(stage_b_out.diagnostics["debug_curves"].values()), None)
+                         if curves:
+                             # Check bounds
+                             fused_arr = curves.get("fused_f0")
+                             smoothed_arr = curves.get("smoothed_f0")
+                             if fused_arr is not None and idx < len(fused_arr):
+                                 fval = fused_arr[idx]
+                                 if fval > 0:
+                                     fused_c = 1200.0 * math.log2(fval / 440.0) + 6900.0
+                                 else:
+                                     fused_c = float("nan")
+
+                             if smoothed_arr is not None and idx < len(smoothed_arr):
+                                 sval = smoothed_arr[idx]
+                                 if sval > 0:
+                                     smoothed_c = 1200.0 * math.log2(sval / 440.0) + 6900.0
+                                 else:
+                                     smoothed_c = float("nan")
+
+                     csv_row = {
+                        "t_sec": t_row["time_sec"],
+                        "f0_hz": t_row["f0_hz"],
+                        "midi": t_row["midi"],
+                        "cents": cents,
+                        "confidence": t_row["confidence"],
+                        "voiced": (t_row["f0_hz"] or 0) > 0,
+                        "detector_name": "fused",
+                        "harmonic_rank": 1,
+                        "fused_cents": fused_c,
+                        "smoothed_cents": smoothed_c,
+                     }
+                     # Basic CSV export
+                     csv_rows.append(csv_row)
+
             pipeline_logger.write_json("timeline.json", timeline_rows)
+
+            # Step 1: Write timeline.csv
+            if write_frame_timeline_csv and csv_rows:
+                 # Use pipeline_logger to get path?
+                 # pipeline_logger.write_text does file writing, but we have a CSV writer function.
+                 # We can construct path manually using pipeline_logger.base_dir
+                 if pipeline_logger.base_dir:
+                     csv_path = os.path.join(pipeline_logger.base_dir, "timeline.csv")
+                     write_frame_timeline_csv(csv_path, csv_rows)
+                     pipeline_logger.log_event("pipeline", "artifact_export", {"files": ["timeline.csv"]})
 
             # predicted_notes.json
             note_rows = []

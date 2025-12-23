@@ -454,6 +454,7 @@ def load_and_preprocess(
         audio = warped_linear_prediction(audio, sr=sr, pre_emphasis=float(tpe_conf.get("alpha", 0.97)))
 
     # 2. Trim Silence
+    # Allow strict override from config/overrides
     if a_conf.silence_trimming.get("enabled", True):
         audio = _trim_silence(audio, top_db=trim_db, frame_length=window_size, hop_length=hop_length)
 

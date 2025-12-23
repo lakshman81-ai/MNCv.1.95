@@ -35,6 +35,19 @@ except Exception:
 
 def _lcm(a, b): return abs(a*b) // math.gcd(a, b)
 
+def light_quantize_time(t, grid_times, max_shift=0.03):
+    """
+    Step 7: Light Quantization.
+    Only snap if nearest grid point is within max_shift.
+    Otherwise preserve rubato.
+    """
+    if not grid_times:
+        return t
+    nearest = min(grid_times, key=lambda g: abs(g - t))
+    if abs(nearest - t) <= max_shift:
+        return nearest
+    return t
+
 def quantize_and_render(
     events: List[NoteEvent],
     analysis_data: AnalysisData,
@@ -221,9 +234,43 @@ def quantize_and_render(
                     start_beats = e.start_sec / quarter_dur
 
         # D2: Quantize to grid
-        # Round start and duration to nearest grid unit
-        start_beats = round(start_beats / grid_res_beats) * grid_res_beats
-        dur_beats = max(grid_res_beats, round(dur_beats / grid_res_beats) * grid_res_beats)
+        # Check Step 7: "don't destroy rubato" mode
+        quant_mode = getattr(d_conf, "quantization_mode", "grid")
+
+        if quant_mode == "light_rubato":
+            # We need grid_times in beat space?
+            # Current grid resolution is grid_res_beats (e.g. 0.25).
+            # We can simulate grid_times by just checking distance to nearest multiple of grid_res_beats.
+
+            nearest_grid = round(start_beats / grid_res_beats) * grid_res_beats
+
+            # Calculate time shift in seconds to verify threshold?
+            # Or beat threshold.
+            # Threshold is light_rubato_snap_ms (default 30ms).
+            snap_ms = getattr(d_conf, "light_rubato_snap_ms", 30.0)
+            snap_sec = snap_ms / 1000.0
+
+            # Approx seconds per beat
+            sec_per_beat = 60.0 / bpm
+            snap_beats = snap_sec / sec_per_beat
+
+            if abs(start_beats - nearest_grid) <= snap_beats:
+                start_beats = nearest_grid
+                # If snapped, also snap duration? Or preserve duration?
+                # Usually snap start, let duration flow, but duration should probably be grid-aligned if possible?
+                # "quantize durations only, preserve onsets" or "cap onset movement"
+                # We implemented cap onset movement.
+
+            # Duration quantization
+            # We can also be gentle with duration
+            nearest_dur = round(dur_beats / grid_res_beats) * grid_res_beats
+            if abs(dur_beats - nearest_dur) <= snap_beats:
+                 dur_beats = max(grid_res_beats, nearest_dur)
+
+        else:
+            # Round start and duration to nearest grid unit (Standard)
+            start_beats = round(start_beats / grid_res_beats) * grid_res_beats
+            dur_beats = max(grid_res_beats, round(dur_beats / grid_res_beats) * grid_res_beats)
 
         return float(start_beats), float(dur_beats)
 

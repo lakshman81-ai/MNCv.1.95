@@ -129,6 +129,16 @@ class StageBConfig:
         }
     )
 
+    # Ensemble fusion mode: "static" (weighted sum) | "adaptive" (reliability-gated weighted median)
+    ensemble_mode: str = "static"
+
+    # Smoothing method: "tracker" (Hungarian assignment) | "viterbi" (HMM-based)
+    smoothing_method: str = "tracker"
+
+    # Viterbi smoothing parameters
+    viterbi_transition_smoothness: float = 0.5
+    viterbi_jump_penalty: float = 0.6
+
     # Polyphonic peeling (ISS) settings
     polyphonic_peeling: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -153,6 +163,7 @@ class StageBConfig:
             "strength_min": 0.8,
             "strength_max": 1.2,
             "flatness_thresholds": [0.3, 0.6],  # [low, high]
+            "use_freq_aware_masks": True,
         }
     )
 
@@ -305,6 +316,10 @@ class StageCConfig:
         }
     )
 
+    # Feature Flags for robustness upgrades
+    use_onset_refinement: bool = True
+    use_repeated_note_splitter: bool = True
+
     # Polyphony filter mode ("skyline_top_voice" used as a hint to Stage D)
     polyphony_filter: Dict[str, str] = field(
         default_factory=lambda: {"mode": "skyline_top_voice"}
@@ -335,6 +350,10 @@ class StageDConfig:
     staccato_marking: Dict[str, Any] = field(
         default_factory=lambda: {"threshold_beats": 0.25}
     )
+
+    # Quantization mode: "grid" (strict) | "light_rubato" (snap only if close)
+    quantization_mode: str = "grid"
+    light_rubato_snap_ms: float = 30.0
 
     # General glissando detection (disabled for piano by WI)
     glissando_threshold_general: Dict[str, Any] = field(
