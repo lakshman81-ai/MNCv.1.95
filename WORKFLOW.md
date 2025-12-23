@@ -1,4 +1,4 @@
-# Pipeline Workflow & Contracts (MNC v1.95)
+# Pipeline Workflow & Contracts (MNC v2.0)
 
 This document outlines the detailed call graph, data flow, algorithms, and configuration triggers for the music transcription pipeline (Stages A-D).
 
@@ -19,12 +19,12 @@ flowchart TD
     end
     StageA --> SA1
 
-    %% Decision: Neural Bypass vs Standard
-    SA2 --> CheckOF{Onsets & Frames<br>Enabled?}
-    CheckOF -- Yes --> NeuralTrans[Neural Transcription<br>transcribe_onsets_frames]
+    %% Decision: Neural E2E vs Standard
+    SA2 --> CheckE2E{E2E Mode?<br>Basic Pitch / Auto}
+    CheckE2E -- Yes --> NeuralTrans[Neural Transcription<br>Basic Pitch / O&F]
     NeuralTrans --> StageD
 
-    CheckOF -- No --> LogicStart
+    CheckE2E -- No --> LogicStart
 
     %% --- STAGE B: FEATURE EXTRACTION ---
     subgraph StageB_Process [Stage B: Feature Extraction]
@@ -41,20 +41,13 @@ flowchart TD
 
             SL1 -- Yes --> SL1_Load[Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN]
             SL1 -- No --> SL1_Def[Load Default Config]
-
-            %% Logic 3: Fallback
-            SL1_Load & SL1_Def --> SL3{3. Fallback Check<br>Neural Models Available?}
-
-            SL3 -- Yes --> SL3_Neural[Enable Neural Models<br>SwiftF0 / CREPE / RMVPE]
-            SL3 -- No --> SL3_DSP[Fallback to DSP Only<br>YIN / SACF]
         end
 
         %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
-        subgraph Detectors [Note Extraction Algorithms]
+        subgraph Detectors [Detector Bank]
             direction TB
             %% Setup Inputs
-            SL3_Neural --> D_Input
-            SL3_DSP --> D_Input(Run Detectors Parallel)
+            SL1_Load & SL1_Def --> D_Input(Run Detectors Parallel)
 
             %% The 6 Algorithms from Section 2
             D_Input --> Alg_YIN
@@ -75,23 +68,25 @@ flowchart TD
         %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
         Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
 
-        subgraph Ensemble_Logic [Ensemble Weights]
-            Ensemble[**2. Ensemble Weights**<br>Merge Outputs]
+        subgraph Ensemble_Logic [Ensemble & Smoothing]
+            Ensemble[**2. Ensemble Fusion**<br>Merge Outputs]
 
-            %% Logic 2: Weighted Average
-            Ensemble --> Weights{Apply Weights}
-            Weights -- SwiftF0 --> W1[0.5]
-            Weights -- SACF --> W2[0.3]
-            Weights -- CREPE --> W3[High]
-            Weights -- Other --> W4[...]
+            %% Logic 2: Fusion Mode
+            Ensemble --> Fusion{Mode?}
+            Fusion -- Static --> W_Avg[Weighted Average]
+            Fusion -- Adaptive --> W_Med[Reliability-Gated<br>Weighted Median]
 
-            W1 & W2 & W3 & W4 --> ResultB([Main Stage B Output])
+            W_Avg & W_Med --> Smoothing{Smoothing?}
+            Smoothing -- Tracker --> S_Track[Hungarian Tracker]
+            Smoothing -- Viterbi --> S_Vit[Viterbi Path]
+
+            S_Track & S_Vit --> ResultB([Main Stage B Output])
         end
 
         %% --- ISS / POLYPHONY (Parallel Path 2) ---
         %% ISS runs independently using a primary detector to peel layers
         LogicStart -.-> CheckPoly{Polyphonic?}
-        CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers]
+        CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers<br>(Adaptive / Freq-Aware)]
         ISS --> PolyLayers([Polyphonic Layers])
         CheckPoly -- No --> NoPoly[No Peeling]
     end
@@ -101,7 +96,7 @@ flowchart TD
     ResultB & NoPoly --> StageC
 
     subgraph StageC_Process [Stage C]
-        SC1["Segmentation<br>(Threshold / HMM)"] --> SC2[Duration/Velocity Filter]
+        SC1["Segmentation<br>(Threshold / HMM / Decomposed)"] --> SC2[Duration/Velocity Filter]
     end
 
     subgraph StageD_Process [Stage D: Quantize & Render]
@@ -116,7 +111,7 @@ flowchart TD
 ### Stage A: Preprocessing
 *   **Signal Conditioning**: The input audio is resampled to a consistent rate (44.1kHz or 22.05kHz), mixed to mono, and trimmed of silence.
 *   **Normalization**: Loudness is normalized to a target (e.g., -23 LUFS) to ensure consistent detector response.
-*   **Neural Bypass**: If "Onsets & Frames" is enabled, the classic pipeline is bypassed, sending neural transcription directly to Stage D.
+*   **E2E Bypass**: If `transcription_mode` is set to "e2e_basic_pitch" or "onsets_and_frames", the classic detector pipeline is bypassed, sending neural transcription results directly to Stage C/D.
 
 ### Stage B: Selection & Detectors (Sections 2 & 3)
 *   **Selection Logic**:
@@ -128,20 +123,29 @@ flowchart TD
     *   **CQT**: Spectral analysis validator.
 
 ### Stage B: Polyphony & Ensemble
-*   **Ensemble Fusion**: Outputs from the active detector bank are merged using weighted averaging (or adaptive fusion) to produce a single, high-confidence "Main Voice" timeline.
-*   **Polyphony (ISS)**: In parallel, **Iterative Spectral Subtraction** peels multiple layers of accompaniment voices using a primary detector if the input is polyphonic.
+*   **Ensemble Fusion**: Outputs are fused into a main timeline.
+    *   **Static**: Traditional weighted averaging.
+    *   **Adaptive**: Reliability-gated weighted median (robust against outliers).
+*   **Smoothing**:
+    *   **Tracker**: Hungarian assignment for voice continuity.
+    *   **Viterbi**: HMM-based pathfinding for optimal global pitch contour.
+*   **Polyphony (ISS)**: **Iterative Spectral Subtraction** peels accompaniment voices. Now supports **Adaptive** strength and **Frequency-Aware Masks** (wider for bass).
 *   **Output**: The Main Voice and Polyphonic Layers are combined and sent to Stage C.
 
 ### Stage C: Segmentation
-*   **Note Extraction**: Continuous pitch timelines are segmented into discrete notes using **Thresholding** (default) or **HMM/Viterbi** (optional).
-*   **Refinement**: Note boundaries are snapped to spectral flux peaks (Onsets), and repeated notes (re-articulations) are split based on energy bumps.
+*   **Note Extraction**:
+    *   **Skyline**: Selects the best candidate per frame (prioritizing confidence & vocal band).
+    *   **Decomposed Melody**: Fully decomposes polyphony and picks the strongest melodic track.
+*   **Refinement**:
+    *   **Onset Snapping**: Aligns starts to spectral flux peaks.
+    *   **Repeated Note Splitter**: Splits long notes on re-articulation (energy bumps).
 *   **Filtering**: Notes below minimum duration or velocity thresholds are discarded.
 
 ### Stage D: Quantization & Rendering
-*   **Quantization**: Notes are aligned to a rhythmic grid.
-    *   **Grid Mode**: Hard snap to the nearest grid unit (e.g., 1/16th).
-    *   **Light Rubato**: Snaps only notes close to the grid, preserving expressive timing elsewhere.
-*   **Rendering**: The quantized notes are formatted into a MusicXML score and MIDI file for export.
+*   **Quantization**:
+    *   **Grid Mode**: Hard snap to nearest grid unit (e.g., 1/16th).
+    *   **Light Rubato**: Snaps only notes close to the grid (within ~30ms), preserving expressive timing elsewhere.
+*   **Rendering**: Formats notes into MusicXML (Grand Staff with braces) and MIDI (including glissando).
 
 ## Tunable Parameters (Tuner/Audit)
 
@@ -152,29 +156,32 @@ The following parameters are exposed for iterative tuning and audit verification
 *   `loudness_normalization.target_lufs`: Target integrated loudness (e.g., -23.0).
 *   `high_pass_filter.cutoff_hz`: HPF cutoff (20-60Hz).
 *   `bpm_detection.min_bpm` / `max_bpm`: Allowed tempo range.
+*   `peak_limiter.mode`: "soft" or "hard" clipping.
 
 ### Stage B: Features
+*   **Mode**:
+    *   `transcription_mode`: "classic", "e2e_basic_pitch", "auto".
+    *   `active_stems`: Whitelist of stems to process (e.g., ["vocals"]).
 *   **Separation**:
     *   `separation.enabled`: Auto/True/False.
     *   `separation.model`: "htdemucs" or "synthetic" (L2).
-    *   `separation.harmonic_masking.mask_width`: Width of harmonic exclusion.
 *   **Detectors**:
     *   `detectors.<name>.enabled`: Toggle SwiftF0, YIN, CREPE, RMVPE.
-    *   `detectors.<name>.fmin/fmax`: Frequency search range.
     *   `ensemble_weights.<name>`: Contribution of each detector.
 *   **Fusion & Smoothing**:
-    *   `ensemble_mode`: "static" (weighted average) or "adaptive" (reliability-gated weighted median).
+    *   `ensemble_mode`: "static" (weighted average) or "adaptive" (reliability-gated).
     *   `smoothing_method`: "tracker" (Hungarian) or "viterbi" (HMM).
-    *   `voice_tracking.smoothing`: Temporal smoothing factor.
+    *   `viterbi_transition_smoothness`: Smoothness cost for Viterbi.
 *   **Polyphony**:
     *   `polyphonic_peeling.max_layers`: Max voices to extract (ISS).
-    *   `polyphonic_peeling.mask_width`: Spectral mask width.
     *   `polyphonic_peeling.iss_adaptive`: Enable adaptive strength.
     *   `polyphonic_peeling.use_freq_aware_masks`: Wider masks for bass frequencies.
+    *   `polyphonic_peeling.cqt_gate_enabled`: Soft spectral gating for candidates.
 
 ### Stage C: Segmentation
 *   **Logic**:
     *   `segmentation_method.method`: "hmm", "threshold", "viterbi".
+    *   `polyphony_filter.mode`: "skyline_top_voice" (default) or "decomposed_melody" (L5).
     *   `confidence_threshold`: Minimum confidence for note activation.
     *   `min_note_duration_ms`: Minimum duration (Mono).
     *   `min_note_duration_ms_poly`: Minimum duration (Poly).
@@ -182,12 +189,15 @@ The following parameters are exposed for iterative tuning and audit verification
 *   **Refinement**:
     *   `use_onset_refinement`: Snap start times to flux peaks.
     *   `use_repeated_note_splitter`: Split long notes on energy re-articulation.
-    *   `pitch_tolerance_cents`: Max drift within a note.
+    *   `chord_onset_snap_ms`: Tolerance for snapping simultaneous notes.
+    *   `gap_filling.max_gap_ms`: Max gap to bridge for legato.
 
 ### Stage D: Quantization
 *   `quantization_mode`: "grid" or "light_rubato".
 *   `light_rubato_snap_ms`: Window for snapping in rubato mode (e.g., 30ms).
 *   `quantization_grid`: Grid resolution (16 = 1/16th).
+*   `forced_key`: Override detected key signature.
+*   `glissando_threshold_general`: Config for glissando detection.
 
 ---
 
@@ -216,7 +226,7 @@ The following parameters are exposed for iterative tuning and audit verification
     *   **Algorithm**: EBU R128 (via `pyloudnorm`) or RMS-based gain.
     *   **Why**: Ensures consistent energy levels for detector confidence thresholds.
 7.  **BPM Detection**:
-    *   **Algorithm**: `librosa.beat.beat_track` (tightness=100).
+    *   **Algorithm**: `librosa.beat.beat_track` (tightness=100) or Fallback loop.
     *   **Why**: Provides the rhythmic grid for quantization.
 8.  **Texture Detection**:
     *   **Algorithm**: Spectral flatness analysis (`detect_audio_type`).
@@ -259,7 +269,7 @@ class StageAOutput:
     *   **Why**: Produces smoother, more musical pitch contours than simple frame-by-frame selection.
 5.  **Polyphonic Peeling (ISS)**:
     *   **Trigger**: `polyphonic_peeling.max_layers > 0` AND Polyphonic context.
-    *   **Algorithm**: Iterative Spectral Subtraction with **Frequency-Aware Masking** (wider masks for bass).
+    *   **Algorithm**: Iterative Spectral Subtraction with **Frequency-Aware Masking** (wider masks for bass) and **Adaptive Strength**.
     *   **Why**: Recovers secondary voices (accompaniment) hidden by the melody.
 
 ### Configuration & Thresholds
@@ -270,7 +280,7 @@ class StageAOutput:
 | `ensemble_mode` | "static" | "static","adaptive" | Fusion strategy. |
 | `smoothing_method` | "tracker" | "tracker","viterbi" | Smoothing algorithm. |
 | `polyphonic_peeling.max_layers` | 8 | 0-16 | Max number of ISS layers. |
-| `polyphonic_peeling.use_freq_aware_masks` | True | Bool | Wider masks for bass freqs. |
+| `polyphonic_peeling.iss_adaptive` | True | Bool | Adapt subtraction strength. |
 
 ### Output Contract: `StageBOutput`
 
@@ -283,7 +293,8 @@ class StageBOutput:
     stem_timelines: Dict[str, List[FramePitch]] # Per-stem timelines
     per_detector: Dict[str, Any]    # Raw detector outputs
     meta: MetaData                  # Passed through
-    diagnostics: Dict[str, Any]     # "fused_f0", "smoothed_f0" curves
+    diagnostics: Dict[str, Any]     # "fused_f0", "cqt_gate", "iss"
+    precalculated_notes: Optional[List[NoteEvent]] # E2E bypass notes
 ```
 
 ---
@@ -296,7 +307,7 @@ class StageBOutput:
 
 1.  **Skyline Selection**:
     *   **Trigger**: `polyphony_filter.mode = "skyline_top_voice"`.
-    *   **Algorithm**: Selects "best" candidate per frame based on Confidence, Continuity, and Vocal Range.
+    *   **Algorithm**: Selects "best" candidate per frame based on Confidence, Continuity, and Vocal Range (80-1400Hz).
 2.  **Onset Refinement (`snap_onset`)**:
     *   **Trigger**: `use_onset_refinement=True`.
     *   **Algorithm**: Aligns note start times to local peaks in spectral flux (onset strength).
@@ -308,6 +319,7 @@ class StageBOutput:
 4.  **Polyphonic Decomposition**:
     *   **Trigger**: Polyphonic AudioType + `polyphony_filter.mode != "skyline_top_voice"`.
     *   **Algorithm**: Greedily assigns concurrent pitches to stable voice tracks.
+    *   **Mode "decomposed_melody"**: Decomposes fully but selects only the single best track (for difficult melody extraction).
 
 ### Configuration & Thresholds
 
@@ -345,13 +357,13 @@ class AnalysisData:
     *   **Why**: "Light Rubato" preserves expressive timing for solo performances while fixing obvious errors.
 2.  **Voice Assignment**:
     *   **Strategy**: Uses `NoteEvent.voice` ID. Groups events by (Staff, Voice).
-    *   **Mapping**: Treble/Bass Staff split (default C4/60).
+    *   **Mapping**: Treble/Bass Staff split (default C4/60) + Grand Staff grouping.
 3.  **Music21 Rendering**:
-    *   **Objects**: `Note`, `Chord`, `Part`, `Score`.
-    *   **Layout**: Grand Staff group.
+    *   **Objects**: `Note`, `Chord`, `Part`, `Score`, `Glissando`.
+    *   **Layout**: Grand Staff group with brace.
 4.  **Export**:
     *   **MusicXML**: String dump.
-    *   **MIDI**: Binary write.
+    *   **MIDI**: Binary write (via temp file).
 
 ### Configuration & Thresholds
 
@@ -360,7 +372,7 @@ class AnalysisData:
 | `quantization_mode` | "grid" | "grid","light_rubato" | Quantization strategy. |
 | `light_rubato_snap_ms` | 30.0 | 10-100 | Snap window for rubato. |
 | `quantization_grid` | 16 | 4,8,16,32 | Grid resolution. |
-| `staccato_marking.threshold_beats` | 0.25 | 0.1-1.0 | Max duration for staccato. |
+| `forced_key` | None | Str | Override key signature. |
 
 ### Output Contract: `TranscriptionResult`
 
