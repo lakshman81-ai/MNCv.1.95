@@ -1,64 +1,128 @@
-# Pipeline Workflow & Contracts
+# Pipeline Workflow & Contracts (MNC v1.95)
 
 This document outlines the detailed call graph, data flow, algorithms, and configuration triggers for the music transcription pipeline (Stages A-D).
 
-## Algorithm Selection & Flow
+## Detailed Pipeline Flowchart
 
-The following flowchart illustrates how the pipeline selects methods based on input characteristics and configuration, including the segmented transcription logic.
+This chart explicitly details the Algorithm Selection Logic (Profile $\rightarrow$ Weights $\rightarrow$ Fallback) and expands the Detector Bank to include every algorithm mentioned in Section 2.
 
 ```mermaid
 flowchart TD
-    Start[Import WAV] --> StageA[Stage A: Signal Conditioning]
-    StageA --> CheckSeg{Duration > 10s &<br>Segmented Config?}
+    %% Main Entry Point
+    Start([Start: Audio Input]) --> StageA[Stage A: Signal Conditioning]
 
-    %% Segmented Path
-    CheckSeg -- Yes --> SegLoop[Segmentation Loop]
-    SegLoop --> Slice[Slice 10s Audio]
-    Slice --> Gens[Generate Candidates C1, C2, C3]
-    Gens --> EvalLoop[Evaluate Candidates]
-    EvalLoop --> RunBC[Run Stage B & C]
-    RunBC --> Score[Score Segment]
-    Score --> Select[Select Best Candidate]
-    Select --> Stitch[Stitch Notes]
-    Stitch --> NextSeg{More Audio?}
-    NextSeg -- Yes --> Slice
-    NextSeg -- No --> StageD
+    %% Stage A Summary
+    subgraph StageA_Process [Stage A: Preprocessing]
+        SA1[Resample / Mono / Trim]
+        SA2[Loudness Norm EBU R128]
+        SA1 --> SA2
+    end
+    StageA --> SA1
 
-    %% Standard Path
-    CheckSeg -- No --> StageB[Stage B: Feature Extraction]
-    StageB --> CheckPoly{Polyphonic?}
-    CheckPoly -- Yes --> Sep{Separation Enabled?}
-    Sep -- Yes --> Demucs[HTDemucs/Synthetic Separation]
-    Demucs --> Detectors
-    Sep -- No --> Detectors
-    CheckPoly -- No --> Detectors[Pitch Detectors<br>SwiftF0/YIN/CREPE]
+    %% Decision: Neural Bypass vs Standard
+    SA2 --> CheckOF{Onsets & Frames<br>Enabled?}
+    CheckOF -- Yes --> NeuralTrans[Neural Transcription<br>transcribe_onsets_frames]
+    NeuralTrans --> StageD
 
-    Detectors --> Ensemble[Ensemble Fusion]
-    Ensemble --> Smooth{Smoothing Mode}
-    Smooth -- Viterbi --> Viterbi[Viterbi Smoothing]
-    Smooth -- Tracker --> Tracker[Voice Tracking]
+    CheckOF -- No --> LogicStart
 
-    Tracker --> Peeling{Poly Peeling?}
-    Viterbi --> Peeling
-    Peeling -- Yes --> ISS[Iterative Spectral Subtraction]
-    ISS --> StageC
-    Peeling -- No --> StageC
+    %% --- SECTION 3: SELECTION LOGIC ---
+    subgraph Selection_Logic [Section 3: Selection Logic]
+        direction TB
+        LogicStart(Input Context)
 
-    StageC[Stage C: Theory] --> Onset{Refine Onsets?}
-    Onset -- Yes --> Snap[Snap to Flux Peaks]
-    Snap --> Split{Split Repetitions?}
-    Onset -- No --> Split
-    Split -- Yes --> Splitter[Repeated Note Splitter]
-    Splitter --> StageD
-    Split -- No --> StageD
+        %% Logic 1: Instrument Profile
+        SL1{1. Instrument<br>Profile?}
+        LogicStart --> SL1
 
-    StageD[Stage D: Rendering] --> Quant{Quantization Mode}
-    Quant -- Grid --> GridQ[Hard Grid Snap]
-    Quant -- Light Rubato --> RubatoQ[Light Snap < 30ms]
+        SL1 -- Yes --> SL1_Load[Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN]
+        SL1 -- No --> SL1_Def[Load Default Config]
 
-    GridQ --> Output[MusicXML / MIDI]
-    RubatoQ --> Output
+        %% Logic 3: Fallback
+        SL1_Load & SL1_Def --> SL3{3. Fallback Check<br>Neural Models Available?}
+
+        SL3 -- Yes --> SL3_Neural[Enable Neural Models<br>SwiftF0 / CREPE / RMVPE]
+        SL3 -- No --> SL3_DSP[Fallback to DSP Only<br>YIN / SACF]
+    end
+
+    %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
+    subgraph Detectors [Section 2: Note Extraction Algorithms]
+        direction TB
+        %% Setup Inputs
+        SL3_Neural --> D_Input
+        SL3_DSP --> D_Input(Run Detectors Parallel)
+
+        %% The 6 Algorithms from Section 2
+        D_Input --> Alg_YIN
+        D_Input --> Alg_Swift
+        D_Input --> Alg_SACF
+        D_Input --> Alg_CREPE
+        D_Input --> Alg_RMVPE
+        D_Input --> Alg_CQT
+
+        Alg_YIN[**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>]
+        Alg_Swift[**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>]
+        Alg_SACF[**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>]
+        Alg_CREPE[**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>]
+        Alg_RMVPE[**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>]
+        Alg_CQT[**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>]
+    end
+
+    %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
+    Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
+
+    subgraph Ensemble_Logic [Section 3: Ensemble Weights]
+        Ensemble[**2. Ensemble Weights**<br>Merge Outputs]
+
+        %% Logic 2: Weighted Average
+        Ensemble --> Weights{Apply Weights}
+        Weights -- SwiftF0 --> W1[0.5]
+        Weights -- SACF --> W2[0.3]
+        Weights -- CREPE --> W3[High]
+        Weights -- Other --> W4[...]
+
+        W1 & W2 & W3 & W4 --> ResultB([Main Stage B Output])
+    end
+
+    %% --- ISS / POLYPHONY (Parallel Path 2) ---
+    %% ISS runs independently using a primary detector to peel layers
+    LogicStart -.-> CheckPoly{Polyphonic?}
+    CheckPoly -- Yes --> ISS[**Iterative Spectral Subtraction**<br>Peel multiple layers]
+    ISS --> PolyLayers([Polyphonic Layers])
+    CheckPoly -- No --> NoPoly[No Peeling]
+
+    %% Merge Paths
+    ResultB & PolyLayers --> StageC[Stage C: Apply Theory]
+    ResultB & NoPoly --> StageC
+
+    subgraph StageC_Process [Stage C]
+        SC1[Segmentation<br>(Threshold / HMM)] --> SC2[Duration/Velocity Filter]
+    end
+
+    SC2 --> StageD[Stage D: Quantize & Render]
+    StageD --> End([Final Output])
 ```
+
+## Flowchart Explainer
+
+### Section 3: Selection Logic
+*   **Instrument Profile**: The pipeline first checks if a specific instrument is defined (e.g., "Violin"). If so, it forces "Recommended Algorithms" (like CREPE for violin) to take precedence over defaults.
+*   **Fallback**: Before running, it checks system health. If neural libraries (like torch for SwiftF0/RMVPE) are missing or crash, the system automatically falls back to DSP methods (YIN/SACF) to ensure something is always output.
+*   **Ensemble Weights**: Finally, all running detectors are merged using specific weights (e.g., trusting SwiftF0 more than SACF) to create a single confident pitch timeline (Main Voice).
+
+### Section 2: Note Extraction Algorithms
+The chart now explicitly shows all 6 supported detectors running in parallel (configuration permitting):
+*   **YIN**: Robust, used for Bass.
+*   **SwiftF0**: High-priority neural estimator.
+*   **SACF**: Simple autocorrelation (backup).
+*   **CREPE**: High-accuracy neural model for mono instruments.
+*   **RMVPE**: Specialized for vocals.
+*   **CQT**: Frequency-domain transform for spectral analysis.
+
+### Polyphony Handling
+*   **Parallel Processing**: Polyphonic processing (ISS) occurs in parallel with the main ensemble fusion.
+*   **Iterative Spectral Subtraction (ISS)**: If the input context is polyphonic, the system peels multiple layers using a primary detector (e.g., SwiftF0) and spectral masking to extract accompaniment voices.
+*   **Result**: The Main Voice (from Ensemble) and Polyphonic Layers (from ISS) are combined into the final Stage B output.
 
 ## Tunable Parameters (Tuner/Audit)
 
