@@ -138,36 +138,66 @@ def _postprocess_candidates(
     cqt_ctx: Optional[dict],
     max_candidates: int,
     dup_cents: float = 35.0,
-    octave_cents: float = 35.0,
+    harmonic_cents: float = 35.0,
     cqt_gate_mul: float = 0.25,
     cqt_support_ratio: float = 2.0,
     harmonic_drop_ratio: float = 0.75,
+    min_post_conf: float = 0.12,
+    harmonic_ratios: Tuple[int, ...] = (2, 3, 4),
+    subharmonic_boost_ratio: float = 1.15,
+    subharmonic_conf_mul: float = 0.6,
 ) -> List[Tuple[float, float]]:
     """
+    Cleanup for per-frame polyphonic F0 candidates.
+
+    What it does (in order):
     - Soft CQT gate: if a candidate lacks spectral support at its fundamental, reduce conf.
+    - Optional subharmonic injection: if f/2 has stronger CQT support than f, add (f/2) as a weak candidate.
+      This helps when detectors "lock" onto harmonics instead of fundamentals (common in dense piano).
     - Drop near-duplicates (within dup_cents).
-    - Suppress octave-harmonic duplicates when 2x looks like a harmonic of x.
-    - Cap count and renormalize confidences to [0,1] (max=1).
+    - Suppress harmonic duplicates for ratios in `harmonic_ratios` (default: 2×, 3×, 4×).
+    - Cap count and renormalize confidences to [0, 1] (max=1).
+
+    Notes:
+    - `min_post_conf` is applied AFTER the CQT gate so weak, unsupported pitches don't leak downstream.
     """
     if not candidates:
         return []
 
-    # clamp conf and soft CQT gate
     floor = _cqt_frame_floor(cqt_ctx, frame_idx)
+
     gated: List[Tuple[float, float]] = []
+    extra: List[Tuple[float, float]] = []
+
+    # clamp conf and soft CQT gate (+ optional subharmonic)
     for f, c in candidates:
         if f <= 0.0 or c <= 0.0:
             continue
+        f = float(f)
         c = float(max(0.0, min(1.0, c)))
 
+        m_f = 0.0
         if cqt_ctx is not None and floor > 0.0:
-            m = _cqt_mag_at(cqt_ctx, frame_idx, float(f))
+            m_f = _cqt_mag_at(cqt_ctx, frame_idx, f)
             # support if fundamental bin stands out vs median floor
-            if m < floor * float(cqt_support_ratio):
+            if m_f < floor * float(cqt_support_ratio):
                 c *= float(cqt_gate_mul)
 
-        if c > 0.0:
-            gated.append((float(f), float(c)))
+            # Subharmonic injection: if the "half" bin is stronger, we may be tracking a harmonic.
+            sub_f = f * 0.5
+            if sub_f >= 20.0 and m_f > 0.0:
+                m_sub = _cqt_mag_at(cqt_ctx, frame_idx, sub_f)
+                if m_sub > m_f * float(subharmonic_boost_ratio):
+                    extra.append((sub_f, c * float(subharmonic_conf_mul)))
+
+        if c >= float(min_post_conf):
+            gated.append((f, c))
+
+    if extra:
+        # Merge extra candidates (they'll be deduped later)
+        for f, c in extra:
+            if f > 0.0 and c >= float(min_post_conf):
+                gated.append((float(f), float(c)))
 
     if not gated:
         return []
@@ -177,16 +207,16 @@ def _postprocess_candidates(
 
     kept: List[Tuple[float, float]] = []
 
-    # helper: decide if hi is likely harmonic of lo using CQT ratio + cents check
-    def _looks_like_harmonic(lo: float, hi: float) -> bool:
+    def _looks_like_harmonic(lo: float, hi: float, ratio: int) -> bool:
         if cqt_ctx is None:
             return False
-        # ensure hi ~ 2*lo
-        if abs(_cents_diff(hi, 2.0 * lo)) > octave_cents:
+        if ratio <= 1:
+            return False
+        # ensure hi ~ ratio*lo
+        if abs(_cents_diff(hi, float(ratio) * lo)) > harmonic_cents:
             return False
         m_lo = _cqt_mag_at(cqt_ctx, frame_idx, lo)
         m_hi = _cqt_mag_at(cqt_ctx, frame_idx, hi)
-        # if hi is much weaker than lo, it's likely just the 2nd harmonic of lo
         if m_lo <= 0.0:
             return False
         return (m_hi / (m_lo + 1e-9)) < float(harmonic_drop_ratio)
@@ -201,16 +231,18 @@ def _postprocess_candidates(
         if dup:
             continue
 
-        # 2) octave-harmonic suppression: if this candidate is ~2x of an already-kept one
-        # and looks like a harmonic rather than a true octave note, skip it.
+        # 2) harmonic suppression: if this candidate is ~r× of an already-kept one and looks harmonic, skip it.
         harm = False
         for fk, ck in kept:
-            # if f is hi and fk is lo
-            if fk > 0.0 and f > 0.0 and abs(_cents_diff(f, 2.0 * fk)) <= octave_cents:
-                if _looks_like_harmonic(fk, f) and c <= ck * 1.10:
-                    harm = True
-                    break
-            # if f is lo and fk is hi, we keep lo (strong fundamentals) so no need to drop lo
+            if fk <= 0.0:
+                continue
+            for r in harmonic_ratios:
+                if abs(_cents_diff(f, float(r) * fk)) <= harmonic_cents:
+                    if _looks_like_harmonic(fk, f, int(r)) and c <= ck * 1.10:
+                        harm = True
+                        break
+            if harm:
+                break
         if harm:
             continue
 
@@ -1753,6 +1785,24 @@ def extract_features(
         # B3: Apply tuning offset during MIDI conversion
         tuning_semitones = tuning_cents / 100.0
 
+        # Poly-peeling postprocessing knobs (computed once per stem for speed and consistency)
+        tracker_cap = int(tracker.max_tracks)
+        max_active_pitches = int(b_conf.polyphonic_peeling.get("max_active_pitches_per_frame", max(tracker_cap, 10)))
+        max_candidates_per_frame = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", max_active_pitches))
+        min_post_conf = float(b_conf.polyphonic_peeling.get("min_post_conf", 0.12))
+
+        harm_ratios_raw = b_conf.polyphonic_peeling.get("harmonic_ratios", (2, 3, 4))
+        try:
+            harmonic_ratios = tuple(int(x) for x in harm_ratios_raw)
+            if not harmonic_ratios:
+                harmonic_ratios = (2, 3, 4)
+        except Exception:
+            harmonic_ratios = (2, 3, 4)
+
+        harmonic_cents = float(b_conf.polyphonic_peeling.get("harmonic_cents", b_conf.polyphonic_peeling.get("octave_cents", 35.0)))
+        subharmonic_boost_ratio = float(b_conf.polyphonic_peeling.get("subharmonic_boost_ratio", 1.15))
+        subharmonic_conf_mul = float(b_conf.polyphonic_peeling.get("subharmonic_conf_mul", 0.6))
+
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
             for f0_arr, conf_arr in padded_layers:
@@ -1761,25 +1811,30 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
-            # ---- cleanup: CQT soft gate + dedupe + octave-harmonic suppression + cap ----
-            # Cap tied to tracker capacity (prevents active_pitches explosion)
-            max_cands = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks))
+            # ---- cleanup: CQT soft gate + dedupe + harmonic suppression + cap ----
+            # Keep a larger "active" pool for downstream chord detection, but track only up to tracker capacity.
             candidates = _postprocess_candidates(
                 candidates=candidates,
                 frame_idx=i,
                 cqt_ctx=cqt_ctx,
-                max_candidates=max_cands,
+                max_candidates=max_candidates_per_frame,
                 dup_cents=float(b_conf.polyphonic_peeling.get("dup_cents", 35.0)),
-                octave_cents=float(b_conf.polyphonic_peeling.get("octave_cents", 35.0)),
+                harmonic_cents=harmonic_cents,
                 cqt_gate_mul=float(b_conf.polyphonic_peeling.get("cqt_gate_mul", 0.25)),
                 cqt_support_ratio=float(b_conf.polyphonic_peeling.get("cqt_support_ratio", 2.0)),
                 harmonic_drop_ratio=float(b_conf.polyphonic_peeling.get("harmonic_drop_ratio", 0.75)),
+                min_post_conf=min_post_conf,
+                harmonic_ratios=harmonic_ratios,
+                subharmonic_boost_ratio=subharmonic_boost_ratio,
+                subharmonic_conf_mul=subharmonic_conf_mul,
             )
 
-            # Preserve raw detector/layer candidates for skyline selection in Stage C
+            # Preserve raw candidates for skyline selection / chord extraction downstream
             active_candidates = list(candidates)
 
-            tracked_pitches, tracked_confs = tracker.step(candidates)
+            # Track only up to tracker capacity (stability), but expose all active candidates.
+            track_candidates = active_candidates[:tracker_cap]
+            tracked_pitches, tracked_confs = tracker.step(track_candidates)
             for voice_idx in range(tracker.max_tracks):
                 track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
                 track_conf_buffers[voice_idx][i] = tracked_confs[voice_idx]
