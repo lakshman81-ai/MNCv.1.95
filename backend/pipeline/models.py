@@ -118,6 +118,7 @@ class StageBOutput:
     meta: Optional[MetaData] = None         # Passed through from Stage A
     diagnostics: Dict[str, Any] = field(default_factory=dict)  # Separation/masking/ISS flags
     timeline: List["FramePitch"] = field(default_factory=list)
+    precalculated_notes: Optional[List["NoteEvent"]] = None
 
     def __iter__(self):
         # Legacy tuple-style unpacking support
@@ -214,6 +215,7 @@ class AnalysisData:
     notes_before_quantization: List[NoteEvent] = field(default_factory=list)
     benchmark: Optional[BenchmarkResult] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
+    precalculated_notes: Optional[List[NoteEvent]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """

@@ -195,3 +195,75 @@ def transcribe_onsets_frames(
     diag["run"] = True
     diag["note_count"] = len(notes)
     return notes, diag
+
+
+def transcribe_basic_pitch_to_notes(
+    audio: np.ndarray,
+    sr: int,
+    tmp_dir: Any,  # pathlib.Path
+    *,
+    onset_threshold: float,
+    frame_threshold: float,
+    minimum_note_length_ms: float,
+    min_hz: float,
+    max_hz: float,
+    melodia_trick: bool,
+) -> List[NoteEvent]:
+    """
+    Wrapper for Basic Pitch inference.
+    Isolates the heavy dependency inside this function.
+    """
+    # Import inside function so classic mode has zero TF/basic-pitch import cost
+    try:
+        from basic_pitch.inference import predict
+    except Exception as e:
+        raise RuntimeError("basic-pitch not installed") from e
+
+    import soundfile as sf
+    from pathlib import Path
+
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = tmp_dir / "basic_pitch_input.wav"
+
+    # Basic Pitch reads from file path; it will load mono at 22.05k internally.
+    sf.write(str(wav_path), audio.astype(np.float32), sr)
+
+    model_output, midi_data, note_events = predict(
+        str(wav_path),
+        onset_threshold=onset_threshold,
+        frame_threshold=frame_threshold,
+        minimum_note_length=minimum_note_length_ms,
+        minimum_frequency=min_hz,
+        maximum_frequency=max_hz,
+        melodia_trick=melodia_trick,
+    )
+
+    # note_events tuples: (start_time_s, end_time_s, pitch_midi, amplitude, pitch_bend_list)
+    notes: List[NoteEvent] = []
+    for start_s, end_s, pitch_midi, amplitude, _pitch_bends in note_events:
+        vel = int(np.clip(round(float(amplitude) * 127.0), 1, 127))
+        # Frequency from MIDI
+        pitch_hz = 440.0 * (2.0 ** ((pitch_midi - 69.0) / 12.0))
+
+        notes.append(NoteEvent(
+            start_sec=float(start_s),
+            end_sec=float(end_s),
+            midi_note=int(pitch_midi),
+            pitch_hz=pitch_hz,
+            confidence=1.0, # Basic Pitch implies high confidence if emitted
+            velocity=float(vel) / 127.0, # NoteEvent expects 0-1
+            voice=1,
+            dynamic="mf" # Default
+        ))
+
+    # Clean up temp file?
+    # Usually safer to leave for OS cleanup or explicit cleanup context,
+    # but here we can try to remove to avoid clutter.
+    try:
+        if wav_path.exists():
+            wav_path.unlink()
+    except Exception:
+        pass
+
+    return notes

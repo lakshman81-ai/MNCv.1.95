@@ -153,6 +153,79 @@ def _autocorr_pitch_per_frame(
     return f0, conf
 
 
+def _autocorr_pitch_per_frame_safe(
+    frames: np.ndarray,
+    sr: int,
+    fmin: float,
+    fmax: float,
+    threshold: float = 0.1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Iterative 'safe' ACF fallback for robustness.
+    Includes explicit mean removal, zero-lag energy normalization,
+    and strict neighbor checks for peak picking.
+    """
+    n_frames, frame_length = frames.shape
+    f0_out = np.zeros((n_frames,), dtype=np.float32)
+    conf_out = np.zeros((n_frames,), dtype=np.float32)
+
+    if n_frames == 0:
+        return f0_out, conf_out
+
+    lag_min = max(1, int(sr / max(fmax, 1e-6)))
+    # Ensure lag_max + 1 < frame_length for safe indexing
+    # because we need norm_corr[lag+1]
+    lag_max = min(int(sr / max(fmin, 1e-6)), frame_length - 3)
+
+    if lag_min >= lag_max:
+        return f0_out, conf_out
+
+    # Numba optimization hook (if available, otherwise pure Python)
+    # Since we can't easily rely on numba being present, we write pure python optimized
+    # loop or accept it is slow (fallback).
+
+    for i in range(n_frames):
+        frame = frames[i].astype(np.float32)
+        # DC removal
+        frame = frame - np.mean(frame)
+
+        # ACF
+        # mode='full' gives 2*L-1 output. lag 0 is at index L-1.
+        # We only need positive lags.
+        # This is slow per frame but robust.
+        corr = np.correlate(frame, frame, mode="full")[len(frame)-1:]
+
+        c0 = float(corr[0])
+        if c0 <= 1e-12:
+            continue
+
+        # Normalize by zero-lag energy
+        norm_corr = corr / (c0 + 1e-12)
+
+        best_lag = 0
+        max_val = 0.0
+
+        # Iterative peak picking with bounds checks
+        # range(lag_min, lag_max + 1) covers lags we want to check.
+        # We need neighbor access lag-1 and lag+1.
+        # Since lag_min >= 1, lag-1 >= 0.
+        # Since lag_max <= len-3, lag+1 <= len-2.
+
+        for lag in range(lag_min, lag_max + 1):
+            val = float(norm_corr[lag])
+            if val > threshold and val > max_val:
+                # Safe neighbor check (local maximum)
+                if norm_corr[lag - 1] < val and norm_corr[lag + 1] < val:
+                    max_val = val
+                    best_lag = lag
+
+        if best_lag > 0:
+            f0_out[i] = sr / best_lag
+            conf_out[i] = max_val
+
+    return f0_out, conf_out
+
+
 # --------------------------------------------------------------------------------------
 # Public polyphonic helpers (imported by tests / used by Stage B)
 # --------------------------------------------------------------------------------------
@@ -571,7 +644,8 @@ class YinDetector(BasePitchDetector):
                     pass
             # Fallback
             frames = _frame_audio(y, frame_length=frame_len, hop_length=self.hop_length)
-            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
+            # Use safe iterative fallback
+            f0, conf = _autocorr_pitch_per_frame_safe(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax, threshold=self.threshold)
             return f0, conf
 
         if enable_multires:
@@ -826,9 +900,7 @@ class CQTDetector(BasePitchDetector):
                     confs_list.append(c)
                 return pitches_list, confs_list
 
-            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
-            conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            f0, conf = _autocorr_pitch_per_frame_safe(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax, threshold=self.threshold)
             return f0, conf
 
 
@@ -862,6 +934,11 @@ class SwiftF0Detector(BasePitchDetector):
 
         # If you later add real SwiftF0 inference, replace this block.
         # For now: stable fallback to ACF so pipeline still works deterministically.
+        # Use fast ACF here as it's not strictly a "fallback" but the placeholder impl?
+        # Requirement says "Only patch the naïve / fallback loops (YIN fallback / placeholder brute ACF)".
+        # SwiftF0 here IS the placeholder. So safe is better?
+        # But SwiftF0 is primary. If we make it slow, defaults become slow.
+        # Let's keep fast for SwiftF0 placeholder, only change YIN/SACF/CREPE-fallback.
         f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
         f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
@@ -892,6 +969,7 @@ class RMVPEDetector(BasePitchDetector):
             return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.float32)
 
         # Replace with actual RMVPE inference later.
+        # Keep fast ACF for placeholder
         f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
         conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
 
@@ -979,9 +1057,8 @@ class CREPEDetector(BasePitchDetector):
             self._warn_once("crepe_error", f"CREPE inference failed: {e}")
             # Fallback to ACF if CREPE fails (e.g. missing tensorflow or shape error)
             # This ensures we always return *some* pitch data rather than silence.
-            f0, conf = _autocorr_pitch_per_frame(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax)
-            conf = np.where(conf >= self.threshold, conf, 0.0).astype(np.float32)
-            f0 = np.where(conf > 0.0, f0, 0.0).astype(np.float32)
+            # Use SAFE fallback here
+            f0, conf = _autocorr_pitch_per_frame_safe(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax, threshold=self.threshold)
             return f0, conf
 
 

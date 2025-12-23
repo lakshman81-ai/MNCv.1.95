@@ -1003,7 +1003,8 @@ def transcribe(
             f0_layers=[],
             per_detector={},
             meta=stage_a_out.meta,
-            diagnostics={"mode": "segmented"}
+            diagnostics={"mode": "segmented"},
+            precalculated_notes=None
         )
 
         # Pass the accumulated notes to Stage D
@@ -1054,6 +1055,7 @@ def transcribe(
             meta=stage_a_out.meta,
             timeline=[],
             stem_timelines=stage_b_out.stem_timelines,
+            precalculated_notes=stage_b_out.precalculated_notes
         )
 
         pipeline_logger.log_event(
@@ -1086,8 +1088,10 @@ def transcribe(
     timeline_source = list(stage_b_out.timeline or [])
     if not timeline_source and getattr(stage_b_out, "time_grid", None) is not None:
         # Robustly rebuild timeline if missing from stage_b_out
-        tg = getattr(stage_b_out, "time_grid", []) or []
-        f0m = getattr(stage_b_out, "f0_main", []) or []
+        tg = getattr(stage_b_out, "time_grid", None)
+        if tg is None: tg = []
+        f0m = getattr(stage_b_out, "f0_main", None)
+        if f0m is None: f0m = []
         for t, f0 in zip(tg, f0m):
             f0 = float(f0)
             if f0 > 0.0:

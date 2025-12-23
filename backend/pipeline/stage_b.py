@@ -31,6 +31,7 @@ from .detectors import (
 
 # PB0: Fix imports
 from copy import deepcopy
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -1092,6 +1093,61 @@ def extract_features(
         or b_conf.instrument
     )
 
+    # -------------------------------------------------------------------------
+    # E2E / Neural Transcription Routing (Basic Pitch)
+    # -------------------------------------------------------------------------
+    transcription_mode = getattr(b_conf, "transcription_mode", "classic")
+
+    # Auto logic: try to use E2E if basic_pitch is importable
+    if transcription_mode == "auto":
+        if _module_available("basic_pitch"):
+            transcription_mode = "e2e_basic_pitch"
+        else:
+            transcription_mode = "classic"
+
+    if transcription_mode == "e2e_basic_pitch":
+        temp_dir = kwargs.get("temp_dir", Path("/tmp"))
+        if isinstance(temp_dir, str):
+            temp_dir = Path(temp_dir)
+
+        try:
+            from .neural_transcription import transcribe_basic_pitch_to_notes
+
+            # Use 'mix' stem if available, else first stem
+            audio_source = None
+            if "mix" in stage_a_out.stems:
+                audio_source = stage_a_out.stems["mix"].audio
+            elif stage_a_out.stems:
+                audio_source = next(iter(stage_a_out.stems.values())).audio
+
+            if audio_source is not None:
+                notes = transcribe_basic_pitch_to_notes(
+                    audio_source,
+                    sr,
+                    temp_dir,
+                    onset_threshold=getattr(b_conf, "bp_onset_threshold", 0.5),
+                    frame_threshold=getattr(b_conf, "bp_frame_threshold", 0.3),
+                    minimum_note_length_ms=getattr(b_conf, "bp_minimum_note_length_ms", 127.7),
+                    min_hz=getattr(b_conf, "bp_min_hz", 27.5),
+                    max_hz=getattr(b_conf, "bp_max_hz", 4186.0),
+                    melodia_trick=getattr(b_conf, "bp_melodia_trick", True),
+                )
+
+                # Success: return StageBOutput with precalculated_notes
+                return StageBOutput(
+                    time_grid=np.array([], dtype=np.float32),
+                    f0_main=np.array([], dtype=np.float32),
+                    f0_layers=[],
+                    stem_timelines={},
+                    per_detector={},
+                    meta=stage_a_out.meta,
+                    diagnostics={"stage_b_mode": "e2e_basic_pitch"},
+                    precalculated_notes=notes,
+                )
+        except Exception as e:
+            logger.warning(f"Basic Pitch unavailable/failed; falling back to classic: {e}")
+            # Fallback to classic
+
     profile = config.get_profile(str(instrument)) if (instrument and b_conf.apply_instrument_profile) else None
     profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
     profile_applied = bool(profile)
@@ -1649,6 +1705,7 @@ def extract_features(
 
     # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
+        "stage_b_mode": "classic",
         "instrument": str(instrument),
         "profile": profile.instrument if profile else None,
         "profile_applied": bool(profile_applied),
