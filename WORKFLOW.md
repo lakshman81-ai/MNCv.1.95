@@ -96,7 +96,7 @@ flowchart TD
     ResultB & NoPoly --> StageC
 
     subgraph StageC_Process [Stage C]
-        SC1[Segmentation<br>(Threshold / HMM)] --> SC2[Duration/Velocity Filter]
+        SC1["Segmentation<br>(Threshold / HMM)"] --> SC2[Duration/Velocity Filter]
     end
 
     SC2 --> StageD[Stage D: Quantize & Render]
