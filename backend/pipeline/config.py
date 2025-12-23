@@ -73,6 +73,17 @@ class StageBConfig:
     # Instrument selection (for Stage B tuning)
     instrument: str = "piano_61key"
 
+    # Transcription mode: "classic" (default) | "e2e_basic_pitch" | "auto"
+    transcription_mode: str = "classic"
+
+    # Basic Pitch parameters
+    bp_onset_threshold: float = 0.5
+    bp_frame_threshold: float = 0.3
+    bp_minimum_note_length_ms: float = 127.7
+    bp_min_hz: float = 27.5      # A0
+    bp_max_hz: float = 4186.0    # C8
+    bp_melodia_trick: bool = True
+
     # Active stems whitelist (None = all)
     active_stems: Optional[List[str]] = None  # e.g. ["bass", "vocals"]
     # Flag to enable instrument-specific profile overrides in Stage B

@@ -641,6 +641,20 @@ def _segments_from_mask(
     return segs
 
 
+def _sanitize_notes(notes: List[NoteEvent]) -> List[NoteEvent]:
+    clean = []
+    for n in notes:
+        if n is None:
+            continue
+        if n.end_sec <= n.start_sec:
+            continue
+        if n.pitch_hz is None or n.pitch_hz <= 0:
+            continue
+        clean.append(n)
+    clean.sort(key=lambda x: (x.start_sec, x.end_sec, x.pitch_hz))
+    return clean
+
+
 def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEvent]:
     """
     Convert FramePitch timelines into NoteEvent list.
@@ -657,6 +671,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             analysis_data.stem_timelines = {"mix": legacy_timeline}
     elif not isinstance(analysis_data, AnalysisData):
         return []
+
+    # Short-circuit if precalculated notes exist (E2E path)
+    if analysis_data.precalculated_notes is not None:
+        clean = _sanitize_notes(analysis_data.precalculated_notes)
+        analysis_data.notes = clean
+        analysis_data.diagnostics["stage_c_mode"] = "precalculated"
+        return clean
 
     # Patch F0: Apply instrument profile overrides inside Stage C
     # Resolve instrument from metadata if available, else config
