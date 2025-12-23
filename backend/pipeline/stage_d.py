@@ -331,6 +331,8 @@ def quantize_and_render(
     # D3: Multi-voice support - we will group by voice index too
     staff_voice_groups: Dict[Tuple[str, int, float], Dict[str, Any]] = {}
 
+    merge_across_voices = bool(getattr(d_conf, "merge_simultaneous_across_voices", False))
+
     for e in events_sorted:
         staff_name = getattr(e, "staff", None)
         if staff_name not in ("treble", "bass"):
@@ -353,6 +355,8 @@ def quantize_and_render(
         # Round start time for key to avoid float jitter
         start_key = round(start_beats * 1024.0) / 1024.0
 
+        if merge_across_voices:
+            voice_idx = 1
         key_tuple = (staff_name, voice_idx, start_key)
         if key_tuple not in staff_voice_groups:
             staff_voice_groups[key_tuple] = {"events": [], "start_beats": start_beats}
