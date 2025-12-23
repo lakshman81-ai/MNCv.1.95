@@ -105,24 +105,35 @@ flowchart TD
 
 ## Flowchart Explainer
 
-### Section 3: Selection Logic
-*   **Instrument Profile**: The pipeline first checks if a specific instrument is defined (e.g., "Violin"). If so, it forces "Recommended Algorithms" (like CREPE for violin) to take precedence over defaults.
-*   **Fallback**: Before running, it checks system health. If neural libraries (like torch for SwiftF0/RMVPE) are missing or crash, the system automatically falls back to DSP methods (YIN/SACF) to ensure something is always output.
-*   **Ensemble Weights**: Finally, all running detectors are merged using specific weights (e.g., trusting SwiftF0 more than SACF) to create a single confident pitch timeline (Main Voice).
+### Stage A: Preprocessing
+*   **Signal Conditioning**: The input audio is resampled to a consistent rate (44.1kHz or 22.05kHz), mixed to mono, and trimmed of silence.
+*   **Normalization**: Loudness is normalized to a target (e.g., -23 LUFS) to ensure consistent detector response.
+*   **Neural Bypass**: If "Onsets & Frames" is enabled, the classic pipeline is bypassed, sending neural transcription directly to Stage D.
 
-### Section 2: Note Extraction Algorithms
-The chart now explicitly shows all 6 supported detectors running in parallel (configuration permitting):
-*   **YIN**: Robust, used for Bass.
-*   **SwiftF0**: High-priority neural estimator.
-*   **SACF**: Simple autocorrelation (backup).
-*   **CREPE**: High-accuracy neural model for mono instruments.
-*   **RMVPE**: Specialized for vocals.
-*   **CQT**: Frequency-domain transform for spectral analysis.
+### Stage B: Selection & Detectors (Sections 2 & 3)
+*   **Selection Logic**:
+    *   **Profile**: Checks for specific instrument profiles (e.g., "Violin") to prioritize recommended algorithms (e.g., CREPE).
+    *   **Fallback**: Automatically falls back to DSP methods (YIN/SACF) if neural dependencies are missing or fail.
+*   **Detector Bank**: Up to six algorithms run in parallel:
+    *   **YIN/SACF**: Robust DSP methods for bass and clean signals.
+    *   **SwiftF0/RMVPE/CREPE**: High-accuracy neural estimators for melody/vocals/instruments.
+    *   **CQT**: Spectral analysis validator.
 
-### Polyphony Handling
-*   **Parallel Processing**: Polyphonic processing (ISS) occurs in parallel with the main ensemble fusion.
-*   **Iterative Spectral Subtraction (ISS)**: If the input context is polyphonic, the system peels multiple layers using a primary detector (e.g., SwiftF0) and spectral masking to extract accompaniment voices.
-*   **Result**: The Main Voice (from Ensemble) and Polyphonic Layers (from ISS) are combined into the final Stage B output.
+### Stage B: Polyphony & Ensemble
+*   **Ensemble Fusion**: Outputs from the active detector bank are merged using weighted averaging (or adaptive fusion) to produce a single, high-confidence "Main Voice" timeline.
+*   **Polyphony (ISS)**: In parallel, **Iterative Spectral Subtraction** peels multiple layers of accompaniment voices using a primary detector if the input is polyphonic.
+*   **Output**: The Main Voice and Polyphonic Layers are combined and sent to Stage C.
+
+### Stage C: Segmentation
+*   **Note Extraction**: Continuous pitch timelines are segmented into discrete notes using **Thresholding** (default) or **HMM/Viterbi** (optional).
+*   **Refinement**: Note boundaries are snapped to spectral flux peaks (Onsets), and repeated notes (re-articulations) are split based on energy bumps.
+*   **Filtering**: Notes below minimum duration or velocity thresholds are discarded.
+
+### Stage D: Quantization & Rendering
+*   **Quantization**: Notes are aligned to a rhythmic grid.
+    *   **Grid Mode**: Hard snap to the nearest grid unit (e.g., 1/16th).
+    *   **Light Rubato**: Snaps only notes close to the grid, preserving expressive timing elsewhere.
+*   **Rendering**: The quantized notes are formatted into a MusicXML score and MIDI file for export.
 
 ## Tunable Parameters (Tuner/Audit)
 
