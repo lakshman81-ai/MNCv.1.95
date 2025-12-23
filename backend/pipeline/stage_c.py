@@ -362,7 +362,10 @@ def _segment_monophonic(
 
             # Step 5.2: Check for repeated note split (same pitch, new onset)
             is_repeated_split = False
-            if active and not is_glitch:
+
+            # Feature Flag: Repeated Note Splitter
+            use_splitter = seg_cfg.get("use_repeated_note_splitter", True)
+            if active and not is_glitch and use_splitter:
                 # Use should_split_same_pitch logic
                 # Need band energy -> use fp.rms as proxy for now
                 if should_split_same_pitch(i, onset_strength, rms_values, thr_onset=0.6, thr_bump=0.1):
@@ -384,8 +387,16 @@ def _segment_monophonic(
 
                     # Start new
                     active = True
+
+                    # Feature Flag: Onset Refinement
+                    use_refinement = seg_cfg.get("use_onset_refinement", True)
+
                     # Snap onset?
-                    refined_start = snap_onset(i, onset_strength) if onset_strength else i
+                    if use_refinement:
+                        refined_start = snap_onset(i, onset_strength) if onset_strength else i
+                    else:
+                        refined_start = i
+
                     # Ensure refined start is causally valid (>= current_end + 1?)
                     refined_start = max(refined_start, current_end + 1)
 
@@ -402,9 +413,17 @@ def _segment_monophonic(
                 stable += 1
                 if stable >= min_on:
                     active = True
+
+                    # Feature Flag: Onset Refinement
+                    use_refinement = seg_cfg.get("use_onset_refinement", True)
+
                     # Snap start
                     start_idx = i - (min_on - 1)
-                    refined_start = snap_onset(start_idx, onset_strength) if onset_strength else start_idx
+                    if use_refinement:
+                        refined_start = snap_onset(start_idx, onset_strength) if onset_strength else start_idx
+                    else:
+                        refined_start = start_idx
+
                     current_start = refined_start
 
                     current_end = i
@@ -682,6 +701,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # Specifically map: stage_c_pitch_ref_window_frames, stage_c_conf_start/end
 
     seg_cfg = dict(resolve_val("segmentation_method", {}) or {})
+
+    # Inject robustness flags into seg_cfg
+    # Now config.stage_c has these fields directly, so we can use _get properly
+    seg_cfg["use_onset_refinement"] = _get(config, "stage_c.use_onset_refinement", True)
+    seg_cfg["use_repeated_note_splitter"] = _get(config, "stage_c.use_repeated_note_splitter", True)
+
     if "stage_c_pitch_ref_window_frames" in profile_special:
          # Note: stage_c_pitch_ref_window_frames doesn't exist in segmentation_method usually,
          # it's usually a local param or logic. But let's check.

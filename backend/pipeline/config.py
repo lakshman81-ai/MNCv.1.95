@@ -163,6 +163,7 @@ class StageBConfig:
             "strength_min": 0.8,
             "strength_max": 1.2,
             "flatness_thresholds": [0.3, 0.6],  # [low, high]
+            "use_freq_aware_masks": True,
         }
     )
 
@@ -314,6 +315,10 @@ class StageCConfig:
             "noise_floor_db_margin": 6.0,  # (Patch 5B)
         }
     )
+
+    # Feature Flags for robustness upgrades
+    use_onset_refinement: bool = True
+    use_repeated_note_splitter: bool = True
 
     # Polyphony filter mode ("skyline_top_voice" used as a hint to Stage D)
     polyphony_filter: Dict[str, str] = field(

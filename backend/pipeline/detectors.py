@@ -195,12 +195,14 @@ def create_harmonic_mask(
 
             if frequency_aware_width:
                  # Wider for low notes, narrower for high notes
+                 # fh is scalar here (float), so comparison is safe.
+                 # Let's boost mask width for low freqs (<200Hz)
                  width_factor = 1.0
                  if fh < 200.0:
                      width_factor = 1.0 + (200.0 - fh) / 100.0
-                 bw = max(min_band_hz, abs(mask_width * width_factor) * fh)
+                 bw = max(float(min_band_hz), abs(mask_width * width_factor) * fh)
             else:
-                bw = max(min_band_hz, abs(mask_width) * fh)
+                bw = max(float(min_band_hz), abs(mask_width) * fh)
 
             lo = fh - bw
             hi = fh + bw
@@ -247,6 +249,8 @@ def iterative_spectral_subtraction(
     strength_min: float = 0.8,
     strength_max: float = 1.2,
     flatness_thresholds: Optional[List[float]] = None,
+    # Frequency-aware masking override
+    use_freq_aware_masks: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
     Iterative spectral subtraction ("peeling") with optional adaptive scheduling.
@@ -400,7 +404,7 @@ def iterative_spectral_subtraction(
                 mask_width=float(eff_mask_width),
                 n_harmonics=adaptive_harmonics,
                 min_band_hz=min_band,
-                frequency_aware_width=True,
+                frequency_aware_width=use_freq_aware_masks,
             )
 
             harmonic_energy = float(np.mean(magnitude * (1.0 - mask)))

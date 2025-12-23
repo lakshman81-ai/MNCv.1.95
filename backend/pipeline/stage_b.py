@@ -1336,6 +1336,7 @@ def extract_features(
                     strength_min=b_conf.polyphonic_peeling.get("strength_min", 0.8),
                     strength_max=b_conf.polyphonic_peeling.get("strength_max", 1.2),
                     flatness_thresholds=b_conf.polyphonic_peeling.get("flatness_thresholds", [0.3, 0.6]),
+                    use_freq_aware_masks=bool(config.stage_b.polyphonic_peeling.get("use_freq_aware_masks", True)),
                     )
                     all_layers.extend([f0 for f0, _ in iss_layers])
                     iss_total_layers += len(iss_layers)
@@ -1399,6 +1400,9 @@ def extract_features(
             melody_filter_eff,
         )
 
+        # Capture pre-smoothing (fused) F0 for debug artifacts
+        fused_f0_debug = merged_f0.copy()
+
         # Step 3: Viterbi Smoothing (Optional)
         use_viterbi_smoothing = getattr(b_conf, "smoothing_method", "tracker") == "viterbi"
         if use_viterbi_smoothing and np.any(merged_f0 > 0):
@@ -1448,12 +1452,23 @@ def extract_features(
         # Use voicing_thr_effective for deciding voiced/unvoiced frames
         voicing_thr = voicing_thr_effective
 
-        # Record into diagnostics (no schema change if diagnostics already exists)
-        diagnostics = locals().get("diagnostics", None)
-        # Note: diagnostics dict is created at the end of the function usually,
-        # but we need to inject tuning_cents.
-        # We'll rely on collecting tuning_cents into a separate dict for now
-        # and merging into diagnostics at the end.
+        # Record fused/smoothed curves for debugging
+        # We use fused_f0_debug (pre-smoothing) and merged_f0 (post-smoothing)
+        # Note: diagnostics is a local variable shadowing the outer one if we are not careful
+        # But here we just want to prepare data to put into the FINAL diagnostics object.
+        # We can store it in 'per_detector' temporarily? No, that's typed.
+        # Let's add it to a new field in StageBOutput if allowed, or put it in per_detector under reserved names.
+
+        # Actually, let's just use the 'diagnostics' dict that we construct at the end of the function.
+        # We need to persist these arrays outside this loop.
+        # Let's use a side-channel dict `stem_debug_curves`
+        if "stem_debug_curves" not in locals():
+            stem_debug_curves = {}
+
+        stem_debug_curves[stem_name] = {
+            "fused_f0": fused_f0_debug,
+            "smoothed_f0": merged_f0,
+        }
 
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
         max_frames = max(len(arr[0]) for arr in layer_arrays)
@@ -1616,6 +1631,9 @@ def extract_features(
     # The requirement says "store it in diagnostics".
     tuning_cents_val = locals().get("tuning_cents", 0.0)
 
+    # Retrieve debug curves if any
+    stem_debug_curves = locals().get("stem_debug_curves", {})
+
     # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
         "instrument": str(instrument),
@@ -1642,6 +1660,7 @@ def extract_features(
             "max_jump_cents": tracker_cfg.get("max_jump_cents", 150.0),
         },
         "global_tuning_cents": tuning_cents_val,
+        "debug_curves": stem_debug_curves,
     }
 
     primary_timeline = (
