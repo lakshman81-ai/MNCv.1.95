@@ -1923,6 +1923,11 @@ def extract_features(
             "layers_found": iss_total_layers,
             "max_layers": b_conf.polyphonic_peeling.get("max_layers", 0),
         },
+        "cqt_gate": {
+            "requested": cqt_gate_enabled,
+            "active": cqt_ctx is not None,
+            "librosa_available": _module_available("librosa"),
+        },
         "skyline_mode": skyline_mode,
         "voice_tracking": {
             "max_alt_voices": int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0),
