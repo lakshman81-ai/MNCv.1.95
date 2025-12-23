@@ -371,6 +371,24 @@ def iterative_spectral_subtraction(
     def _lerp(a: float, b: float, t: float) -> float:
         return a + (b - a) * np.clip(t, 0.0, 1.0)
 
+    def _layer_similarity(
+        f0_a: np.ndarray,
+        conf_a: np.ndarray,
+        f0_b: np.ndarray,
+        conf_b: np.ndarray,
+        conf_thr: float = 0.1,
+        cents_tol: float = 35.0,
+    ) -> float:
+        # Check similarity on voiced overlap
+        mask = (conf_a > conf_thr) & (conf_b > conf_thr) & (f0_a > 0.0) & (f0_b > 0.0)
+        overlap_count = np.count_nonzero(mask)
+        if overlap_count < 10:
+            return 0.0
+
+        diffs = np.abs(1200.0 * np.log2((f0_a[mask] + 1e-9) / (f0_b[mask] + 1e-9)))
+        matches = np.count_nonzero(diffs <= cents_tol)
+        return float(matches) / float(overlap_count)
+
     for _layer in range(int(max_polyphony)):
         f0, conf = primary_detector.predict(residual, audio_path=audio_path)
 
@@ -413,6 +431,18 @@ def iterative_spectral_subtraction(
         voiced_ratio = float(np.mean((conf > 0.1).astype(np.float32)))
         if voiced_ratio < 0.05:
             break
+
+        # Check similarity to previous layer to prevent duplicates
+        if layers:
+            prev_f0, prev_conf = layers[-1]
+            n_cmp = min(len(f0), len(prev_f0))
+            sim = _layer_similarity(
+                f0[:n_cmp], conf[:n_cmp], prev_f0[:n_cmp], prev_conf[:n_cmp],
+                conf_thr=0.1, cents_tol=35.0
+            )
+            if sim >= 0.85:
+                # Stop if new layer is too similar to the previous one (duplicate extraction)
+                break
 
         # STFT -> apply harmonic mask -> iSTFT
         try:
