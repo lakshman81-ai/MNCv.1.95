@@ -65,6 +65,169 @@ def weighted_median(values, weights):
             return v
     return pairs[-1][0]
 
+# ---- Poly candidate cleanup helpers ----------------------------------------
+
+_LOG2_1200 = 1200.0 / math.log(2.0)
+_EPS = 1e-9
+
+def _cents_diff(a_hz: float, b_hz: float) -> float:
+    if a_hz <= 0.0 or b_hz <= 0.0:
+        return 1e9
+    return abs(_LOG2_1200 * math.log((a_hz + _EPS) / (b_hz + _EPS)))
+
+def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
+                           fmin: float, fmax: float,
+                           bins_per_octave: int = 36) -> Optional[dict]:
+    """
+    Returns dict with: mag (float32 [n_bins, n_frames]), freqs (float32 [n_bins])
+    or None if librosa missing or computation fails.
+    """
+    if not _module_available("librosa"):
+        return None
+    try:
+        import librosa  # optional
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size == 0:
+            return None
+
+        # n_bins spans [fmin, fmax]
+        fmin = float(max(20.0, fmin))
+        fmax = float(max(fmin * 1.01, fmax))
+        n_oct = math.log2(fmax / fmin)
+        n_bins = int(max(24, math.ceil(n_oct * bins_per_octave)))
+
+        C = librosa.cqt(y=y, sr=sr, hop_length=hop_length,
+                        fmin=fmin, n_bins=n_bins, bins_per_octave=bins_per_octave)
+        mag = np.abs(C).astype(np.float32)
+        freqs = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin, bins_per_octave=bins_per_octave).astype(np.float32)
+
+        if mag.size == 0 or freqs.size == 0:
+            return None
+        return {"mag": mag, "freqs": freqs}
+    except Exception:
+        return None
+
+def _cqt_mag_at(ctx: Optional[dict], frame_idx: int, hz: float) -> float:
+    if ctx is None or hz <= 0.0:
+        return 0.0
+    mag = ctx["mag"]
+    freqs = ctx["freqs"]
+    if mag.ndim != 2 or freqs.ndim != 1:
+        return 0.0
+    t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
+    # nearest bin
+    j = int(np.clip(np.searchsorted(freqs, hz), 0, freqs.size - 1))
+    if j > 0 and abs(freqs[j - 1] - hz) < abs(freqs[j] - hz):
+        j -= 1
+    return float(mag[j, t])
+
+def _cqt_frame_floor(ctx: Optional[dict], frame_idx: int) -> float:
+    if ctx is None:
+        return 0.0
+    mag = ctx["mag"]
+    if mag.ndim != 2 or mag.shape[1] == 0:
+        return 0.0
+    t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
+    # robust floor for that frame
+    col = mag[:, t]
+    return float(np.median(col)) + 1e-9
+
+def _postprocess_candidates(
+    candidates: List[Tuple[float, float]],
+    frame_idx: int,
+    cqt_ctx: Optional[dict],
+    max_candidates: int,
+    dup_cents: float = 35.0,
+    octave_cents: float = 35.0,
+    cqt_gate_mul: float = 0.25,
+    cqt_support_ratio: float = 2.0,
+    harmonic_drop_ratio: float = 0.75,
+) -> List[Tuple[float, float]]:
+    """
+    - Soft CQT gate: if a candidate lacks spectral support at its fundamental, reduce conf.
+    - Drop near-duplicates (within dup_cents).
+    - Suppress octave-harmonic duplicates when 2x looks like a harmonic of x.
+    - Cap count and renormalize confidences to [0,1] (max=1).
+    """
+    if not candidates:
+        return []
+
+    # clamp conf and soft CQT gate
+    floor = _cqt_frame_floor(cqt_ctx, frame_idx)
+    gated: List[Tuple[float, float]] = []
+    for f, c in candidates:
+        if f <= 0.0 or c <= 0.0:
+            continue
+        c = float(max(0.0, min(1.0, c)))
+
+        if cqt_ctx is not None and floor > 0.0:
+            m = _cqt_mag_at(cqt_ctx, frame_idx, float(f))
+            # support if fundamental bin stands out vs median floor
+            if m < floor * float(cqt_support_ratio):
+                c *= float(cqt_gate_mul)
+
+        if c > 0.0:
+            gated.append((float(f), float(c)))
+
+    if not gated:
+        return []
+
+    # sort strongest first
+    gated.sort(key=lambda x: x[1], reverse=True)
+
+    kept: List[Tuple[float, float]] = []
+
+    # helper: decide if hi is likely harmonic of lo using CQT ratio + cents check
+    def _looks_like_harmonic(lo: float, hi: float) -> bool:
+        if cqt_ctx is None:
+            return False
+        # ensure hi ~ 2*lo
+        if abs(_cents_diff(hi, 2.0 * lo)) > octave_cents:
+            return False
+        m_lo = _cqt_mag_at(cqt_ctx, frame_idx, lo)
+        m_hi = _cqt_mag_at(cqt_ctx, frame_idx, hi)
+        # if hi is much weaker than lo, it's likely just the 2nd harmonic of lo
+        if m_lo <= 0.0:
+            return False
+        return (m_hi / (m_lo + 1e-9)) < float(harmonic_drop_ratio)
+
+    for f, c in gated:
+        # 1) drop near-duplicate pitch (same note repeated across layers)
+        dup = False
+        for fk, ck in kept:
+            if _cents_diff(f, fk) <= dup_cents:
+                dup = True
+                break
+        if dup:
+            continue
+
+        # 2) octave-harmonic suppression: if this candidate is ~2x of an already-kept one
+        # and looks like a harmonic rather than a true octave note, skip it.
+        harm = False
+        for fk, ck in kept:
+            # if f is hi and fk is lo
+            if fk > 0.0 and f > 0.0 and abs(_cents_diff(f, 2.0 * fk)) <= octave_cents:
+                if _looks_like_harmonic(fk, f) and c <= ck * 1.10:
+                    harm = True
+                    break
+            # if f is lo and fk is hi, we keep lo (strong fundamentals) so no need to drop lo
+        if harm:
+            continue
+
+        kept.append((f, c))
+        if len(kept) >= int(max(1, max_candidates)):
+            break
+
+    if not kept:
+        return []
+
+    # 3) renormalize conf so max=1 (keeps ordering, keeps values bounded)
+    max_c = max(c for _, c in kept)
+    if max_c > 1e-9:
+        kept = [(f, float(c / max_c)) for f, c in kept]
+
+    return kept
+
 class DetectorReliability:
     def __init__(self, base_w: float, pop_penalty_frames=6):
         self.base_w = base_w
@@ -1550,6 +1713,27 @@ def extract_features(
         padded_layers = [(_pad_to(f0, max_frames), _pad_to(conf, max_frames)) for f0, conf in layer_arrays]
         padded_rms = _pad_to(rms_vals, max_frames)
 
+        # ---- Optional CQT context for poly candidate gating (soft gate) ----
+        # Only do this for true poly (won't affect L0/L1).
+        cqt_ctx = None
+        cqt_gate_enabled = bool(b_conf.polyphonic_peeling.get("cqt_gate_enabled", True))
+        if is_true_poly and polyphonic_context and cqt_gate_enabled:
+            fmin_gate = float(melody_filter_eff.get("fmin_hz", 60.0) or 60.0)
+            fmax_gate = float(melody_filter_eff.get("fmax_hz", 2200.0) or 2200.0)
+            cqt_ctx = _maybe_compute_cqt_ctx(audio, sr, hop_length, fmin=fmin_gate, fmax=fmax_gate,
+                                             bins_per_octave=int(b_conf.polyphonic_peeling.get("cqt_bins_per_octave", 36)))
+
+        # Capture summaries of layer confidences for diagnostics
+        if "layer_conf_summaries" not in locals():
+            layer_conf_summaries = {}
+        try:
+            # summaries only, not full arrays
+            layer_conf_summaries[stem_name] = [
+                _curve_summary(conf_arr) for (_, conf_arr) in padded_layers
+            ]
+        except Exception:
+            pass
+
         timeline: List[FramePitch] = []
         max_alt_voices = int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0)
         tracker = MultiVoiceTracker(
@@ -1576,6 +1760,21 @@ def extract_features(
                 c = float(conf_arr[i]) if i < len(conf_arr) else 0.0
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
+
+            # ---- cleanup: CQT soft gate + dedupe + octave-harmonic suppression + cap ----
+            # Cap tied to tracker capacity (prevents active_pitches explosion)
+            max_cands = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks))
+            candidates = _postprocess_candidates(
+                candidates=candidates,
+                frame_idx=i,
+                cqt_ctx=cqt_ctx,
+                max_candidates=max_cands,
+                dup_cents=float(b_conf.polyphonic_peeling.get("dup_cents", 35.0)),
+                octave_cents=float(b_conf.polyphonic_peeling.get("octave_cents", 35.0)),
+                cqt_gate_mul=float(b_conf.polyphonic_peeling.get("cqt_gate_mul", 0.25)),
+                cqt_support_ratio=float(b_conf.polyphonic_peeling.get("cqt_support_ratio", 2.0)),
+                harmonic_drop_ratio=float(b_conf.polyphonic_peeling.get("harmonic_drop_ratio", 0.75)),
+            )
 
             # Preserve raw detector/layer candidates for skyline selection in Stage C
             active_candidates = list(candidates)
@@ -1731,6 +1930,7 @@ def extract_features(
         },
         "global_tuning_cents": tuning_cents_val,
         "debug_curves": stem_debug_curves,
+        "layer_conf_summaries": locals().get("layer_conf_summaries", {}),
     }
 
     primary_timeline = (

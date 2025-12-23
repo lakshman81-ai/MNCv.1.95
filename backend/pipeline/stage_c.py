@@ -162,104 +162,121 @@ def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float
 def _decompose_polyphonic_timeline(
     timeline: List[FramePitch],
     pitch_tolerance_cents: float = 50.0,
-    max_tracks: int = 5
+    max_tracks: int = 5,
+    *,
+    hangover_frames: int = 3,          # keep head through short dropouts
+    new_track_penalty: float = 80.0,   # discourage spawning new tracks
+    crossing_penalty: float = 60.0,    # discourage voice crossing
+    min_cand_conf: float = 0.05,       # ignore very weak candidates
 ) -> List[List[FramePitch]]:
-    """
-    Split a polyphonic timeline (with active_pitches) into multiple monophonic timelines (voice tracks).
-    Uses simple greedy tracking based on pitch proximity.
-    """
     if not timeline:
         return []
 
-    # Tracks: list of list of FramePitch
     tracks: List[List[FramePitch]] = [[] for _ in range(max_tracks)]
-    # Current pitch of each track to match against (0.0 if inactive/silence)
     track_heads: List[float] = [0.0] * max_tracks
+    track_age: List[int] = [10**9] * max_tracks  # frames since last voiced
 
-    # Pre-calculate constants and bind locals
-    log = math.log
-    log2 = math.log2
-    LOG2_1200 = 1200.0 / log(2.0)
+    LOG2_1200 = 1200.0 / math.log(2.0)
+
+    def cents(a: float, b: float) -> float:
+        if a <= 0.0 or b <= 0.0:
+            return 1e9
+        return abs(LOG2_1200 * math.log((a + 1e-9) / (b + 1e-9)))
+
+    def assign_cost(track_i: int, p: float) -> float:
+        head = track_heads[track_i]
+        age = track_age[track_i]
+        if head > 0.0:
+            d = cents(p, head)
+            if d > pitch_tolerance_cents:
+                return 1e9
+            # small penalty grows with age (prefer continuity)
+            return d + 5.0 * min(age, 10)
+        # empty track: discourage spawning unless needed
+        return new_track_penalty + 5.0 * min(age, 10)
 
     for fp in timeline:
-        # Get active pitches for this frame
-        candidates: List[Tuple[float, float]] = []
+        # candidates (top by confidence, clipped to max_tracks)
         if getattr(fp, "active_pitches", None):
-            # Sort by confidence desc
-            candidates = sorted(
-                [(p, c) for (p, c) in fp.active_pitches if p > 0.0],
-                key=lambda x: x[1],
-                reverse=True
-            )
-        elif fp.pitch_hz > 0.0:
+            candidates = [(p, c) for (p, c) in fp.active_pitches if p > 0.0 and c >= min_cand_conf]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+        elif fp.pitch_hz > 0.0 and fp.confidence >= min_cand_conf:
             candidates = [(fp.pitch_hz, fp.confidence)]
+        else:
+            candidates = []
 
-        # If no candidates, append silent frames to all tracks and reset heads
-        if not candidates:
-            for i in range(max_tracks):
-                tracks[i].append(FramePitch(
-                    time=fp.time,
-                    pitch_hz=0.0,
-                    midi=None,
-                    confidence=0.0,
-                    rms=fp.rms
-                ))
-                track_heads[i] = 0.0
-            continue
+        if candidates:
+            candidates = candidates[:max_tracks]
 
-        assigned_tracks = set()
-        current_heads = list(track_heads)
+            # brute-force best assignment (small max_tracks => fast)
+            best_map = None
+            best_cost = 1e18
 
-        # Assign each candidate
-        for p_hz, conf in candidates:
-            best_idx = -1
-            best_dist = float('inf')
+            m = len(candidates)
+            track_ids = list(range(max_tracks))
 
-            # 1. Try to match to an active track
-            for i in range(max_tracks):
-                if i in assigned_tracks:
+            # try subsets of tracks of size m (simple: try all tracks permutations and take first m)
+            # because max_tracks is small, brute-forcing permutations is okay
+            import itertools
+            for perm in itertools.permutations(track_ids, m):
+                cost_sum = 0.0
+                assigned_pitch = [0.0] * max_tracks
+
+                ok = True
+                for j, ti in enumerate(perm):
+                    p, conf = candidates[j]
+                    cst = assign_cost(ti, p) - 80.0 * float(conf)  # confidence bonus
+                    if cst >= 1e8:
+                        ok = False
+                        break
+                    cost_sum += cst
+                    assigned_pitch[ti] = p
+
+                if not ok:
                     continue
 
-                head = current_heads[i]
-                if head > 0.0:
-                    # Inline cents diff with math.log for speed in inner loop
-                    dist = abs(LOG2_1200 * log((p_hz + 1e-9) / (head + 1e-9)))
-                    if dist <= pitch_tolerance_cents and dist < best_dist:
-                        best_dist = dist
-                        best_idx = i
-
-            # 2. If no match to active track, find an empty track
-            if best_idx == -1:
+                # crossing penalty: enforce track index ~ pitch order (track0 highest, trackN lowest)
                 for i in range(max_tracks):
-                    if i in assigned_tracks:
-                        continue
-                    if current_heads[i] <= 0.0: # Inactive
-                        best_idx = i
-                        break
+                    for k in range(i + 1, max_tracks):
+                        pi = assigned_pitch[i]
+                        pk = assigned_pitch[k]
+                        if pi > 0.0 and pk > 0.0 and pi < pk:
+                            cost_sum += crossing_penalty
 
-            # 3. Assign
-            if best_idx != -1:
-                tracks[best_idx].append(FramePitch(
-                    time=fp.time,
-                    pitch_hz=p_hz,
-                    midi=int(round(69 + 12 * log2(p_hz / 440.0))) if p_hz > 0 else None,
-                    confidence=conf,
-                    rms=fp.rms
-                ))
-                track_heads[best_idx] = p_hz
-                assigned_tracks.add(best_idx)
+                if cost_sum < best_cost:
+                    best_cost = cost_sum
+                    best_map = perm
 
-        # Fill unassigned tracks with silence
-        for i in range(max_tracks):
-            if i not in assigned_tracks:
-                tracks[i].append(FramePitch(
-                    time=fp.time,
-                    pitch_hz=0.0,
-                    midi=None,
-                    confidence=0.0,
-                    rms=fp.rms
-                ))
-                track_heads[i] = 0.0
+            assigned_tracks = set()
+            if best_map is not None:
+                for j, ti in enumerate(best_map):
+                    p_hz, conf = candidates[j]
+                    tracks[ti].append(FramePitch(
+                        time=fp.time,
+                        pitch_hz=p_hz,
+                        midi=int(round(69 + 12 * math.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                        confidence=float(conf),
+                        rms=fp.rms
+                    ))
+                    track_heads[ti] = p_hz
+                    track_age[ti] = 0
+                    assigned_tracks.add(ti)
+
+            # fill others with silence; DO NOT instantly reset head (hangover)
+            for i in range(max_tracks):
+                if i not in assigned_tracks:
+                    tracks[i].append(FramePitch(time=fp.time, pitch_hz=0.0, midi=None, confidence=0.0, rms=fp.rms))
+                    track_age[i] = min(track_age[i] + 1, 10**9)
+                    if track_age[i] > hangover_frames:
+                        track_heads[i] = 0.0
+
+        else:
+            # no candidates: keep heads for hangover_frames instead of wiping immediately
+            for i in range(max_tracks):
+                tracks[i].append(FramePitch(time=fp.time, pitch_hz=0.0, midi=None, confidence=0.0, rms=fp.rms))
+                track_age[i] = min(track_age[i] + 1, 10**9)
+                if track_age[i] > hangover_frames:
+                    track_heads[i] = 0.0
 
     return tracks
 
@@ -312,7 +329,8 @@ def _segment_monophonic(
 
     # P5: Pitch reference buffer for vibrato stability
     pitch_buffer: List[float] = []
-    pitch_buffer_size = 7
+    pitch_buffer_size = int(seg_cfg.get("pitch_ref_window_frames", 7))
+    pitch_buffer_size = max(3, min(21, pitch_buffer_size))
 
     # Glitch tolerance
     glitch_counter = 0
@@ -611,6 +629,56 @@ def _sanitize_notes(notes: List[NoteEvent]) -> List[NoteEvent]:
         clean.append(n)
     clean.sort(key=lambda x: (x.start_sec, x.end_sec, x.pitch_hz))
     return clean
+
+def _dedupe_overlapping_notes(notes: List[NoteEvent], overlap_thr: float = 0.85) -> List[NoteEvent]:
+    if not notes:
+        return notes
+    # Sort primarily by voice, then pitch, then time
+    notes = sorted(notes, key=lambda n: (n.voice or 0, n.midi_note or 0, n.start_sec, n.end_sec, -n.confidence))
+    out: List[NoteEvent] = []
+    for n in notes:
+        if not out:
+            out.append(n); continue
+        p = out[-1]
+        # Only check if same voice and same MIDI pitch
+        if (p.voice == n.voice) and (p.midi_note == n.midi_note):
+            # overlap ratio
+            a0, a1 = p.start_sec, p.end_sec
+            b0, b1 = n.start_sec, n.end_sec
+            inter = max(0.0, min(a1, b1) - max(a0, b0))
+            union = max(a1, b1) - min(a0, b0) + 1e-9
+            if inter / union >= overlap_thr:
+                # keep the higher-confidence one
+                if n.confidence > p.confidence:
+                    out[-1] = n
+                continue
+        out.append(n)
+    return out
+
+def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[NoteEvent]:
+    if not notes:
+        return notes
+    tol = tol_ms / 1000.0
+    notes = sorted(notes, key=lambda n: n.start_sec)
+    i = 0
+    out = []
+    while i < len(notes):
+        j = i + 1
+        group = [notes[i]]
+        # Collect group within tolerance window
+        while j < len(notes) and abs(notes[j].start_sec - notes[i].start_sec) <= tol:
+            group.append(notes[j])
+            j += 1
+
+        if len(group) >= 2:
+            # Snap all to the earliest start in the group
+            s0 = min(n.start_sec for n in group)
+            for n in group:
+                n.start_sec = s0
+
+        out.extend(group)
+        i = j
+    return out
 
 
 def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEvent]:
@@ -954,6 +1022,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                      min_rms=min_rms,
                  )
              else:
+                 seg_cfg_local = dict(seg_cfg)
+                 # For poly decomposition: only allow repeated-note splitter for the strongest track (sub_idx==0)
+                 # to prevent false splits in accompaniment
+                 if enable_polyphony and sub_idx > 0:
+                     seg_cfg_local["use_repeated_note_splitter"] = False
+
                  segs = _segment_monophonic(
                      timeline=sub_tl,
                      conf_thr=voice_conf_gate,
@@ -962,7 +1036,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                      min_rms=min_rms,
                      conf_start=max(start_conf, voice_conf_gate),
                      conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
-                     seg_cfg=seg_cfg,
+                     seg_cfg=seg_cfg_local,
                      hop_s=hop_s,
                  )
 
@@ -1049,6 +1123,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 # But here we are checking if new_start is valid w.r.t end.
                 if new_start < max_start_limit:
                     n.start_sec = float(new_start)
+
+    if enable_polyphony:
+        notes = _dedupe_overlapping_notes(notes)
+        snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
+        if snap_ms > 0:
+            notes = _snap_chord_starts(notes, tol_ms=snap_ms)
 
     # Populate diagnostics
     if hasattr(analysis_data, "diagnostics"):
