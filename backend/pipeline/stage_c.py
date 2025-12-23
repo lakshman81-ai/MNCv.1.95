@@ -129,8 +129,10 @@ def _decompose_polyphonic_timeline(
     # Current pitch of each track to match against (0.0 if inactive/silence)
     track_heads: List[float] = [0.0] * max_tracks
 
-    # Pre-calculate log2 constant
-    LOG2_1200 = 1200.0 / math.log(2.0)
+    # Pre-calculate constants and bind locals
+    log = math.log
+    log2 = math.log2
+    LOG2_1200 = 1200.0 / log(2.0)
 
     for fp in timeline:
         # Get active pitches for this frame
@@ -145,12 +147,9 @@ def _decompose_polyphonic_timeline(
         elif fp.pitch_hz > 0.0:
             candidates = [(fp.pitch_hz, fp.confidence)]
 
-        # Optimization: use set of all indices and remove as we assign
-        unassigned_tracks = set(range(max_tracks))
-
         # If no candidates, append silent frames to all tracks and reset heads
         if not candidates:
-            for i in unassigned_tracks:
+            for i in range(max_tracks):
                 tracks[i].append(FramePitch(
                     time=fp.time,
                     pitch_hz=0.0,
@@ -161,6 +160,7 @@ def _decompose_polyphonic_timeline(
                 track_heads[i] = 0.0
             continue
 
+        assigned_tracks = set()
         current_heads = list(track_heads)
 
         # Assign each candidate
@@ -169,18 +169,23 @@ def _decompose_polyphonic_timeline(
             best_dist = float('inf')
 
             # 1. Try to match to an active track
-            for i in unassigned_tracks:
+            for i in range(max_tracks):
+                if i in assigned_tracks:
+                    continue
+
                 head = current_heads[i]
                 if head > 0.0:
                     # Inline cents diff with math.log for speed in inner loop
-                    dist = abs(LOG2_1200 * math.log((p_hz + 1e-9) / (head + 1e-9)))
+                    dist = abs(LOG2_1200 * log((p_hz + 1e-9) / (head + 1e-9)))
                     if dist <= pitch_tolerance_cents and dist < best_dist:
                         best_dist = dist
                         best_idx = i
 
             # 2. If no match to active track, find an empty track
             if best_idx == -1:
-                for i in unassigned_tracks:
+                for i in range(max_tracks):
+                    if i in assigned_tracks:
+                        continue
                     if current_heads[i] <= 0.0: # Inactive
                         best_idx = i
                         break
@@ -190,26 +195,24 @@ def _decompose_polyphonic_timeline(
                 tracks[best_idx].append(FramePitch(
                     time=fp.time,
                     pitch_hz=p_hz,
-                    midi=int(round(69 + 12 * math.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                    midi=int(round(69 + 12 * log2(p_hz / 440.0))) if p_hz > 0 else None,
                     confidence=conf,
                     rms=fp.rms
                 ))
                 track_heads[best_idx] = p_hz
-                unassigned_tracks.remove(best_idx)
-
-                if not unassigned_tracks:
-                    break
+                assigned_tracks.add(best_idx)
 
         # Fill unassigned tracks with silence
-        for i in unassigned_tracks:
-            tracks[i].append(FramePitch(
-                time=fp.time,
-                pitch_hz=0.0,
-                midi=None,
-                confidence=0.0,
-                rms=fp.rms
-            ))
-            track_heads[i] = 0.0
+        for i in range(max_tracks):
+            if i not in assigned_tracks:
+                tracks[i].append(FramePitch(
+                    time=fp.time,
+                    pitch_hz=0.0,
+                    midi=None,
+                    confidence=0.0,
+                    rms=fp.rms
+                ))
+                track_heads[i] = 0.0
 
     return tracks
 
