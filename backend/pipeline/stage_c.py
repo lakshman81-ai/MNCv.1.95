@@ -615,6 +615,186 @@ def _segments_from_mask(
         i += 1
 
     return segs
+def _segment_pianoroll_chords(
+    timeline: List[FramePitch],
+    conf_thr: float,
+    min_note_dur_s: float,
+    gap_tolerance_s: float,
+    min_rms: float,
+    seg_cfg: Dict[str, Any],
+    hop_s: float,
+    staff_split_midi: int = 60,
+    max_notes_per_frame: int = 10,
+) -> List[NoteEvent]:
+    """
+    Polyphonic chord extraction from FramePitch.active_pitches.
+
+    This treats each MIDI pitch as an independent "lane" (piano-roll style), segments
+    contiguous activity into notes, and returns NoteEvents with:
+      - voice=1 (per staff) so Stage D can render same-onset notes as chords
+      - staff assigned by `staff_split_midi` (default middle C=60)
+
+    Designed for dense polyphony (piano), where greedy track decomposition can miss
+    chord members or swap voices.
+    """
+    if not timeline:
+        return []
+
+    min_on = int(seg_cfg.get("min_onset_frames", 2))
+    rel = int(seg_cfg.get("release_frames", 2))
+    min_on = max(1, min_on)
+    rel = max(1, rel)
+
+    gap_frames = int(max(0, gap_tolerance_s / max(1e-6, hop_s)))
+
+    # Simple onset strength proxy from RMS deltas (same as _segment_monophonic)
+    onset_strength: List[float] = []
+    rms_values = [float(getattr(fp, "rms", 0.0) or 0.0) for fp in timeline]
+    if rms_values:
+        onset_strength = [0.0] * len(rms_values)
+        for k in range(1, len(rms_values)):
+            d = rms_values[k] - rms_values[k - 1]
+            if d > 0:
+                onset_strength[k] = d
+        m = max(onset_strength) if onset_strength else 0.0
+        if m > 0:
+            onset_strength = [x / m for x in onset_strength]
+
+    # Per-MIDI state
+    # state: {midi: dict(active, stable, silent, start, last, pitches[], confs[], rmss[])}
+    states: Dict[int, Dict[str, Any]] = {}
+    notes_out: List[NoteEvent] = []
+
+    def _close(midi: int, st: Dict[str, Any]) -> None:
+        if not st.get("active", False):
+            return
+        start_i = int(st.get("start", 0))
+        end_i = int(st.get("last", start_i))
+        if end_i < start_i:
+            return
+        dur_s = (end_i - start_i + 1) * hop_s
+        if dur_s < float(min_note_dur_s):
+            return
+        rmss = st.get("rmss", []) or []
+        if rmss and float(np.mean(rmss)) < float(min_rms):
+            return
+
+        pitches = st.get("pitches", []) or []
+        confs = st.get("confs", []) or []
+
+        pitch_hz = float(np.median(pitches)) if pitches else 0.0
+        confidence = float(np.mean(confs)) if confs else 0.0
+
+        midi_vel = _velocity_from_rms(rmss)
+        velocity_norm = float(midi_vel) / 127.0
+        dynamic_label = _velocity_to_dynamic(midi_vel)
+
+        # Optional onset refinement
+        use_refinement = bool(seg_cfg.get("use_onset_refinement", True))
+        if use_refinement and onset_strength:
+            start_i = int(snap_onset(start_i, onset_strength))
+            start_i = max(0, min(start_i, len(timeline) - 1))
+
+        start_sec = float(timeline[start_i].time)
+        end_sec = float(timeline[end_i].time + hop_s)
+        if end_sec <= start_sec:
+            end_sec = start_sec + hop_s
+
+        staff = "treble" if int(midi) >= int(staff_split_midi) else "bass"
+
+        notes_out.append(
+            NoteEvent(
+                start_sec=start_sec,
+                end_sec=end_sec,
+                midi_note=int(midi),
+                pitch_hz=pitch_hz,
+                confidence=confidence,
+                velocity=velocity_norm,
+                rms_value=float(np.mean(rmss)) if rmss else 0.0,
+                dynamic=dynamic_label,
+                voice=1,
+                staff=staff,
+            )
+        )
+
+    for i, fp in enumerate(timeline):
+        # Candidate pool from active_pitches, with fallback to Stage B primary pitch
+        ap = getattr(fp, "active_pitches", None) or []
+        cands = [(float(p), float(c)) for (p, c) in ap if p and p > 0.0 and c and c > 0.0]
+
+        # fallback if active_pitches missing/empty
+        if not cands and getattr(fp, "pitch_hz", 0.0) and getattr(fp, "confidence", 0.0):
+            cands = [(float(fp.pitch_hz), float(fp.confidence))]
+
+        # Filter + keep strongest
+        cands = [(p, c) for (p, c) in cands if c >= float(conf_thr)]
+        cands.sort(key=lambda x: x[1], reverse=True)
+        if max_notes_per_frame and max_notes_per_frame > 0:
+            cands = cands[: int(max_notes_per_frame)]
+
+        # Snap to MIDI and keep best per MIDI for this frame
+        present: Dict[int, Tuple[float, float]] = {}
+        for p, c in cands:
+            try:
+                midi = int(round(69.0 + 12.0 * math.log2(max(1e-6, p) / 440.0)))
+            except Exception:
+                continue
+            if midi not in present or c > present[midi][1]:
+                present[midi] = (p, c)
+
+        present_midis = set(present.keys())
+
+        # Update existing states
+        for midi, st in list(states.items()):
+            if midi in present_midis:
+                st["silent"] = 0
+                st["stable"] = int(st.get("stable", 0)) + 1
+                st["last"] = i
+                p, c = present[midi]
+                st.setdefault("pitches", []).append(float(p))
+                st.setdefault("confs", []).append(float(c))
+                st.setdefault("rmss", []).append(float(getattr(fp, "rms", 0.0) or 0.0))
+
+                if not st.get("active", False) and st["stable"] >= min_on:
+                    st["active"] = True
+                    st["start"] = max(0, i - (min_on - 1))
+            else:
+                if st.get("active", False):
+                    st["silent"] = int(st.get("silent", 0)) + 1
+                    # allow short gaps (gap_frames) before counting as release
+                    if st["silent"] > max(rel, gap_frames):
+                        _close(midi, st)
+                        states.pop(midi, None)
+                else:
+                    # not active -> reset stability if not present
+                    st["stable"] = 0
+                    # If it has been absent for a while, drop it
+                    st["silent"] = int(st.get("silent", 0)) + 1
+                    if st["silent"] > max(rel, gap_frames) * 2:
+                        states.pop(midi, None)
+
+        # Add new states
+        for midi, (p, c) in present.items():
+            if midi in states:
+                continue
+            states[midi] = {
+                "active": False,
+                "stable": 1,
+                "silent": 0,
+                "start": i,
+                "last": i,
+                "pitches": [float(p)],
+                "confs": [float(c)],
+                "rmss": [float(getattr(fp, "rms", 0.0) or 0.0)],
+            }
+            if min_on <= 1:
+                states[midi]["active"] = True
+
+    # Close any active notes at end
+    for midi, st in list(states.items()):
+        _close(midi, st)
+
+    return notes_out
 
 
 def _sanitize_notes(notes: List[NoteEvent]) -> List[NoteEvent]:
@@ -820,6 +1000,24 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     audio_type = getattr(analysis_data.meta, "audio_type", None)
     allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
 
+    # Optional override / instrument heuristic:
+    # Separator "stems" (vocals/bass/drums/other) are usually NOT meaningful for piano transcription
+    # and can create duplicate/misaligned notes in L5.* benchmarks.
+    include_secondary_override = _get(config, "stage_c.include_secondary_stems", None)
+    instrument = getattr(getattr(analysis_data, "meta", None), "instrument", None)
+    if instrument is None:
+        instrument = _get(config, "intended_instrument", None)
+
+    if include_secondary_override is not None:
+        allow_secondary = bool(include_secondary_override) and bool(allow_secondary)
+    else:
+        try:
+            inst = str(instrument).lower() if instrument is not None else ""
+        except Exception:
+            inst = ""
+        if inst in ("piano", "keyboard", "keys"):
+            allow_secondary = False
+
     if allow_secondary and len(stem_timelines) > 1:
         # Add others in deterministic order
         other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
@@ -852,9 +1050,44 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         if not timeline or len(timeline) < 2:
             continue
 
+        # Resolve per-stem polyphony filter mode (allows "auto")
+        pf_mode = str(poly_filter_mode).lower()
+        if pf_mode == "auto":
+            ap_counts = [len(getattr(fp, "active_pitches", []) or []) for fp in timeline]
+            nz = [c for c in ap_counts if c > 0]
+            mean_ap = float(np.mean(nz)) if nz else 0.0
+            pf_mode = "pianoroll_chords" if mean_ap >= 2.0 else "skyline_top_voice"
+
+        # Pianoroll chord extraction (poly piano)
+        if pf_mode == "pianoroll_chords":
+            voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
+            dur_s = min_note_dur_s
+            try:
+                if min_note_dur_ms_poly is not None:
+                    dur_s = max(dur_s, float(min_note_dur_ms_poly) / 1000.0)
+            except Exception:
+                pass
+            hop_s = _estimate_hop_seconds(timeline)
+            staff_split_midi = int(_get(config, "stage_d.staff_split_point.pitch", 60))
+            max_notes_pf = int(_get(config, "stage_c.polyphony_filter.pianoroll_max_notes_per_frame", 10))
+            notes.extend(
+                _segment_pianoroll_chords(
+                    timeline=timeline,
+                    conf_thr=voice_conf_gate,
+                    min_note_dur_s=dur_s,
+                    gap_tolerance_s=gap_tolerance_s,
+                    min_rms=min_rms,
+                    seg_cfg=seg_cfg,
+                    hop_s=hop_s,
+                    staff_split_midi=staff_split_midi,
+                    max_notes_per_frame=max_notes_pf,
+                )
+            )
+            continue
+
         # Patch: Skyline Top Voice Selection
         # If active, derive frame pitch from the highest confident active pitch
-        if poly_filter_mode == "skyline_top_voice":
+        if pf_mode == "skyline_top_voice":
             new_tl = []
             # Use a modest floor to keep weak melody candidates in play
             skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
@@ -929,7 +1162,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         # Gate: config != "skyline_top_voice" (implied "process_all") or just presence of poly_frames?
         # WI implies we should use active_pitches if present, unless explicitly disabled?
         # WI says: "Detect polyphony... OR config signal"
-        enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
+        enable_polyphony = (len(poly_frames) > 0) and (pf_mode != "skyline_top_voice")
 
         # Decompose into tracks if polyphony active
         voice_timelines = []
@@ -943,7 +1176,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
              # Feature: Decomposed Melody Mode (L5.2)
              # If mode is "decomposed_melody", pick only the best track as the "melody"
              # This avoids outputting accompaniment tracks for monophonic benchmarks
-             if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
+             if pf_mode == "decomposed_melody" and len(voice_timelines) > 1:
                 # Score tracks by total confidence mass in vocal range
                 best_idx = 0
                 best_score = -1.0
@@ -999,7 +1232,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
              # WI Patch: If using Skyline Top Voice, we must rely on pitch changes for segmentation,
              # so we disable Viterbi (which only tracks voicing state) to use the pitch-sensitive segmenter.
-             if poly_filter_mode == "skyline_top_voice":
+             if pf_mode == "skyline_top_voice":
                  use_viterbi = False
 
              segs = []
