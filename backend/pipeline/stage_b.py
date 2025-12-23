@@ -1164,7 +1164,7 @@ def extract_features(
     # Patch 7: Config Validator
     common_keys = {"enabled", "fmin", "fmax", "hop_length", "frame_length", "threshold"}
     _validate_config_keys("detectors.crepe", detector_cfgs.get("crepe", {}),
-                          common_keys | {"model_capacity", "step_ms", "confidence_threshold", "conf_threshold"}, pipeline_logger)
+                          common_keys | {"model_capacity", "step_ms", "confidence_threshold", "conf_threshold", "use_viterbi"}, pipeline_logger)
     _validate_config_keys("detectors.yin", detector_cfgs.get("yin", {}),
                           common_keys | {"enable_multires_f0", "enable_octave_correction", "octave_jump_penalty", "trough_threshold"}, pipeline_logger)
     _validate_config_keys("detectors.swiftf0", detector_cfgs.get("swiftf0", {}),
