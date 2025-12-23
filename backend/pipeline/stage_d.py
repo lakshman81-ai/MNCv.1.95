@@ -35,6 +35,56 @@ except Exception:
 
 def _lcm(a, b): return abs(a*b) // math.gcd(a, b)
 
+
+def _sec_to_beat_index(t: float, beat_times: list[float]) -> float:
+    n = len(beat_times)
+    if n < 2:
+        return 0.0
+
+    bt = np.asarray(beat_times, dtype=np.float64)
+    idx = np.arange(n, dtype=np.float64)
+
+    # interior mapping
+    if bt[0] <= t <= bt[-1]:
+        return float(np.interp(t, bt, idx))
+
+    # edge intervals (robust)
+    dt0 = float(bt[1] - bt[0])
+    dt1 = float(bt[-1] - bt[-2])
+
+    # guard against bad beat arrays
+    if dt0 <= 1e-6 or dt1 <= 1e-6:
+        # fallback: clamp rather than explode
+        return 0.0 if t < bt[0] else float(n - 1)
+
+    if t < bt[0]:
+        return float((t - bt[0]) / dt0)  # beat 0 + negative offset
+    else:
+        return float((n - 1) + (t - bt[-1]) / dt1)  # extend beyond last beat
+
+
+def _beat_index_to_sec(b: float, beat_times: list[float]) -> float:
+    n = len(beat_times)
+    if n < 2:
+        return 0.0
+
+    bt = np.asarray(beat_times, dtype=np.float64)
+    idx = np.arange(n, dtype=np.float64)
+
+    if 0.0 <= b <= float(n - 1):
+        return float(np.interp(b, idx, bt))
+
+    dt0 = float(bt[1] - bt[0])
+    dt1 = float(bt[-1] - bt[-2])
+    if dt0 <= 1e-6 or dt1 <= 1e-6:
+        return float(bt[0] if b < 0 else bt[-1])
+
+    if b < 0.0:
+        return float(bt[0] + b * dt0)
+    else:
+        return float(bt[-1] + (b - float(n - 1)) * dt1)
+
+
 def light_quantize_time(t, grid_times, max_shift=0.03):
     """
     Step 7: Light Quantization.
@@ -206,10 +256,11 @@ def quantize_and_render(
             # beat_times are timestamps of beats 0, 1, 2...
             # We assume linear tempo between beat markers
             # np.interp returns extrapolated values for times outside [min, max]
-            start_beats = float(np.interp(e.start_sec, beat_times, np.arange(len(beat_times))))
+            # Use extrapolating helper to prevent clamping at edges
+            start_beats = _sec_to_beat_index(float(e.start_sec), beat_times)
 
             # For duration, we calculate end_beat and subtract
-            end_beats = float(np.interp(e.end_sec, beat_times, np.arange(len(beat_times))))
+            end_beats = _sec_to_beat_index(float(e.end_sec), beat_times)
             dur_beats = end_beats - start_beats
         else:
             # Fallback to constant tempo
