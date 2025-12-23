@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import math
 
 # Support both package and top‑level imports for models
 try:
@@ -78,7 +79,7 @@ def _velocity_to_dynamic(v: int) -> str:
 def _cents_diff_hz(a, b):
     if a <= 0 or b <= 0:
         return 1e9
-    return abs(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
+    return abs(1200.0 * math.log2((a + 1e-9) / (b + 1e-9)))
 
 def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
     if len(timeline) < 2:
@@ -124,14 +125,12 @@ def _decompose_polyphonic_timeline(
         return []
 
     # Tracks: list of list of FramePitch
-    tracks: List[List[FramePitch]] = []
+    tracks: List[List[FramePitch]] = [[] for _ in range(max_tracks)]
     # Current pitch of each track to match against (0.0 if inactive/silence)
-    track_heads: List[float] = []
+    track_heads: List[float] = [0.0] * max_tracks
 
-    # Initialize tracks
-    for _ in range(max_tracks):
-        tracks.append([])
-        track_heads.append(0.0)
+    # Pre-calculate log2 constant
+    LOG2_1200 = 1200.0 / math.log(2.0)
 
     for fp in timeline:
         # Get active pitches for this frame
@@ -146,9 +145,12 @@ def _decompose_polyphonic_timeline(
         elif fp.pitch_hz > 0.0:
             candidates = [(fp.pitch_hz, fp.confidence)]
 
+        # Optimization: use set of all indices and remove as we assign
+        unassigned_tracks = set(range(max_tracks))
+
         # If no candidates, append silent frames to all tracks and reset heads
         if not candidates:
-            for i in range(max_tracks):
+            for i in unassigned_tracks:
                 tracks[i].append(FramePitch(
                     time=fp.time,
                     pitch_hz=0.0,
@@ -159,8 +161,6 @@ def _decompose_polyphonic_timeline(
                 track_heads[i] = 0.0
             continue
 
-        # Greedy matching
-        assigned_tracks = set()
         current_heads = list(track_heads)
 
         # Assign each candidate
@@ -169,22 +169,18 @@ def _decompose_polyphonic_timeline(
             best_dist = float('inf')
 
             # 1. Try to match to an active track
-            for i in range(max_tracks):
-                if i in assigned_tracks:
-                    continue
-
+            for i in unassigned_tracks:
                 head = current_heads[i]
                 if head > 0.0:
-                    dist = _cents_diff_hz(p_hz, head)
+                    # Inline cents diff with math.log for speed in inner loop
+                    dist = abs(LOG2_1200 * math.log((p_hz + 1e-9) / (head + 1e-9)))
                     if dist <= pitch_tolerance_cents and dist < best_dist:
                         best_dist = dist
                         best_idx = i
 
             # 2. If no match to active track, find an empty track
             if best_idx == -1:
-                for i in range(max_tracks):
-                    if i in assigned_tracks:
-                        continue
+                for i in unassigned_tracks:
                     if current_heads[i] <= 0.0: # Inactive
                         best_idx = i
                         break
@@ -194,24 +190,26 @@ def _decompose_polyphonic_timeline(
                 tracks[best_idx].append(FramePitch(
                     time=fp.time,
                     pitch_hz=p_hz,
-                    midi=int(round(69 + 12 * np.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                    midi=int(round(69 + 12 * math.log2(p_hz / 440.0))) if p_hz > 0 else None,
                     confidence=conf,
                     rms=fp.rms
                 ))
                 track_heads[best_idx] = p_hz
-                assigned_tracks.add(best_idx)
+                unassigned_tracks.remove(best_idx)
+
+                if not unassigned_tracks:
+                    break
 
         # Fill unassigned tracks with silence
-        for i in range(max_tracks):
-            if i not in assigned_tracks:
-                tracks[i].append(FramePitch(
-                    time=fp.time,
-                    pitch_hz=0.0,
-                    midi=None,
-                    confidence=0.0,
-                    rms=fp.rms
-                ))
-                track_heads[i] = 0.0
+        for i in unassigned_tracks:
+            tracks[i].append(FramePitch(
+                time=fp.time,
+                pitch_hz=0.0,
+                midi=None,
+                confidence=0.0,
+                rms=fp.rms
+            ))
+            track_heads[i] = 0.0
 
     return tracks
 
