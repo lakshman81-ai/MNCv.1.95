@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import math
 
 # Support both package and top‑level imports for models
 try:
@@ -78,7 +79,7 @@ def _velocity_to_dynamic(v: int) -> str:
 def _cents_diff_hz(a, b):
     if a <= 0 or b <= 0:
         return 1e9
-    return abs(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
+    return abs(1200.0 * math.log2((a + 1e-9) / (b + 1e-9)))
 
 def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
     if len(timeline) < 2:
@@ -124,14 +125,14 @@ def _decompose_polyphonic_timeline(
         return []
 
     # Tracks: list of list of FramePitch
-    tracks: List[List[FramePitch]] = []
+    tracks: List[List[FramePitch]] = [[] for _ in range(max_tracks)]
     # Current pitch of each track to match against (0.0 if inactive/silence)
-    track_heads: List[float] = []
+    track_heads: List[float] = [0.0] * max_tracks
 
-    # Initialize tracks
-    for _ in range(max_tracks):
-        tracks.append([])
-        track_heads.append(0.0)
+    # Pre-calculate constants and bind locals
+    log = math.log
+    log2 = math.log2
+    LOG2_1200 = 1200.0 / log(2.0)
 
     for fp in timeline:
         # Get active pitches for this frame
@@ -159,7 +160,6 @@ def _decompose_polyphonic_timeline(
                 track_heads[i] = 0.0
             continue
 
-        # Greedy matching
         assigned_tracks = set()
         current_heads = list(track_heads)
 
@@ -175,7 +175,8 @@ def _decompose_polyphonic_timeline(
 
                 head = current_heads[i]
                 if head > 0.0:
-                    dist = _cents_diff_hz(p_hz, head)
+                    # Inline cents diff with math.log for speed in inner loop
+                    dist = abs(LOG2_1200 * log((p_hz + 1e-9) / (head + 1e-9)))
                     if dist <= pitch_tolerance_cents and dist < best_dist:
                         best_dist = dist
                         best_idx = i
@@ -194,7 +195,7 @@ def _decompose_polyphonic_timeline(
                 tracks[best_idx].append(FramePitch(
                     time=fp.time,
                     pitch_hz=p_hz,
-                    midi=int(round(69 + 12 * np.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                    midi=int(round(69 + 12 * log2(p_hz / 440.0))) if p_hz > 0 else None,
                     confidence=conf,
                     rms=fp.rms
                 ))
