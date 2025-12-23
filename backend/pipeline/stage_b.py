@@ -848,6 +848,9 @@ def _augment_with_harmonic_masks(
     """
     Derive synthetic melody/accompaniment stems by masking harmonics from a quick f0 prior.
     """
+    if SCIPY_SIGNAL is None:
+        return {}
+
     audio = np.asarray(stem.audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
         return {}
@@ -859,7 +862,7 @@ def _augment_with_harmonic_masks(
         n_fft_eff = int(min(n_fft, max(32, len(audio))))
         hop_eff = int(max(1, min(hop, n_fft_eff // 2)))
 
-        f, t, Z = scipy.signal.stft(
+        f, t, Z = SCIPY_SIGNAL.stft(
             audio,
             fs=stem.sr,
             nperseg=n_fft_eff,
@@ -881,7 +884,7 @@ def _augment_with_harmonic_masks(
         mask = create_harmonic_mask(
             f0_hz=f0,
             sr=stem.sr,
-            n_fft=n_fft,
+            n_fft=n_fft_eff,
             mask_width=mask_width,
             n_harmonics=n_harmonics,
         )
@@ -894,7 +897,7 @@ def _augment_with_harmonic_masks(
         Z_melody = Z * harmonic_keep
         Z_resid = Z * residual_keep
 
-        _, melody_audio = scipy.signal.istft(
+        _, melody_audio = SCIPY_SIGNAL.istft(
             Z_melody,
             fs=stem.sr,
             nperseg=n_fft_eff,
@@ -902,7 +905,7 @@ def _augment_with_harmonic_masks(
             input_onesided=True,
             boundary="zeros",
         )
-        _, residual_audio = scipy.signal.istft(
+        _, residual_audio = SCIPY_SIGNAL.istft(
             Z_resid,
             fs=stem.sr,
             nperseg=n_fft_eff,
@@ -1049,6 +1052,16 @@ def _validate_config_keys(name: str, cfg: dict, allowed: set[str], pipeline_logg
             pipeline_logger.log_event("stage_b", "config_unknown_keys", payload={"section": name, "keys": sorted(list(unknown))})
         else:
             logger.warning(msg)
+
+
+def _curve_summary(x: np.ndarray) -> dict:
+    x = np.asarray(x)
+    return {
+        "len": int(x.size),
+        "nonzero": int(np.count_nonzero(x)),
+        "min": float(x[x > 0].min()) if np.any(x > 0) else 0.0,
+        "max": float(x.max()) if x.size else 0.0,
+    }
 
 
 def extract_features(
@@ -1266,7 +1279,7 @@ def extract_features(
         if stem_results:
             merged_f0, merged_conf = _ensemble_merge(
                 stem_results,
-                b_conf.ensemble_weights,
+                weights_eff,
                 b_conf.pitch_disagreement_cents,
                 b_conf.confidence_priority_floor,
                 adaptive_fusion=use_adaptive,
@@ -1466,8 +1479,8 @@ def extract_features(
             stem_debug_curves = {}
 
         stem_debug_curves[stem_name] = {
-            "fused_f0": fused_f0_debug,
-            "smoothed_f0": merged_f0,
+            "fused_f0": _curve_summary(fused_f0_debug),
+            "smoothed_f0": _curve_summary(merged_f0),
         }
 
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers

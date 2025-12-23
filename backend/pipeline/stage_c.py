@@ -13,7 +13,8 @@ backend/tests/test_stage_c.py expects:
 Important model constraints (from backend/pipeline/models.py)
 -----------------------------------------------------------
 NoteEvent fields:
-  start_sec, end_sec, midi_note, pitch_hz, confidence, velocity
+  start_sec, end_sec, midi_note, pitch_hz, confidence, velocity,
+  rms_value, dynamic, voice, staff, measure, beat, duration_beats
 (no source_stem/source_detector fields)
 """
 
@@ -441,49 +442,6 @@ def _segment_monophonic(
                     pitch_buffer.pop(0)
                 current_pitch_hz = float(np.median(pitch_buffer))
 
-            if is_glitch:
-                if glitch_counter < MAX_GLITCH_FRAMES:
-                    # Absorb glitch: extend current note logically but don't update pitch ref
-                    # Treat as part of note
-                    current_end = i
-                    glitch_counter += 1
-                    continue
-                else:
-                    # Confirmed split, proceed to standard logic to handle it
-                    glitch_counter = 0
-            else:
-                glitch_counter = 0
-
-            silent = 0
-            if not active:
-                stable += 1
-                if stable >= min_on:
-                    active = True
-                    current_start = i - (min_on - 1)
-                    current_end = i
-                    current_pitch_hz = fp.pitch_hz
-                    pitch_buffer = [fp.pitch_hz]
-            else:
-                # Check vibrato / pitch jump - C2
-                diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
-                if diff <= split_cents:
-                    # Extend note
-                    current_end = i
-                    # P5: Update pitch reference to track drift/vibrato (median of last N good frames)
-                    pitch_buffer.append(fp.pitch_hz)
-                    if len(pitch_buffer) > pitch_buffer_size:
-                        pitch_buffer.pop(0)
-                    current_pitch_hz = float(np.median(pitch_buffer))
-                else:
-                    # Split note
-                    segs.append((current_start, current_end))
-
-                    # Reset for new note
-                    current_start = i
-                    current_end = i
-                    current_pitch_hz = fp.pitch_hz
-                    pitch_buffer = [fp.pitch_hz]
-                    stable = min_on
 
         else:
             stable = 0
@@ -781,7 +739,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     notes: List[NoteEvent] = []
 
-    seg_cfg = resolve_val("segmentation_method", {}) or {}
+    # seg_cfg is already built above
     seg_method = str(seg_cfg.get("method", "threshold")).lower()
 
     # P1: Auto-enable smoothing for HMM
