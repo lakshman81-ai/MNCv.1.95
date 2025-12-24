@@ -75,135 +75,6 @@ def _cents_diff(a_hz: float, b_hz: float) -> float:
         return 1e9
     return abs(_LOG2_1200 * math.log((a_hz + _EPS) / (b_hz + _EPS)))
 
-# ---- Stem selection helpers (V3) -------------------------------------------
-
-def _score_timeline_for_melody(
-    timeline: List["FramePitch"],
-    *,
-    voiced_conf_thr: float = 0.10,
-    jump_cents_thr: float = 200.0,
-    hz_min: float = 80.0,
-    hz_max: float = 1400.0,
-) -> Tuple[float, Dict[str, float]]:
-    """Score a FramePitch timeline for 'melody-likeness'.
-
-    Higher is better. Designed to reject jitter/artifacts common in poor separations.
-    Returns (score, components).
-    """
-    n = len(timeline) if timeline is not None else 0
-    if n <= 0:
-        return -1e9, {"voiced_ratio": 0.0, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
-
-    voiced: List["FramePitch"] = []
-    for fp in timeline:
-        try:
-            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
-            c = float(getattr(fp, "confidence", 0.0) or 0.0)
-        except Exception:
-            continue
-        if hz > 0.0 and c >= voiced_conf_thr:
-            voiced.append(fp)
-
-    voiced_ratio = float(len(voiced)) / float(max(1, n))
-    if not voiced:
-        return -1e9, {"voiced_ratio": voiced_ratio, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
-
-    confs = []
-    in_range = 0
-    for fp in voiced:
-        hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
-        confs.append(float(getattr(fp, "confidence", 0.0) or 0.0))
-        if hz_min <= hz <= hz_max:
-            in_range += 1
-    mean_conf = float(sum(confs)) / float(max(1, len(confs)))
-    range_bonus = float(in_range) / float(max(1, len(voiced)))
-
-    # Penalize big pitch jumps (artifacty separation often causes warbles/chirps)
-    jumps = 0
-    prev_hz = None
-    prev_t = None
-    for fp in voiced:
-        hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
-        t = float(getattr(fp, "time", 0.0) or 0.0)
-        if prev_hz is not None and prev_hz > 0.0 and hz > 0.0:
-            if _cents_diff(prev_hz, hz) > jump_cents_thr:
-                jumps += 1
-        prev_hz = hz
-        prev_t = t
-
-    # Duration estimate
-    try:
-        t0 = float(getattr(timeline[0], "time", 0.0) or 0.0)
-        t1 = float(getattr(timeline[-1], "time", t0) or t0)
-        dur = max(1e-6, t1 - t0)
-    except Exception:
-        dur = max(1e-6, n * 0.02)
-
-    jump_rate = float(jumps) / dur  # jumps per second
-
-    score = (mean_conf * voiced_ratio) + (0.10 * range_bonus) - (0.20 * jump_rate)
-    return float(score), {
-        "voiced_ratio": float(voiced_ratio),
-        "mean_conf": float(mean_conf),
-        "jump_rate": float(jump_rate),
-        "range_bonus": float(range_bonus),
-    }
-
-
-def _select_primary_stem_v3(
-    stem_timelines: Dict[str, List["FramePitch"]],
-    *,
-    prefer_order: Tuple[str, ...] = ("vocals", "other", "melody_masked", "mix"),
-    mix_margin: float = 0.02,
-    tie_eps: float = 0.005,
-    voiced_conf_thr: float = 0.10,
-) -> Tuple[str, Dict[str, float], Dict[str, Dict[str, float]]]:
-    """Pick the best stem timeline using a quality gate against the mix."""
-    if not stem_timelines:
-        return "mix", {}, {}
-
-    candidates = [k for k in prefer_order if k in stem_timelines]
-    if not candidates:
-        # deterministic fallback
-        candidates = sorted(stem_timelines.keys())
-
-    scores: Dict[str, float] = {}
-    details: Dict[str, Dict[str, float]] = {}
-    for k in candidates:
-        s, d = _score_timeline_for_melody(stem_timelines.get(k, []), voiced_conf_thr=voiced_conf_thr)
-        scores[k] = float(s)
-        details[k] = d
-
-    # Ensure mix score for gating
-    mix_score = None
-    if "mix" in stem_timelines and "mix" not in scores:
-        ms, md = _score_timeline_for_melody(stem_timelines.get("mix", []), voiced_conf_thr=voiced_conf_thr)
-        scores["mix"] = float(ms)
-        details["mix"] = md
-        mix_score = float(ms)
-    elif "mix" in scores:
-        mix_score = float(scores["mix"])
-
-    best = max(scores.keys(), key=lambda k: scores.get(k, -1e9))
-    best_score = float(scores.get(best, -1e9))
-
-    # Tie-breaker by prefer_order
-    tied = [k for k, s in scores.items() if abs(float(s) - best_score) <= tie_eps]
-    for k in prefer_order:
-        if k in tied:
-            best = k
-            best_score = float(scores[k])
-            break
-
-    # Quality gate vs mix
-    if mix_score is not None and best != "mix":
-        if best_score < (mix_score + float(mix_margin)):
-            best = "mix"
-            best_score = float(mix_score)
-
-    return best, scores, details
-
-
 def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
                            fmin: float, fmax: float,
                            bins_per_octave: int = 36) -> Optional[dict]:
@@ -261,72 +132,84 @@ def _cqt_frame_floor(ctx: Optional[dict], frame_idx: int) -> float:
     col = mag[:, t]
     return float(np.median(col)) + 1e-9
 
+def _cqt_top_peaks(
+    ctx: Optional[dict],
+    frame_idx: int,
+    max_peaks: int = 10,
+    min_ratio: float = 2.0,
+) -> List[Tuple[float, float]]:
+    """Return (hz, conf) peaks from the CQT magnitude at a frame.
+
+    conf is a squashed peak-to-median ratio in [0,1], similar to CQTDetector.
+    This is used to populate FramePitch.active_pitches for chord-aware stages.
+    """
+    if ctx is None:
+        return []
+    mag = ctx.get("mag", None)
+    freqs = ctx.get("freqs", None)
+    if mag is None or freqs is None:
+        return []
+    if getattr(mag, "ndim", 0) != 2 or getattr(freqs, "ndim", 0) != 1 or mag.shape[1] == 0:
+        return []
+    t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
+    col = mag[:, t]
+    if col.size == 0:
+        return []
+    floor = float(np.median(col)) + 1e-9
+    ordered = np.argsort(col)[::-1]
+    out: List[Tuple[float, float]] = []
+    for j in ordered:
+        mval = float(col[j])
+        if mval <= 0.0:
+            continue
+        if mval < floor * float(min_ratio):
+            break
+        hz = float(freqs[j])
+        conf = float(np.clip((mval / floor - 1.0) / 4.0, 0.0, 1.0))
+        if conf <= 0.0 or hz <= 0.0:
+            continue
+        out.append((hz, conf))
+        if len(out) >= int(max(1, max_peaks)):
+            break
+    return out
+
+
 def _postprocess_candidates(
     candidates: List[Tuple[float, float]],
     frame_idx: int,
     cqt_ctx: Optional[dict],
     max_candidates: int,
     dup_cents: float = 35.0,
-    harmonic_cents: float = 35.0,
+    octave_cents: float = 35.0,
     cqt_gate_mul: float = 0.25,
     cqt_support_ratio: float = 2.0,
     harmonic_drop_ratio: float = 0.75,
-    min_post_conf: float = 0.12,
-    harmonic_ratios: Tuple[int, ...] = (2, 3, 4),
-    subharmonic_boost_ratio: float = 1.15,
-    subharmonic_conf_mul: float = 0.6,
 ) -> List[Tuple[float, float]]:
     """
-    Cleanup for per-frame polyphonic F0 candidates.
-
-    What it does (in order):
     - Soft CQT gate: if a candidate lacks spectral support at its fundamental, reduce conf.
-    - Optional subharmonic injection: if f/2 has stronger CQT support than f, add (f/2) as a weak candidate.
-      This helps when detectors "lock" onto harmonics instead of fundamentals (common in dense piano).
     - Drop near-duplicates (within dup_cents).
-    - Suppress harmonic duplicates for ratios in `harmonic_ratios` (default: 2×, 3×, 4×).
-    - Cap count and renormalize confidences to [0, 1] (max=1).
-
-    Notes:
-    - `min_post_conf` is applied AFTER the CQT gate so weak, unsupported pitches don't leak downstream.
+    - Suppress octave-harmonic duplicates when 2x looks like a harmonic of x.
+    - Cap count and renormalize confidences to [0,1] (max=1).
     """
     if not candidates:
         return []
 
+    # clamp conf and soft CQT gate
     floor = _cqt_frame_floor(cqt_ctx, frame_idx)
-
     gated: List[Tuple[float, float]] = []
-    extra: List[Tuple[float, float]] = []
-
-    # clamp conf and soft CQT gate (+ optional subharmonic)
     for f, c in candidates:
         if f <= 0.0 or c <= 0.0:
             continue
-        f = float(f)
         c = float(max(0.0, min(1.0, c)))
 
-        m_f = 0.0
         if cqt_ctx is not None and floor > 0.0:
-            m_f = _cqt_mag_at(cqt_ctx, frame_idx, f)
+            m = _cqt_mag_at(cqt_ctx, frame_idx, float(f))
             # support if fundamental bin stands out vs median floor
-            if m_f < floor * float(cqt_support_ratio):
+            if m < floor * float(cqt_support_ratio):
                 c *= float(cqt_gate_mul)
 
-            # Subharmonic injection: if the "half" bin is stronger, we may be tracking a harmonic.
-            sub_f = f * 0.5
-            if sub_f >= 20.0 and m_f > 0.0:
-                m_sub = _cqt_mag_at(cqt_ctx, frame_idx, sub_f)
-                if m_sub > m_f * float(subharmonic_boost_ratio):
-                    extra.append((sub_f, c * float(subharmonic_conf_mul)))
-
-        if c >= float(min_post_conf):
-            gated.append((f, c))
-
-    if extra:
-        # Merge extra candidates (they'll be deduped later)
-        for f, c in extra:
-            if f > 0.0 and c >= float(min_post_conf):
-                gated.append((float(f), float(c)))
+        if c > 0.0:
+            gated.append((float(f), float(c)))
 
     if not gated:
         return []
@@ -336,16 +219,16 @@ def _postprocess_candidates(
 
     kept: List[Tuple[float, float]] = []
 
-    def _looks_like_harmonic(lo: float, hi: float, ratio: int) -> bool:
+    # helper: decide if hi is likely harmonic of lo using CQT ratio + cents check
+    def _looks_like_harmonic(lo: float, hi: float) -> bool:
         if cqt_ctx is None:
             return False
-        if ratio <= 1:
-            return False
-        # ensure hi ~ ratio*lo
-        if abs(_cents_diff(hi, float(ratio) * lo)) > harmonic_cents:
+        # ensure hi ~ 2*lo
+        if abs(_cents_diff(hi, 2.0 * lo)) > octave_cents:
             return False
         m_lo = _cqt_mag_at(cqt_ctx, frame_idx, lo)
         m_hi = _cqt_mag_at(cqt_ctx, frame_idx, hi)
+        # if hi is much weaker than lo, it's likely just the 2nd harmonic of lo
         if m_lo <= 0.0:
             return False
         return (m_hi / (m_lo + 1e-9)) < float(harmonic_drop_ratio)
@@ -360,18 +243,16 @@ def _postprocess_candidates(
         if dup:
             continue
 
-        # 2) harmonic suppression: if this candidate is ~r× of an already-kept one and looks harmonic, skip it.
+        # 2) octave-harmonic suppression: if this candidate is ~2x of an already-kept one
+        # and looks like a harmonic rather than a true octave note, skip it.
         harm = False
         for fk, ck in kept:
-            if fk <= 0.0:
-                continue
-            for r in harmonic_ratios:
-                if abs(_cents_diff(f, float(r) * fk)) <= harmonic_cents:
-                    if _looks_like_harmonic(fk, f, int(r)) and c <= ck * 1.10:
-                        harm = True
-                        break
-            if harm:
-                break
+            # if f is hi and fk is lo
+            if fk > 0.0 and f > 0.0 and abs(_cents_diff(f, 2.0 * fk)) <= octave_cents:
+                if _looks_like_harmonic(fk, f) and c <= ck * 1.10:
+                    harm = True
+                    break
+            # if f is lo and fk is hi, we keep lo (strong fundamentals) so no need to drop lo
         if harm:
             continue
 
@@ -1587,7 +1468,7 @@ def extract_features(
     augmented_stems = dict(resolved_stems)
     harmonic_mask_applied = False
     harmonic_cfg = b_conf.separation.get("harmonic_masking", {}) if hasattr(b_conf, "separation") else {}
-    if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems and not bool(separation_diag.get("htdemucs_ran", False)):
+    if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems:
         prior_det = detectors.get("swiftf0")
         if prior_det is None:
             prior_conf = dict(b_conf.detectors.get("swiftf0", {}))
@@ -1878,7 +1759,8 @@ def extract_features(
         # Only do this for true poly (won't affect L0/L1).
         cqt_ctx = None
         cqt_gate_enabled = bool(b_conf.polyphonic_peeling.get("cqt_gate_enabled", True))
-        if is_true_poly and polyphonic_context and cqt_gate_enabled:
+        use_cqt_peaks = bool(b_conf.polyphonic_peeling.get("use_cqt_peaks", False))
+        if is_true_poly and polyphonic_context and (cqt_gate_enabled or use_cqt_peaks):
             fmin_gate = float(melody_filter_eff.get("fmin_hz", 60.0) or 60.0)
             fmax_gate = float(melody_filter_eff.get("fmax_hz", 2200.0) or 2200.0)
             cqt_ctx = _maybe_compute_cqt_ctx(audio, sr, hop_length, fmin=fmin_gate, fmax=fmax_gate,
@@ -1914,24 +1796,6 @@ def extract_features(
         # B3: Apply tuning offset during MIDI conversion
         tuning_semitones = tuning_cents / 100.0
 
-        # Poly-peeling postprocessing knobs (computed once per stem for speed and consistency)
-        tracker_cap = int(tracker.max_tracks)
-        max_active_pitches = int(b_conf.polyphonic_peeling.get("max_active_pitches_per_frame", max(tracker_cap, 10)))
-        max_candidates_per_frame = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", max_active_pitches))
-        min_post_conf = float(b_conf.polyphonic_peeling.get("min_post_conf", 0.12))
-
-        harm_ratios_raw = b_conf.polyphonic_peeling.get("harmonic_ratios", (2, 3, 4))
-        try:
-            harmonic_ratios = tuple(int(x) for x in harm_ratios_raw)
-            if not harmonic_ratios:
-                harmonic_ratios = (2, 3, 4)
-        except Exception:
-            harmonic_ratios = (2, 3, 4)
-
-        harmonic_cents = float(b_conf.polyphonic_peeling.get("harmonic_cents", b_conf.polyphonic_peeling.get("octave_cents", 35.0)))
-        subharmonic_boost_ratio = float(b_conf.polyphonic_peeling.get("subharmonic_boost_ratio", 1.15))
-        subharmonic_conf_mul = float(b_conf.polyphonic_peeling.get("subharmonic_conf_mul", 0.6))
-
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
             for f0_arr, conf_arr in padded_layers:
@@ -1940,29 +1804,44 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
-            # ---- cleanup: CQT soft gate + dedupe + harmonic suppression + cap ----
-            # Keep a larger "active" pool for downstream chord detection, but track only up to tracker capacity.
+            
+            # Optional: add direct CQT peaks as additional candidates (multi-pitch).
+            # This is critical for dense chords: ISS layers + monophonic f0 often miss chord tones.
+            if is_true_poly and polyphonic_context and bool(b_conf.polyphonic_peeling.get("use_cqt_peaks", False)) and cqt_ctx is not None:
+                cqt_peaks = _cqt_top_peaks(
+                    cqt_ctx,
+                    i,
+                    max_peaks=int(b_conf.polyphonic_peeling.get("cqt_max_peaks", 10)),
+                    min_ratio=float(b_conf.polyphonic_peeling.get("cqt_peak_min_ratio", 2.0)),
+                )
+                if cqt_peaks:
+                    candidates.extend(cqt_peaks)
+
+            # ---- cleanup: CQT soft gate + dedupe + octave-harmonic suppression + cap ----
+            # IMPORTANT: active_pitches can be larger than tracker capacity; tracker only keeps a stable primary track.
+            max_active = int(
+                b_conf.polyphonic_peeling.get(
+                    "max_active_pitches_per_frame",
+                    b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks),
+                )
+            )
             candidates = _postprocess_candidates(
                 candidates=candidates,
                 frame_idx=i,
                 cqt_ctx=cqt_ctx,
-                max_candidates=max_candidates_per_frame,
+                max_candidates=max_active,
                 dup_cents=float(b_conf.polyphonic_peeling.get("dup_cents", 35.0)),
-                harmonic_cents=harmonic_cents,
+                octave_cents=float(b_conf.polyphonic_peeling.get("octave_cents", 35.0)),
                 cqt_gate_mul=float(b_conf.polyphonic_peeling.get("cqt_gate_mul", 0.25)),
                 cqt_support_ratio=float(b_conf.polyphonic_peeling.get("cqt_support_ratio", 2.0)),
                 harmonic_drop_ratio=float(b_conf.polyphonic_peeling.get("harmonic_drop_ratio", 0.75)),
-                min_post_conf=min_post_conf,
-                harmonic_ratios=harmonic_ratios,
-                subharmonic_boost_ratio=subharmonic_boost_ratio,
-                subharmonic_conf_mul=subharmonic_conf_mul,
             )
 
-            # Preserve raw candidates for skyline selection / chord extraction downstream
+            # Preserve candidates for Stage C chord/poly segmentation.
             active_candidates = list(candidates)
 
-            # Track only up to tracker capacity (stability), but expose all active candidates.
-            track_candidates = active_candidates[:tracker_cap]
+            # Tracker only sees up to its capacity (keeps primary pitch stable).
+            track_candidates = candidates[: tracker.max_tracks]
             tracked_pitches, tracked_confs = tracker.step(track_candidates)
             for voice_idx in range(tracker.max_tracks):
                 track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
@@ -2122,38 +2001,11 @@ def extract_features(
         "layer_conf_summaries": locals().get("layer_conf_summaries", {}),
     }
 
-    # V3: Choose best stem for downstream segmentation/rendering.
-    stem_sel_cfg = b_conf.separation.get("stem_selection", {}) if hasattr(b_conf, "separation") else {}
-    prefer_order = tuple(stem_sel_cfg.get("prefer_order", ["vocals", "other", "melody_masked", "mix"]))
-    mix_margin = float(stem_sel_cfg.get("mix_margin", 0.02))
-    tie_eps = float(stem_sel_cfg.get("tie_eps", 0.005))
-    voiced_thr = float(stem_sel_cfg.get("voiced_confidence", 0.10))
-
-    selected_stem, stem_scores, stem_score_details = _select_primary_stem_v3(
-        stem_timelines,
-        prefer_order=prefer_order,
-        mix_margin=mix_margin,
-        tie_eps=tie_eps,
-        voiced_conf_thr=voiced_thr,
+    primary_timeline = (
+        stem_timelines.get("vocals")
+        or stem_timelines.get("mix")
+        or (next(iter(stem_timelines.values())) if stem_timelines else [])
     )
-    primary_timeline = stem_timelines.get(selected_stem, [])
-
-    diagnostics["stem_selection"] = {
-        "selected_stem": selected_stem,
-        "prefer_order": list(prefer_order),
-        "mix_margin": mix_margin,
-        "voiced_confidence": voiced_thr,
-        "scores": stem_scores,
-        "details": stem_score_details,
-    }
-
-    # Keep f0_main aligned with the chosen primary timeline (useful for audits/plots).
-    if primary_timeline:
-        try:
-            f0_main = np.array([float(fp.pitch_hz or 0.0) for fp in primary_timeline], dtype=np.float32)
-        except Exception:
-            pass
-
 
     return StageBOutput(
         time_grid=time_grid,
