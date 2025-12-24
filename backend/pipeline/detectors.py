@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import warnings
+import math
 import numpy as np
 import scipy.signal
 
@@ -25,7 +26,7 @@ except Exception as e:  # pragma: no cover
 def hz_to_midi(hz: float) -> float:
     if hz <= 0.0:
         return 0.0
-    return 69.0 + 12.0 * float(np.log2(hz / 440.0))
+    return 69.0 + 12.0 * math.log2(hz / 440.0)
 
 
 def midi_to_hz(m: int) -> float:
@@ -105,7 +106,7 @@ def _autocorr_pitch_per_frame(
 
     # 4. Vectorized Autocorrelation using FFT (Batched to manage memory)
     # Pad to >= 2*L - 1 to get linear convolution (Wiener-Khinchin)
-    n_fft = 2 ** int(np.ceil(np.log2(2 * frame_length - 1)))
+    n_fft = 2 ** int(math.ceil(math.log2(2 * frame_length - 1)))
 
     # Process in chunks to avoid OOM on long audio files
     BATCH_SIZE = 2000
@@ -743,7 +744,7 @@ class YinDetector(BasePitchDetector):
                 if cand < self.fmin or cand > self.fmax:
                     continue
                 # Continuity cost: cents diff
-                diff_cents = abs(1200.0 * np.log2(cand / prev))
+                diff_cents = abs(1200.0 * math.log2(cand / prev))
                 # Bias towards original detection (0 penalty for 1.0*f)
                 cand_penalty = 0.0
                 if cand != curr:

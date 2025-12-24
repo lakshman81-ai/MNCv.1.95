@@ -401,6 +401,7 @@ def _estimate_global_tuning_cents(f0: np.ndarray) -> float:
     f = f[f > 0.0]
     if f.size < 50:
         return 0.0
+    # Vectorized op, use np.log2
     midi_float = 69.0 + 12.0 * np.log2(f / 440.0)
     frac = midi_float - np.round(midi_float)
     cents = frac * 100.0
@@ -787,7 +788,7 @@ def _arrays_to_timeline(
 
         midi = 0.0
         if hz > 0:
-            midi = 69.0 + 12.0 * np.log2(hz / 440.0)
+            midi = 69.0 + 12.0 * math.log2(hz / 440.0)
 
         time_sec = float(i * hop_length) / float(sr)
 
@@ -930,7 +931,7 @@ def _ensemble_merge(
     def _cent_diff(a: float, b: float) -> float:
         if a <= 0.0 or b <= 0.0:
             return float("inf")
-        return float(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
+        return float(1200.0 * math.log2((a + 1e-9) / (b + 1e-9)))
 
     # Initialize reliability trackers if adaptive
     reliabilities = {}
@@ -1861,7 +1862,7 @@ def extract_features(
 
                     # Apply penalty for jumps from previous frame's selected pitch
                     if prev_p > 0.0:
-                         cents = abs(1200.0 * np.log2(p / prev_p))
+                         cents = abs(1200.0 * math.log2(p / prev_p))
                          # Penalty: 0.0005 per cent -> 0.05 per semitone
                          # Reduced from 0.001 to strictly punish octave jumps but allow melodic steps
                          penalty = cents * 0.0005
@@ -1883,7 +1884,7 @@ def extract_features(
             midi = None
             if chosen_pitch > 0.0:
                 # Apply global tuning correction
-                midi_float = 69.0 + 12.0 * np.log2(chosen_pitch / 440.0)
+                midi_float = 69.0 + 12.0 * math.log2(chosen_pitch / 440.0)
                 midi = int(round(midi_float - tuning_semitones))
 
             # Use the raw candidates (pre-tracking) to expose all available pitches
@@ -1910,7 +1911,7 @@ def extract_features(
             tail_window = 0.35
             last_pitch = next((fp.pitch_hz for fp in reversed(timeline) if fp.pitch_hz > 0.0), 0.0)
             if last_pitch > 0.0:
-                midi_float = 69.0 + 12.0 * np.log2(last_pitch / 440.0)
+                midi_float = 69.0 + 12.0 * math.log2(last_pitch / 440.0)
                 last_midi = int(round(midi_float - tuning_semitones))
                 tail_start = timeline[-1].time - tail_window
                 for fp in reversed(timeline):
