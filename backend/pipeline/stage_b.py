@@ -75,6 +75,135 @@ def _cents_diff(a_hz: float, b_hz: float) -> float:
         return 1e9
     return abs(_LOG2_1200 * math.log((a_hz + _EPS) / (b_hz + _EPS)))
 
+# ---- Stem selection helpers (V3) -------------------------------------------
+
+def _score_timeline_for_melody(
+    timeline: List["FramePitch"],
+    *,
+    voiced_conf_thr: float = 0.10,
+    jump_cents_thr: float = 200.0,
+    hz_min: float = 80.0,
+    hz_max: float = 1400.0,
+) -> Tuple[float, Dict[str, float]]:
+    """Score a FramePitch timeline for 'melody-likeness'.
+
+    Higher is better. Designed to reject jitter/artifacts common in poor separations.
+    Returns (score, components).
+    """
+    n = len(timeline) if timeline is not None else 0
+    if n <= 0:
+        return -1e9, {"voiced_ratio": 0.0, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
+
+    voiced: List["FramePitch"] = []
+    for fp in timeline:
+        try:
+            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+            c = float(getattr(fp, "confidence", 0.0) or 0.0)
+        except Exception:
+            continue
+        if hz > 0.0 and c >= voiced_conf_thr:
+            voiced.append(fp)
+
+    voiced_ratio = float(len(voiced)) / float(max(1, n))
+    if not voiced:
+        return -1e9, {"voiced_ratio": voiced_ratio, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
+
+    confs = []
+    in_range = 0
+    for fp in voiced:
+        hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+        confs.append(float(getattr(fp, "confidence", 0.0) or 0.0))
+        if hz_min <= hz <= hz_max:
+            in_range += 1
+    mean_conf = float(sum(confs)) / float(max(1, len(confs)))
+    range_bonus = float(in_range) / float(max(1, len(voiced)))
+
+    # Penalize big pitch jumps (artifacty separation often causes warbles/chirps)
+    jumps = 0
+    prev_hz = None
+    prev_t = None
+    for fp in voiced:
+        hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+        t = float(getattr(fp, "time", 0.0) or 0.0)
+        if prev_hz is not None and prev_hz > 0.0 and hz > 0.0:
+            if _cents_diff(prev_hz, hz) > jump_cents_thr:
+                jumps += 1
+        prev_hz = hz
+        prev_t = t
+
+    # Duration estimate
+    try:
+        t0 = float(getattr(timeline[0], "time", 0.0) or 0.0)
+        t1 = float(getattr(timeline[-1], "time", t0) or t0)
+        dur = max(1e-6, t1 - t0)
+    except Exception:
+        dur = max(1e-6, n * 0.02)
+
+    jump_rate = float(jumps) / dur  # jumps per second
+
+    score = (mean_conf * voiced_ratio) + (0.10 * range_bonus) - (0.20 * jump_rate)
+    return float(score), {
+        "voiced_ratio": float(voiced_ratio),
+        "mean_conf": float(mean_conf),
+        "jump_rate": float(jump_rate),
+        "range_bonus": float(range_bonus),
+    }
+
+
+def _select_primary_stem_v3(
+    stem_timelines: Dict[str, List["FramePitch"]],
+    *,
+    prefer_order: Tuple[str, ...] = ("vocals", "other", "melody_masked", "mix"),
+    mix_margin: float = 0.02,
+    tie_eps: float = 0.005,
+    voiced_conf_thr: float = 0.10,
+) -> Tuple[str, Dict[str, float], Dict[str, Dict[str, float]]]:
+    """Pick the best stem timeline using a quality gate against the mix."""
+    if not stem_timelines:
+        return "mix", {}, {}
+
+    candidates = [k for k in prefer_order if k in stem_timelines]
+    if not candidates:
+        # deterministic fallback
+        candidates = sorted(stem_timelines.keys())
+
+    scores: Dict[str, float] = {}
+    details: Dict[str, Dict[str, float]] = {}
+    for k in candidates:
+        s, d = _score_timeline_for_melody(stem_timelines.get(k, []), voiced_conf_thr=voiced_conf_thr)
+        scores[k] = float(s)
+        details[k] = d
+
+    # Ensure mix score for gating
+    mix_score = None
+    if "mix" in stem_timelines and "mix" not in scores:
+        ms, md = _score_timeline_for_melody(stem_timelines.get("mix", []), voiced_conf_thr=voiced_conf_thr)
+        scores["mix"] = float(ms)
+        details["mix"] = md
+        mix_score = float(ms)
+    elif "mix" in scores:
+        mix_score = float(scores["mix"])
+
+    best = max(scores.keys(), key=lambda k: scores.get(k, -1e9))
+    best_score = float(scores.get(best, -1e9))
+
+    # Tie-breaker by prefer_order
+    tied = [k for k, s in scores.items() if abs(float(s) - best_score) <= tie_eps]
+    for k in prefer_order:
+        if k in tied:
+            best = k
+            best_score = float(scores[k])
+            break
+
+    # Quality gate vs mix
+    if mix_score is not None and best != "mix":
+        if best_score < (mix_score + float(mix_margin)):
+            best = "mix"
+            best_score = float(mix_score)
+
+    return best, scores, details
+
+
 def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
                            fmin: float, fmax: float,
                            bins_per_octave: int = 36) -> Optional[dict]:
@@ -1458,7 +1587,7 @@ def extract_features(
     augmented_stems = dict(resolved_stems)
     harmonic_mask_applied = False
     harmonic_cfg = b_conf.separation.get("harmonic_masking", {}) if hasattr(b_conf, "separation") else {}
-    if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems:
+    if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems and not bool(separation_diag.get("htdemucs_ran", False)):
         prior_det = detectors.get("swiftf0")
         if prior_det is None:
             prior_conf = dict(b_conf.detectors.get("swiftf0", {}))
@@ -1993,11 +2122,38 @@ def extract_features(
         "layer_conf_summaries": locals().get("layer_conf_summaries", {}),
     }
 
-    primary_timeline = (
-        stem_timelines.get("vocals")
-        or stem_timelines.get("mix")
-        or (next(iter(stem_timelines.values())) if stem_timelines else [])
+    # V3: Choose best stem for downstream segmentation/rendering.
+    stem_sel_cfg = b_conf.separation.get("stem_selection", {}) if hasattr(b_conf, "separation") else {}
+    prefer_order = tuple(stem_sel_cfg.get("prefer_order", ["vocals", "other", "melody_masked", "mix"]))
+    mix_margin = float(stem_sel_cfg.get("mix_margin", 0.02))
+    tie_eps = float(stem_sel_cfg.get("tie_eps", 0.005))
+    voiced_thr = float(stem_sel_cfg.get("voiced_confidence", 0.10))
+
+    selected_stem, stem_scores, stem_score_details = _select_primary_stem_v3(
+        stem_timelines,
+        prefer_order=prefer_order,
+        mix_margin=mix_margin,
+        tie_eps=tie_eps,
+        voiced_conf_thr=voiced_thr,
     )
+    primary_timeline = stem_timelines.get(selected_stem, [])
+
+    diagnostics["stem_selection"] = {
+        "selected_stem": selected_stem,
+        "prefer_order": list(prefer_order),
+        "mix_margin": mix_margin,
+        "voiced_confidence": voiced_thr,
+        "scores": stem_scores,
+        "details": stem_score_details,
+    }
+
+    # Keep f0_main aligned with the chosen primary timeline (useful for audits/plots).
+    if primary_timeline:
+        try:
+            f0_main = np.array([float(fp.pitch_hz or 0.0) for fp in primary_timeline], dtype=np.float32)
+        except Exception:
+            pass
+
 
     return StageBOutput(
         time_grid=time_grid,
