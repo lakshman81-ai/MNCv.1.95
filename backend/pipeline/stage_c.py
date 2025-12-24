@@ -866,7 +866,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     Convert FramePitch timelines into NoteEvent list.
 
     - Uses analysis_data.stem_timelines if analysis_data.timeline is empty.
-    - Prefers stem order: mix -> vocals -> first available.
+    - Prefers stem order: vocals -> other -> melody_masked -> mix -> first available.
     - Applies default rhythmic quantization (1/16 grid at detected tempo).
     """
     # Legacy call signature support: apply_theory(timeline, analysis_data)
@@ -952,14 +952,109 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         analysis_data.notes = []
         return []
 
-    if "mix" in stem_timelines:
-        stem_name = "mix"
-    elif "vocals" in stem_timelines:
-        stem_name = "vocals"
-    else:
-        # Deterministic fallback for primary stem
-        stem_name = sorted(stem_timelines.keys())[0]
+    # V3: Stem selection with quality gate against mix (prevents poor separations from regressing synth benchmarks)
+    pref_order = _get(config, "stage_c.stem_selection.prefer_order", ["vocals", "other", "melody_masked", "mix"])
+    if not isinstance(pref_order, (list, tuple)):
+        pref_order = ["vocals", "other", "melody_masked", "mix"]
+    pref_order = list(pref_order)
 
+    candidates = [k for k in pref_order if k in stem_timelines]
+    if not candidates:
+        candidates = sorted(stem_timelines.keys())
+
+    voiced_thr = float(_get(config, "stage_c.stem_selection.voiced_confidence", 0.10))
+    jump_thr = float(_get(config, "stage_c.stem_selection.jump_cents", 200.0))
+    hz_min = float(_get(config, "stage_c.stem_selection.hz_min", 80.0))
+    hz_max = float(_get(config, "stage_c.stem_selection.hz_max", 1400.0))
+    mix_margin = float(_get(config, "stage_c.stem_selection.mix_margin", 0.02))
+    tie_eps = float(_get(config, "stage_c.stem_selection.tie_eps", 0.005))
+
+    _LOG2_1200 = 1200.0 / math.log(2.0)
+    _EPS = 1e-9
+
+    def _score_timeline(tl: List[FramePitch]) -> Tuple[float, Dict[str, float]]:
+        n = len(tl) if tl is not None else 0
+        if n <= 0:
+            return -1e9, {"voiced_ratio": 0.0, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
+
+        voiced: List[FramePitch] = []
+        for fp in tl:
+            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+            c = float(getattr(fp, "confidence", 0.0) or 0.0)
+            if hz > 0.0 and c >= voiced_thr:
+                voiced.append(fp)
+
+        voiced_ratio = float(len(voiced)) / float(max(1, n))
+        if not voiced:
+            return -1e9, {"voiced_ratio": voiced_ratio, "mean_conf": 0.0, "jump_rate": 0.0, "range_bonus": 0.0}
+
+        confs = []
+        in_range = 0
+        for fp in voiced:
+            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+            confs.append(float(getattr(fp, "confidence", 0.0) or 0.0))
+            if hz_min <= hz <= hz_max:
+                in_range += 1
+        mean_conf = float(sum(confs)) / float(max(1, len(confs)))
+        range_bonus = float(in_range) / float(max(1, len(voiced)))
+
+        jumps = 0
+        prev_hz = None
+        for fp in voiced:
+            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+            if prev_hz is not None and prev_hz > 0.0 and hz > 0.0:
+                cents = abs(_LOG2_1200 * math.log((hz + _EPS) / (prev_hz + _EPS)))
+                if cents > jump_thr:
+                    jumps += 1
+            prev_hz = hz
+
+        try:
+            t0 = float(getattr(tl[0], "time", 0.0) or 0.0)
+            t1 = float(getattr(tl[-1], "time", t0) or t0)
+            dur = max(1e-6, t1 - t0)
+        except Exception:
+            dur = max(1e-6, n * 0.02)
+
+        jump_rate = float(jumps) / dur
+
+        score = (mean_conf * voiced_ratio) + (0.10 * range_bonus) - (0.20 * jump_rate)
+        return float(score), {
+            "voiced_ratio": float(voiced_ratio),
+            "mean_conf": float(mean_conf),
+            "jump_rate": float(jump_rate),
+            "range_bonus": float(range_bonus),
+        }
+
+    stem_scores: Dict[str, float] = {}
+    stem_details: Dict[str, Dict[str, float]] = {}
+    for k in candidates:
+        s, d = _score_timeline(stem_timelines.get(k, []))
+        stem_scores[k] = float(s)
+        stem_details[k] = d
+
+    if "mix" in stem_timelines and "mix" not in stem_scores:
+        ms, md = _score_timeline(stem_timelines.get("mix", []))
+        stem_scores["mix"] = float(ms)
+        stem_details["mix"] = md
+
+    best = max(stem_scores.keys(), key=lambda k: stem_scores.get(k, -1e9))
+    best_score = float(stem_scores.get(best, -1e9))
+
+    tied = [k for k, s in stem_scores.items() if abs(float(s) - best_score) <= tie_eps]
+    for k in pref_order:
+        if k in tied:
+            best = k
+            best_score = float(stem_scores[k])
+            break
+
+    # Gate: only use separated stem if it beats mix by margin
+    if "mix" in stem_timelines and best != "mix":
+        mix_score = float(stem_scores.get("mix", -1e9))
+        if best_score < (mix_score + mix_margin):
+            best = "mix"
+            best_score = mix_score
+
+    stem_name = best
     primary_timeline = stem_timelines.get(stem_name, [])
     # Removed strict length check here to allow robust fallback handling loop below
 
@@ -998,32 +1093,20 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # Build list of timelines to process.
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]
     audio_type = getattr(analysis_data.meta, "audio_type", None)
-    allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
+    is_poly = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
 
-    # Optional override / instrument heuristic:
-    # Separator "stems" (vocals/bass/drums/other) are usually NOT meaningful for piano transcription
-    # and can create duplicate/misaligned notes in L5.* benchmarks.
+    # Secondary stems (vocals/bass/drums/other) often create duplicate/misaligned notes if segmented independently,
+    # especially when separation introduces artifacts (common in synthetic benchmarks).
+    # Default behavior: process ONLY the selected primary stem.
+    # Opt-in via config: stage_c.include_secondary_stems = True
     include_secondary_override = _get(config, "stage_c.include_secondary_stems", None)
-    instrument = getattr(getattr(analysis_data, "meta", None), "instrument", None)
-    if instrument is None:
-        instrument = _get(config, "intended_instrument", None)
-
-    if include_secondary_override is not None:
-        allow_secondary = bool(include_secondary_override) and bool(allow_secondary)
-    else:
-        try:
-            inst = str(instrument).lower() if instrument is not None else ""
-        except Exception:
-            inst = ""
-        if inst in ("piano", "keyboard", "keys"):
-            allow_secondary = False
+    allow_secondary = bool(include_secondary_override) and bool(is_poly) if include_secondary_override is not None else False
 
     if allow_secondary and len(stem_timelines) > 1:
         # Add others in deterministic order
         other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
         for other_name in other_keys:
-             timelines_to_process.append((other_name, stem_timelines[other_name]))
-
+            timelines_to_process.append((other_name, stem_timelines[other_name]))
     notes: List[NoteEvent] = []
 
     # seg_cfg is already built above
@@ -1368,7 +1451,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
          analysis_data.diagnostics["stage_c"] = {
              "segmentation_method": seg_method,
              "timelines_processed": len(timelines_to_process),
-             "note_count_raw": len(notes)
+             "note_count_raw": len(notes),
+             "selected_stem": stem_name,
+             "allow_secondary_stems": bool(allow_secondary),
+             "stem_scores": stem_scores if "stem_scores" in locals() else {},
+             "stem_score_details": stem_details if "stem_details" in locals() else {},
          }
 
     quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
