@@ -152,7 +152,7 @@ def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float
         for other in pitches[1:]:
             if ref <= 0 or other <= 0:
                 continue
-            cents = abs(1200.0 * np.log2(other / ref))
+            cents = abs(1200.0 * math.log2(other / ref))
             if cents > cents_tolerance:
                 return True
 
@@ -1123,7 +1123,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
                             # Bonus for continuity
                             if prev_pitch > 0.0:
-                                cents_diff = abs(1200.0 * np.log2(p / prev_pitch))
+                                cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
                                 if cents_diff < 100: # Within semitone
                                     score += 0.1
                                 elif cents_diff < 1200: # Within octave
@@ -1138,7 +1138,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     p_best, c_best = best_cand
 
                     # Recompute MIDI
-                    midi_new = int(round(69 + 12 * np.log2(p_best / 440.0)))
+                    midi_new = int(round(69 + 12 * math.log2(p_best / 440.0)))
                     # Create updated frame (assuming immutable-ish usage, creating new is safer)
                     fp2 = FramePitch(
                         time=fp.time,
