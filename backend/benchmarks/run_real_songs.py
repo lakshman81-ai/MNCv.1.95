@@ -103,8 +103,8 @@ def run_song(
     else:
         config = PipelineConfig()
 
-    # disable separation for synthetic audio
-    config.stage_b.separation['enabled'] = False
+    # enable separation for synthetic audio (requested override)
+    config.stage_b.separation['enabled'] = True
     # Tune Stage C for synthetic audio (tight segmentation)
     config.stage_c.velocity_map['min_db'] = -15.0
     meta = MetaData(
