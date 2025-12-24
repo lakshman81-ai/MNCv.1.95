@@ -772,10 +772,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         analysis_data.notes = []
         return []
 
-    if "mix" in stem_timelines:
-        stem_name = "mix"
-    elif "vocals" in stem_timelines:
+    # Prioritize vocals as primary stem for melody-dominant tasks
+    if "vocals" in stem_timelines:
         stem_name = "vocals"
+    elif "mix" in stem_timelines:
+        stem_name = "mix"
     else:
         # Deterministic fallback for primary stem
         stem_name = sorted(stem_timelines.keys())[0]
@@ -820,7 +821,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     audio_type = getattr(analysis_data.meta, "audio_type", None)
     allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
 
-    if allow_secondary and len(stem_timelines) > 1:
+    # Guard: Only process secondary stems if explicitly enabled in config.
+    # By default, we only want the primary stem (melody/mix) to avoid over-segmentation.
+    process_secondary = _get(config, "stage_c.polyphony_filter.process_secondary_stems", False)
+
+    if allow_secondary and process_secondary and len(stem_timelines) > 1:
         # Add others in deterministic order
         other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
         for other_name in other_keys:
