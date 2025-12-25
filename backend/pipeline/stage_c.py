@@ -21,17 +21,16 @@ NoteEvent fields:
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
-
+from copy import deepcopy
 import numpy as np
 import math
 
-# Support both package and top‑level imports for models
+# Support both package and top-level imports for models
 try:
     from .models import AnalysisData, FramePitch, NoteEvent, AudioType  # type: ignore
 except Exception:
     from models import AnalysisData, FramePitch, NoteEvent, AudioType  # type: ignore
 
-from copy import deepcopy
 
 def snap_onset(frame_idx: int, onset_strength: List[float], radius: int = 2) -> int:
     """Refine frame_idx to local maximum of onset_strength within radius."""
@@ -44,7 +43,6 @@ def snap_onset(frame_idx: int, onset_strength: List[float], radius: int = 2) -> 
     lo = max(0, frame_idx - radius)
     hi = min(n - 1, frame_idx + radius)
 
-    # Bias towards the original frame_idx if flat or ties
     best_i = frame_idx
     best_val = onset_strength[frame_idx]
 
@@ -54,7 +52,14 @@ def snap_onset(frame_idx: int, onset_strength: List[float], radius: int = 2) -> 
             best_i = i
     return best_i
 
-def should_split_same_pitch(i: int, onset_strength: List[float], band_energy: List[float], thr_onset: float = 0.7, thr_bump: float = 0.15) -> bool:
+
+def should_split_same_pitch(
+    i: int,
+    onset_strength: List[float],
+    band_energy: List[float],
+    thr_onset: float = 0.7,
+    thr_bump: float = 0.15,
+) -> bool:
     """
     Check if a repeated note split is warranted at index i.
     i: current frame index
@@ -65,24 +70,17 @@ def should_split_same_pitch(i: int, onset_strength: List[float], band_energy: Li
     if onset_strength[i] < thr_onset:
         return False
 
-    # Check local energy bump in specific band
-    # band_energy should be energy of the specific pitch bin
-    # We might not have per-bin energy here easily unless we computed it.
-    # Fallback: just use onset strength peak + pitch stability
-    # But prompt says: "short-term pitch-band energy bump exists"
-    # If we don't have band_energy, we rely on onset_strength.
-
     if not band_energy:
-         # Without band energy, we should be conservative.
-         # Only split if onset strength is very high?
-         return False # False to avoid over-splitting on L0/L1 without per-band data
+        # conservative: without per-band energy, avoid over-splitting
+        return False
 
-    prev = band_energy[max(0, i - 2):i]
+    prev = band_energy[max(0, i - 2) : i]
     if not prev:
         return False
 
     bump = band_energy[i] - (sum(prev) / len(prev))
     return bump >= thr_bump
+
 
 def _get(obj: Any, path: str, default: Any = None) -> Any:
     if obj is None:
@@ -102,36 +100,51 @@ def _get(obj: Any, path: str, default: Any = None) -> Any:
     return cur
 
 
+def _midi_to_hz(midi_note: int) -> float:
+    # A4 = 440Hz at MIDI 69
+    try:
+        return float(440.0 * (2.0 ** ((float(midi_note) - 69.0) / 12.0)))
+    except Exception:
+        return 0.0
+
+
 def _velocity_from_rms(rms_list: List[float], vmin: int = 20, vmax: int = 105) -> int:
-    # C4: Velocity mapping from RMS (20–105)
+    # Velocity mapping from RMS (20–105)
     if not rms_list:
         return 64
 
-    rms = float(np.mean(rms_list)) # Use mean of note RMS
+    rms = float(np.mean(rms_list))
 
     # Default range -40dB to -4dB
-    min_rms = 10**(-40/20)
-    max_rms = 10**(-4/20)
+    min_rms = 10 ** (-40 / 20)
+    max_rms = 10 ** (-4 / 20)
 
     x = (rms - min_rms) / max(max_rms - min_rms, 1e-9)
     x = float(np.clip(x, 0.0, 1.0))
-    x = x ** 0.6
+    x = x**0.6
     v = 20 + int(round(x * (105 - 20)))
     return int(np.clip(v, 20, 105))
 
+
 def _velocity_to_dynamic(v: int) -> str:
-    # C4: Dynamic label assignment
-    if v < 30: return "pp"
-    if v < 45: return "p"
-    if v < 60: return "mp"
-    if v < 75: return "mf"
-    if v < 90: return "f"
+    if v < 30:
+        return "pp"
+    if v < 45:
+        return "p"
+    if v < 60:
+        return "mp"
+    if v < 75:
+        return "mf"
+    if v < 90:
+        return "f"
     return "ff"
 
-def _cents_diff_hz(a, b):
+
+def _cents_diff_hz(a: float, b: float) -> float:
     if a <= 0 or b <= 0:
         return 1e9
     return abs(1200.0 * math.log2((a + 1e-9) / (b + 1e-9)))
+
 
 def _estimate_hop_seconds(timeline: List[FramePitch]) -> float:
     if len(timeline) < 2:
@@ -169,17 +182,17 @@ def _decompose_polyphonic_timeline(
     pitch_tolerance_cents: float = 50.0,
     max_tracks: int = 5,
     *,
-    hangover_frames: int = 3,          # keep head through short dropouts
-    new_track_penalty: float = 80.0,   # discourage spawning new tracks
-    crossing_penalty: float = 60.0,    # discourage voice crossing
-    min_cand_conf: float = 0.05,       # ignore very weak candidates
+    hangover_frames: int = 3,
+    new_track_penalty: float = 80.0,
+    crossing_penalty: float = 60.0,
+    min_cand_conf: float = 0.05,
 ) -> List[List[FramePitch]]:
     if not timeline:
         return []
 
     tracks: List[List[FramePitch]] = [[] for _ in range(max_tracks)]
     track_heads: List[float] = [0.0] * max_tracks
-    track_age: List[int] = [10**9] * max_tracks  # frames since last voiced
+    track_age: List[int] = [10**9] * max_tracks
 
     LOG2_1200 = 1200.0 / math.log(2.0)
 
@@ -195,13 +208,12 @@ def _decompose_polyphonic_timeline(
             d = cents(p, head)
             if d > pitch_tolerance_cents:
                 return 1e9
-            # small penalty grows with age (prefer continuity)
             return d + 5.0 * min(age, 10)
-        # empty track: discourage spawning unless needed
         return new_track_penalty + 5.0 * min(age, 10)
 
+    import itertools
+
     for fp in timeline:
-        # candidates (top by confidence, clipped to max_tracks)
         if getattr(fp, "active_pitches", None):
             candidates = [(p, c) for (p, c) in fp.active_pitches if p > 0.0 and c >= min_cand_conf]
             candidates.sort(key=lambda x: x[1], reverse=True)
@@ -213,16 +225,12 @@ def _decompose_polyphonic_timeline(
         if candidates:
             candidates = candidates[:max_tracks]
 
-            # brute-force best assignment (small max_tracks => fast)
             best_map = None
             best_cost = 1e18
 
             m = len(candidates)
             track_ids = list(range(max_tracks))
 
-            # try subsets of tracks of size m (simple: try all tracks permutations and take first m)
-            # because max_tracks is small, brute-forcing permutations is okay
-            import itertools
             for perm in itertools.permutations(track_ids, m):
                 cost_sum = 0.0
                 assigned_pitch = [0.0] * max_tracks
@@ -230,7 +238,7 @@ def _decompose_polyphonic_timeline(
                 ok = True
                 for j, ti in enumerate(perm):
                     p, conf = candidates[j]
-                    cst = assign_cost(ti, p) - 80.0 * float(conf)  # confidence bonus
+                    cst = assign_cost(ti, p) - 80.0 * float(conf)
                     if cst >= 1e8:
                         ok = False
                         break
@@ -240,7 +248,7 @@ def _decompose_polyphonic_timeline(
                 if not ok:
                     continue
 
-                # crossing penalty: enforce track index ~ pitch order (track0 highest, trackN lowest)
+                # soft penalty for inversions/crossings (very rough)
                 for i in range(max_tracks):
                     for k in range(i + 1, max_tracks):
                         pi = assigned_pitch[i]
@@ -256,18 +264,19 @@ def _decompose_polyphonic_timeline(
             if best_map is not None:
                 for j, ti in enumerate(best_map):
                     p_hz, conf = candidates[j]
-                    tracks[ti].append(FramePitch(
-                        time=fp.time,
-                        pitch_hz=p_hz,
-                        midi=int(round(69 + 12 * math.log2(p_hz / 440.0))) if p_hz > 0 else None,
-                        confidence=float(conf),
-                        rms=fp.rms
-                    ))
+                    tracks[ti].append(
+                        FramePitch(
+                            time=fp.time,
+                            pitch_hz=p_hz,
+                            midi=int(round(69 + 12 * math.log2(p_hz / 440.0))) if p_hz > 0 else None,
+                            confidence=float(conf),
+                            rms=fp.rms,
+                        )
+                    )
                     track_heads[ti] = p_hz
                     track_age[ti] = 0
                     assigned_tracks.add(ti)
 
-            # fill others with silence; DO NOT instantly reset head (hangover)
             for i in range(max_tracks):
                 if i not in assigned_tracks:
                     tracks[i].append(FramePitch(time=fp.time, pitch_hz=0.0, midi=None, confidence=0.0, rms=fp.rms))
@@ -276,7 +285,6 @@ def _decompose_polyphonic_timeline(
                         track_heads[i] = 0.0
 
         else:
-            # no candidates: keep heads for hangover_frames instead of wiping immediately
             for i in range(max_tracks):
                 tracks[i].append(FramePitch(time=fp.time, pitch_hz=0.0, midi=None, confidence=0.0, rms=fp.rms))
                 track_age[i] = min(track_age[i] + 1, 10**9)
@@ -295,35 +303,28 @@ def _segment_monophonic(
     min_rms: float = 0.01,
     conf_start: float | None = None,
     conf_end: float | None = None,
-    seg_cfg: Dict[str, Any] = None,
+    seg_cfg: Optional[Dict[str, Any]] = None,
     hop_s: float = 0.01,
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
-    Updated for C1 (hysteresis), C2 (gap merge/vibrato), and robustness/glitch tolerance.
+    Updated for hysteresis, gap merge/vibrato, and robustness/glitch tolerance.
     """
     seg_cfg = seg_cfg or {}
 
     if len(timeline) < 2:
         return []
 
-    if seg_cfg is None:
-        seg_cfg = {}
-
-    # C1: Frame stability onset (>= 3 frames) + release hysteresis (2-3 frames)
     min_on = int(seg_cfg.get("min_onset_frames", 3))
     rel = int(seg_cfg.get("release_frames", 2))
 
-    # C2 Params
     split_semi = float(seg_cfg.get("split_semitone", 0.7))
     split_cents = split_semi * 100.0
 
-    # P4: Prioritize time_merge_frames logic
     tmf_cfg = seg_cfg.get("time_merge_frames")
     if tmf_cfg is not None:
         time_merge_frames = int(tmf_cfg)
     else:
-        # P4: Default fallback
         time_merge_frames = int(gap_tolerance_s / hop_s)
     time_merge_frames = max(0, time_merge_frames)
 
@@ -337,99 +338,58 @@ def _segment_monophonic(
     current_end = -1
     current_pitch_hz = 0.0
 
-    # P5: Pitch reference buffer for vibrato stability
     pitch_buffer: List[float] = []
     pitch_buffer_size = int(seg_cfg.get("pitch_ref_window_frames", 7))
     pitch_buffer_size = max(3, min(21, pitch_buffer_size))
 
-    # Glitch tolerance
     glitch_counter = 0
     MAX_GLITCH_FRAMES = 2
 
-    # P2: Apply confidence hysteresis
     c_start = conf_start if conf_start is not None else conf_thr
     c_end = conf_end if conf_end is not None else conf_thr
 
-    # Step 5: Onset Refinement
-    # If we have onset_strength in timeline (FramePitch.rms used as proxy or new field?)
-    # FramePitch doesn't have onset_strength.
-    # We can try to infer it from RMS changes or if we added it (we added it to debug CSV but not FramePitch struct yet).
-    # Let's assume we use rms delta as weak proxy if no explicit data.
-    onset_strength = []
-    # Compute simple onset strength from RMS if not present
-    # Or check if we can add it to FramePitch (we didn't modify models.py yet).
-    # We can assume FramePitch has no extra field, so we calculate locally.
+    onset_strength: List[float] = []
     rms_values = [fp.rms for fp in timeline]
     if rms_values:
-        # Simple Flux: diff(rms) > 0
         onset_strength = [0.0] * len(rms_values)
         for k in range(1, len(rms_values)):
-            d = rms_values[k] - rms_values[k-1]
+            d = rms_values[k] - rms_values[k - 1]
             if d > 0:
                 onset_strength[k] = d
-        # Normalize
         m = max(onset_strength) if onset_strength else 0
         if m > 0:
-            onset_strength = [x/m for x in onset_strength]
-
-    # Step 5.1: Snap onset
-    # We apply this when detecting 'active' transition.
+            onset_strength = [x / m for x in onset_strength]
 
     for i, fp in enumerate(timeline):
-        # P2 Hysteresis logic
         if not active:
-             is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_start)
+            is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_start)
         else:
-             is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_end)
+            is_voiced_frame = (fp.pitch_hz > 0.0 and fp.confidence >= c_end)
 
         if is_voiced_frame:
-            # Check for glitch if active
             is_glitch = False
             if active:
                 diff = _cents_diff_hz(fp.pitch_hz, current_pitch_hz)
                 if diff > split_cents:
-                     is_glitch = True
+                    is_glitch = True
 
-            # Step 5.2: Check for repeated note split (same pitch, new onset)
             is_repeated_split = False
-
-            # Feature Flag: Repeated Note Splitter
             use_splitter = seg_cfg.get("use_repeated_note_splitter", True)
             if active and not is_glitch and use_splitter:
-                # Use should_split_same_pitch logic
-                # Need band energy -> use fp.rms as proxy for now
                 if should_split_same_pitch(i, onset_strength, rms_values, thr_onset=0.6, thr_bump=0.1):
-                     is_repeated_split = True
+                    is_repeated_split = True
 
             if is_glitch or is_repeated_split:
-                if glitch_counter < MAX_GLITCH_FRAMES and is_glitch: # Only absorb pitch glitches
-                    # Absorb glitch: extend current note logically but don't update pitch ref
-                    # Treat as part of note
+                if glitch_counter < MAX_GLITCH_FRAMES and is_glitch:
                     current_end = i
                     glitch_counter += 1
                     continue
                 else:
-                    # Confirmed split (pitch jump or repeated note)
                     glitch_counter = 0
-
-                    # Close current
                     segs.append((current_start, current_end))
 
-                    # Start new
-                    active = True
-
-                    # Feature Flag: Onset Refinement
                     use_refinement = seg_cfg.get("use_onset_refinement", True)
-
-                    # Snap onset?
-                    if use_refinement:
-                        refined_start = snap_onset(i, onset_strength) if onset_strength else i
-                    else:
-                        refined_start = i
-
-                    # Safe clamp (Task 2.3):
-                    # 1. refined_start <= i (must be within or before new note start frame)
-                    # 2. refined_start >= current_end + 1 (must be after previous note end)
+                    refined_start = snap_onset(i, onset_strength) if (use_refinement and onset_strength) else i
                     refined_start = min(refined_start, i)
                     refined_start = max(refined_start, current_end + 1)
 
@@ -437,7 +397,8 @@ def _segment_monophonic(
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
                     pitch_buffer = [fp.pitch_hz]
-                    stable = min_on # Assume stability resets? Or we trust this split?
+                    stable = min_on
+                    active = True
             else:
                 glitch_counter = 0
 
@@ -446,91 +407,65 @@ def _segment_monophonic(
                 stable += 1
                 if stable >= min_on:
                     active = True
-
-                    # Feature Flag: Onset Refinement
                     use_refinement = seg_cfg.get("use_onset_refinement", True)
 
-                    # Snap start
                     start_idx = i - (min_on - 1)
-                    if use_refinement:
-                        refined_start = snap_onset(start_idx, onset_strength) if onset_strength else start_idx
-                    else:
-                        refined_start = start_idx
-
-                    # Safe clamp (Task 2.3):
-                    # 1. refined_start <= i (must be within or before new note start frame)
-                    # 2. refined_start >= current_end + 1 (must be after previous note end)
+                    refined_start = (
+                        snap_onset(start_idx, onset_strength) if (use_refinement and onset_strength) else start_idx
+                    )
                     refined_start = min(refined_start, i)
                     refined_start = max(refined_start, current_end + 1)
 
                     current_start = refined_start
-
                     current_end = i
                     current_pitch_hz = fp.pitch_hz
                     pitch_buffer = [fp.pitch_hz]
             else:
-                # Extend note
-                # Check vibrato / pitch jump - C2
-                # (We already checked is_glitch above, so here diff <= split_cents)
                 current_end = i
-                # P5: Update pitch reference
                 pitch_buffer.append(fp.pitch_hz)
                 if len(pitch_buffer) > pitch_buffer_size:
                     pitch_buffer.pop(0)
                 current_pitch_hz = float(np.median(pitch_buffer))
-
 
         else:
             stable = 0
             if active:
                 silent += 1
                 if silent >= rel:
-                    # Finalize
                     segs.append((current_start, current_end))
                     active = False
                     current_start = -1
                     current_end = -1
 
-    # Close pending
     if active and current_start != -1:
         segs.append((current_start, current_end))
 
-    # C2: Gap merge (1-frame)
-    if len(segs) < 2:
-        pass # Optimization: fall through to return merged_segs if empty
-
-    merged_segs = []
+    merged_segs: List[Tuple[int, int]] = []
     if segs:
         curr_s, curr_e = segs[0]
-        # Calculate pitch for current seg to check against next
-        def get_seg_pitch(s, e):
-            p = [timeline[x].pitch_hz for x in range(s, e+1) if timeline[x].pitch_hz > 0]
-            if not p: return 0.0
-            return np.median(p)
+
+        def get_seg_pitch(s: int, e: int) -> float:
+            p = [timeline[x].pitch_hz for x in range(s, e + 1) if timeline[x].pitch_hz > 0]
+            if not p:
+                return 0.0
+            return float(np.median(p))
 
         curr_p = get_seg_pitch(curr_s, curr_e)
 
         for i in range(1, len(segs)):
             next_s, next_e = segs[i]
             next_p = get_seg_pitch(next_s, next_e)
-
-            # Gap in frames
             gap = next_s - curr_e - 1
 
             if gap <= time_merge_frames and _cents_diff_hz(curr_p, next_p) <= split_cents:
-                # Merge
                 curr_e = next_e
-                # Keep curr_p stable
             else:
-                # P3: Enforce min_note_duration
                 dur = (curr_e - curr_s + 1) * hop_s
                 if dur >= min_note_dur_s:
                     merged_segs.append((curr_s, curr_e))
-
                 curr_s, curr_e = next_s, next_e
                 curr_p = next_p
 
-        # Check last
         dur = (curr_e - curr_s + 1) * hop_s
         if dur >= min_note_dur_s:
             merged_segs.append((curr_s, curr_e))
@@ -553,7 +488,6 @@ def _viterbi_voicing_mask(
     conf = np.clip(np.array([fp.confidence for fp in timeline], dtype=np.float64), 0.0, 1.0)
     rms = np.array([fp.rms for fp in timeline], dtype=np.float64)
 
-    # Normalize RMS to [0,1] range to support use as a confidence prior
     rms_norm = rms.copy()
     if np.any(rms_norm > 0):
         rms_norm /= float(np.percentile(rms_norm[rms_norm > 0], 95))
@@ -571,18 +505,16 @@ def _viterbi_voicing_mask(
     silence_cost[0] = -silence_score[0]
 
     for i in range(1, n):
-        # Transition into voiced
         stay_voiced = voiced_cost[i - 1] - stay_bonus
         switch_to_voiced = silence_cost[i - 1] + transition_penalty
         if stay_voiced <= switch_to_voiced:
             voiced_cost[i] = stay_voiced
-            backpointer[i, 1] = 1  # came from voiced
+            backpointer[i, 1] = 1
         else:
             voiced_cost[i] = switch_to_voiced
-            backpointer[i, 1] = 0  # came from silence
+            backpointer[i, 1] = 0
         voiced_cost[i] -= voiced_score[i]
 
-        # Transition into silence
         stay_silence = silence_cost[i - 1] - stay_bonus
         switch_to_silence = voiced_cost[i - 1] + transition_penalty
         if stay_silence <= switch_to_silence:
@@ -593,7 +525,6 @@ def _viterbi_voicing_mask(
             backpointer[i, 0] = 1
         silence_cost[i] -= silence_score[i]
 
-    # Backtrack
     state = 1 if voiced_cost[-1] <= silence_cost[-1] else 0
     mask = np.zeros(n, dtype=bool)
     for i in range(n - 1, -1, -1):
@@ -637,42 +568,61 @@ def _segments_from_mask(
 
 
 def _sanitize_notes(notes: List[NoteEvent]) -> List[NoteEvent]:
-    clean = []
+    """
+    Ensure pitch_hz is valid. If pitch_hz missing/<=0 but midi_note exists, derive pitch_hz.
+    Then drop obviously invalid notes.
+    """
+    clean: List[NoteEvent] = []
     for n in notes:
         if n is None:
             continue
         if n.end_sec <= n.start_sec:
             continue
-        if n.pitch_hz is None or n.pitch_hz <= 0:
+
+        # E2E hygiene: pitch_hz fallback from midi_note
+        phz = getattr(n, "pitch_hz", None)
+        if phz is None or float(phz) <= 0.0:
+            mn = getattr(n, "midi_note", None)
+            if mn is not None:
+                try:
+                    n.pitch_hz = _midi_to_hz(int(mn))
+                except Exception:
+                    n.pitch_hz = 0.0
+
+        if n.pitch_hz is None or float(n.pitch_hz) <= 0.0:
             continue
+
         clean.append(n)
+
     clean.sort(key=lambda x: (x.start_sec, x.end_sec, x.pitch_hz))
     return clean
+
 
 def _dedupe_overlapping_notes(notes: List[NoteEvent], overlap_thr: float = 0.85) -> List[NoteEvent]:
     if not notes:
         return notes
-    # Sort primarily by voice, then pitch, then time
-    notes = sorted(notes, key=lambda n: (n.voice or 0, n.midi_note or 0, n.start_sec, n.end_sec, -n.confidence))
+    notes = sorted(
+        notes,
+        key=lambda n: (n.voice or 0, n.midi_note or 0, n.start_sec, n.end_sec, -float(getattr(n, "confidence", 0.0))),
+    )
     out: List[NoteEvent] = []
     for n in notes:
         if not out:
-            out.append(n); continue
+            out.append(n)
+            continue
         p = out[-1]
-        # Only check if same voice and same MIDI pitch
         if (p.voice == n.voice) and (p.midi_note == n.midi_note):
-            # overlap ratio
             a0, a1 = p.start_sec, p.end_sec
             b0, b1 = n.start_sec, n.end_sec
             inter = max(0.0, min(a1, b1) - max(a0, b0))
             union = max(a1, b1) - min(a0, b0) + 1e-9
             if inter / union >= overlap_thr:
-                # keep the higher-confidence one
-                if n.confidence > p.confidence:
+                if float(getattr(n, "confidence", 0.0)) > float(getattr(p, "confidence", 0.0)):
                     out[-1] = n
                 continue
         out.append(n)
     return out
+
 
 def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[NoteEvent]:
     if not notes:
@@ -680,17 +630,15 @@ def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[Not
     tol = tol_ms / 1000.0
     notes = sorted(notes, key=lambda n: n.start_sec)
     i = 0
-    out = []
+    out: List[NoteEvent] = []
     while i < len(notes):
         j = i + 1
         group = [notes[i]]
-        # Collect group within tolerance window
         while j < len(notes) and abs(notes[j].start_sec - notes[i].start_sec) <= tol:
             group.append(notes[j])
             j += 1
 
         if len(group) >= 2:
-            # Snap all to the earliest start in the group
             s0 = min(n.start_sec for n in group)
             for n in group:
                 n.start_sec = s0
@@ -698,7 +646,6 @@ def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[Not
         out.extend(group)
         i = j
     return out
-
 
 
 def _timeline_score(timeline: list) -> tuple[float, float]:
@@ -732,7 +679,6 @@ def _select_best_stem_timeline(stem_timelines: dict, config: Any) -> tuple[str, 
 
     prefer_order = _get(config, "stem_selection.prefer_order", None)
     if not prefer_order:
-        # Default favors vocals when present (songs), but falls back safely.
         prefer_order = ["vocals", "other", "melody_masked", "mix"]
 
     mix_margin = float(_get(config, "stem_selection.mix_margin", 0.02) or 0.0)
@@ -743,19 +689,16 @@ def _select_best_stem_timeline(stem_timelines: dict, config: Any) -> tuple[str, 
         if tl is None:
             continue
         vr, mc = _timeline_score(tl)
-        # Simple scalar score: prioritize being voiced, then confidence.
         score = vr * (0.5 + mc)
         scores[stem] = (score, vr, mc)
 
     if not scores:
-        # fallback: first available
         stem, tl = next(iter(stem_timelines.items()))
         return stem, tl
 
     best_stem = max(scores.items(), key=lambda kv: kv[1][0])[0]
     best_score = scores[best_stem][0]
 
-    # Optional safety: prefer mix if it's close to best (avoid separation artifacts)
     if "mix" in scores and best_stem != "mix":
         mix_score = scores["mix"][0]
         if mix_score >= best_score - mix_margin:
@@ -768,9 +711,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     """
     Convert FramePitch timelines into NoteEvent list.
 
-    - Uses analysis_data.stem_timelines if analysis_data.timeline is empty.
-    - Prefers stem order: mix -> vocals -> first available.
-    - Applies default rhythmic quantization (1/16 grid at detected tempo).
+    Quantization gate:
+      If config.stage_c.quantize["enabled"] is False, returns RAW notes (no grid snap).
+      Default assumed enabled when config missing.
     """
     # Legacy call signature support: apply_theory(timeline, analysis_data)
     if isinstance(analysis_data, list) and isinstance(config, AnalysisData):
@@ -781,25 +724,35 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     elif not isinstance(analysis_data, AnalysisData):
         return []
 
+    quantize_enabled = bool(_get(config, "stage_c.quantize.enabled", True))
+
     # Short-circuit if precalculated notes exist (E2E path)
     if analysis_data.precalculated_notes is not None:
-        clean = _sanitize_notes(analysis_data.precalculated_notes)
-        analysis_data.notes = clean
-        analysis_data.diagnostics["stage_c_mode"] = "precalculated"
-        return clean
+        clean = _sanitize_notes(list(analysis_data.precalculated_notes or []))
 
-    # Patch F0: Apply instrument profile overrides inside Stage C
-    # Resolve instrument from metadata if available, else config
+        # Always store raw
+        analysis_data.notes_before_quantization = deepcopy(clean)
+
+        if not quantize_enabled:
+            analysis_data.notes = list(clean)
+            if hasattr(analysis_data, "diagnostics"):
+                analysis_data.diagnostics["stage_c_mode"] = "precalculated_raw"
+                analysis_data.diagnostics["stage_c_quantize_enabled"] = False
+            return list(clean)
+
+        quantized = quantize_notes(clean, analysis_data=analysis_data)
+        analysis_data.notes = quantized
+
+        if hasattr(analysis_data, "diagnostics"):
+            analysis_data.diagnostics["stage_c_mode"] = "precalculated"
+            analysis_data.diagnostics["stage_c_quantize_enabled"] = True
+        return quantized
+
     meta_instr = getattr(analysis_data.meta, "instrument", None)
     config_instr = _get(config, "stage_b.instrument", "piano_61key")
-
-    # Priority: MetaData (resolved in Stage B) -> Config -> Default
     instrument_name = meta_instr if meta_instr else config_instr
 
-    profile = None
-    profile_special = {}
-
-    # Check if overrides are enabled
+    profile_special: Dict[str, Any] = {}
     apply_profile = _get(config, "stage_c.apply_instrument_profile", True)
 
     if apply_profile and config and hasattr(config, "get_profile"):
@@ -807,57 +760,30 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         if profile:
             profile_special = dict(getattr(profile, "special", {}) or {})
 
-    # Helper to resolve a config value with override priority:
-    # 1. profile.special['stage_c_X'] (if exists)
-    # 2. config.stage_c.X
-    # 3. default
-
     def resolve_val(key, default):
-        # Try profile special first (e.g. stage_c_min_note_duration_ms)
         special_key = f"stage_c_{key}"
         if special_key in profile_special:
             return profile_special[special_key]
-        # Also check flat key without stage_c_ prefix if it was in the report?
-        # But report says "stage_c_min_note_duration_ms"
-        # However, for nested override "stage_c" -> key
-        # We can also check explicit nested overrides.
         nested_c = profile_special.get("stage_c", {})
         if isinstance(nested_c, dict) and key in nested_c:
             return nested_c[key]
-
-        # Then config
         return _get(config, f"stage_c.{key}", default)
 
-    # Patch C0: Resolve overrides for segmentation
-    # Specifically map: stage_c_pitch_ref_window_frames, stage_c_conf_start/end
-
     seg_cfg = dict(resolve_val("segmentation_method", {}) or {})
-
-    # Inject robustness flags into seg_cfg
-    # Now config.stage_c has these fields directly, so we can use _get properly
     seg_cfg["use_onset_refinement"] = _get(config, "stage_c.use_onset_refinement", True)
     seg_cfg["use_repeated_note_splitter"] = _get(config, "stage_c.use_repeated_note_splitter", True)
 
     if "stage_c_pitch_ref_window_frames" in profile_special:
-         # Note: stage_c_pitch_ref_window_frames doesn't exist in segmentation_method usually,
-         # it's usually a local param or logic. But let's check.
-         # Actually it's P5 in _segment_monophonic which currently hardcodes pitch_buffer_size=7.
-         # We need to pass it down.
-         pass
-
-    # We'll pass seg_cfg into _segment_monophonic, so let's update it if needed
-    if "stage_c_pitch_ref_window_frames" in profile_special:
         seg_cfg["pitch_ref_window_frames"] = int(profile_special["stage_c_pitch_ref_window_frames"])
 
     stem_timelines: Dict[str, List[FramePitch]] = analysis_data.stem_timelines or {}
-
     if not stem_timelines:
+        analysis_data.notes_before_quantization = []
         analysis_data.notes = []
         return []
-    stem_name, primary_timeline = _select_best_stem_timeline(stem_timelines, config)
-    # Removed strict length check here to allow robust fallback handling loop below
 
-    # Thresholds (read from config if available)
+    stem_name, primary_timeline = _select_best_stem_timeline(stem_timelines, config)
+
     base_conf = float(resolve_val("confidence_threshold", _get(config, "stage_c.special.high_conf_threshold", 0.15)))
     hyst_conf = resolve_val("confidence_hysteresis", {}) or {}
     start_conf = float(hyst_conf.get("start", base_conf))
@@ -873,11 +799,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     min_note_dur_ms_poly = resolve_val("min_note_duration_ms_poly", None)
     gap_tolerance_s = float(resolve_val("gap_tolerance_s", 0.05))
 
-    # Calculate min_rms
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
     min_rms = 10 ** (min_db / 20.0)
 
-    # Use noise floor from Stage A if available
     nf = 0.0
     try:
         nf = float(getattr(getattr(analysis_data, "meta", None), "noise_floor_rms", 0.0) or 0.0)
@@ -885,28 +809,25 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         nf = 0.0
 
     if nf > 0.0:
-        # require ~+6 dB above estimated noise floor (Patch 5B)
         margin = float(_get(config, "stage_c.velocity_map.noise_floor_db_margin", 6.0))
         min_rms = max(min_rms, nf * (10 ** (margin / 20.0)))
 
-    # Build list of timelines to process.
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]
     audio_type = getattr(analysis_data.meta, "audio_type", None)
-    allow_secondary = audio_type in (getattr(AudioType, "POLYPHONIC", None), getattr(AudioType, "POLYPHONIC_DOMINANT", None))
+    allow_secondary = audio_type in (
+        getattr(AudioType, "POLYPHONIC", None),
+        getattr(AudioType, "POLYPHONIC_DOMINANT", None),
+    )
 
     if allow_secondary and len(stem_timelines) > 1:
-        # Add others in deterministic order
         other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
         for other_name in other_keys:
-             timelines_to_process.append((other_name, stem_timelines[other_name]))
+            timelines_to_process.append((other_name, stem_timelines[other_name]))
 
     notes: List[NoteEvent] = []
 
-    # seg_cfg is already built above
-    seg_method = str(seg_cfg.get("method", "threshold")).lower()
-
-    # P1: Auto-enable smoothing for HMM
-    smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", False))
+    seg_method = str(seg_cfg.get("method") or _get(config, "stage_c.segmentation_method", "threshold")).lower()
+    smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", _get(config, "stage_c.use_state_smoothing", False)))
     if seg_method == "hmm":
         smoothing_enabled = True
 
@@ -916,138 +837,96 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     energy_weight = float(seg_cfg.get("energy_weight", 0.35))
     conf_weight = max(0.0, min(1.0, 1.0 - energy_weight))
 
-    # Polyphony config
     poly_filter_mode = _get(config, "stage_c.polyphony_filter.mode", "skyline_top_voice")
     max_alt_voices = int(_get(config, "stage_b.voice_tracking.max_alt_voices", 4))
     max_tracks = 1 + max_alt_voices
     poly_pitch_tolerance = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
 
-    for vidx, (vname, timeline) in enumerate(timelines_to_process):
+    poly_used = False
+
+    for vidx, (_vname, timeline) in enumerate(timelines_to_process):
         if not timeline or len(timeline) < 2:
             continue
 
-        # Patch: Skyline Top Voice Selection
-        # If active, derive frame pitch from the highest confident active pitch
         if poly_filter_mode == "skyline_top_voice":
-            new_tl = []
-            # Use a modest floor to keep weak melody candidates in play
+            new_tl: List[FramePitch] = []
             skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
             for fp in timeline:
                 ap = getattr(fp, "active_pitches", []) or []
-                # Filter by confidence floor
                 cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
                 if cand:
-                    # Fix L5 failure mode: Pick by confidence + continuity + vocal band preference
-                    # Previous choice: highest pitch (caused overtones/flute capture)
-
-                    # 1. Sort by confidence descending
                     cand.sort(key=lambda x: x[1], reverse=True)
-
-                    # 2. Prefer vocal band (80-1400Hz) if confidence is close
-                    # We take the top few candidates within 10% confidence of the winner
                     top_conf = cand[0][1]
                     contestants = [x for x in cand if x[1] >= top_conf * 0.9]
-
                     best_cand = contestants[0]
-
-                    # If we have a previous selected pitch (from previous frame in new_tl), use it for continuity
                     prev_pitch = new_tl[-1].pitch_hz if new_tl else 0.0
 
                     if len(contestants) > 1:
-                        # Tie-breaker logic
                         scored_candidates = []
                         for p, c in contestants:
                             score = c
-                            # Bonus for vocal band - Expanded to 1400Hz (approx F6) for female vocals/flutes
                             if 80.0 <= p <= 1400.0:
                                 score += 0.05
-
-                            # Bonus for continuity
                             if prev_pitch > 0.0:
                                 cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
-                                if cents_diff < 100: # Within semitone
+                                if cents_diff < 100:
                                     score += 0.1
-                                elif cents_diff < 1200: # Within octave
+                                elif cents_diff < 1200:
                                     score += 0.05
                                 else:
-                                    score -= 0.05 # Large jumps penalized
-
+                                    score -= 0.05
                             scored_candidates.append(((p, c), score))
-
                         best_cand = max(scored_candidates, key=lambda x: x[1])[0]
 
                     p_best, c_best = best_cand
-
-                    # Recompute MIDI
                     midi_new = int(round(69 + 12 * math.log2(p_best / 440.0)))
-                    # Create updated frame (assuming immutable-ish usage, creating new is safer)
                     fp2 = FramePitch(
                         time=fp.time,
                         pitch_hz=p_best,
                         midi=midi_new,
                         confidence=c_best,
                         rms=fp.rms,
-                        active_pitches=fp.active_pitches
+                        active_pitches=getattr(fp, "active_pitches", None),
                     )
                     new_tl.append(fp2)
                 else:
-                    # Fallback to original Stage B choice
                     new_tl.append(fp)
-            # Replace the timeline for processing
             timeline = new_tl
 
-        # Detect polyphonic context based on active pitch annotations
         poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
-
-        # Should we enable polyphonic segmentation?
-        # Gate: config != "skyline_top_voice" (implied "process_all") or just presence of poly_frames?
-        # WI implies we should use active_pitches if present, unless explicitly disabled?
-        # WI says: "Detect polyphony... OR config signal"
         enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
-
-        # Decompose into tracks if polyphony active
-        voice_timelines = []
         if enable_polyphony:
-             voice_timelines = _decompose_polyphonic_timeline(
-                 timeline,
-                 pitch_tolerance_cents=poly_pitch_tolerance,
-                 max_tracks=max_tracks
-             )
+            poly_used = True
 
-             # Feature: Decomposed Melody Mode (L5.2)
-             # If mode is "decomposed_melody", pick only the best track as the "melody"
-             # This avoids outputting accompaniment tracks for monophonic benchmarks
-             if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
-                # Score tracks by total confidence mass in vocal range
+        if enable_polyphony:
+            voice_timelines = _decompose_polyphonic_timeline(
+                timeline,
+                pitch_tolerance_cents=poly_pitch_tolerance,
+                max_tracks=max_tracks,
+            )
+
+            if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
                 best_idx = 0
                 best_score = -1.0
-
                 for i, tl in enumerate(voice_timelines):
                     score = 0.0
                     for fp in tl:
                         if fp.pitch_hz > 0:
                             s = fp.confidence
-                            # Boost vocal range (80-1400Hz)
                             if 80.0 <= fp.pitch_hz <= 1400.0:
-                                 s *= 1.2
+                                s *= 1.2
                             score += s
-
                     if score > best_score:
                         best_score = score
                         best_idx = i
-
-                # Keep only the best track
                 voice_timelines = [voice_timelines[best_idx]]
-
         else:
-             voice_timelines = [timeline]
+            voice_timelines = [timeline]
 
-        # Determine thresholds
         voice_conf_gate = conf_thr
         voice_min_dur_s = min_note_dur_s
         has_distinct_poly = _has_distinct_poly_layers(timeline)
 
-        # Tune thresholds for context
         if poly_frames or enable_polyphony:
             voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
             try:
@@ -1063,165 +942,143 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
         hop_s = _estimate_hop_seconds(timeline)
 
-        # Process each decomposed voice track
         for sub_idx, sub_tl in enumerate(voice_timelines):
-             # Skip empty tracks
-             if not any(fp.pitch_hz > 0 for fp in sub_tl):
-                 continue
+            if not any(fp.pitch_hz > 0 for fp in sub_tl):
+                continue
 
-             use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+            use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+            if poly_filter_mode == "skyline_top_voice":
+                use_viterbi = False
 
-             # WI Patch: If using Skyline Top Voice, we must rely on pitch changes for segmentation,
-             # so we disable Viterbi (which only tracks voicing state) to use the pitch-sensitive segmenter.
-             if poly_filter_mode == "skyline_top_voice":
-                 use_viterbi = False
+            if use_viterbi:
+                mask = _viterbi_voicing_mask(
+                    sub_tl,
+                    conf_weight=conf_weight,
+                    energy_weight=energy_weight,
+                    transition_penalty=transition_penalty,
+                    stay_bonus=stay_bonus,
+                    silence_bias=silence_bias,
+                )
+                segs = _segments_from_mask(
+                    timeline=sub_tl,
+                    mask=mask,
+                    hop_s=hop_s,
+                    min_note_dur_s=voice_min_dur_s,
+                    min_conf=voice_conf_gate,
+                    min_rms=min_rms,
+                )
+            else:
+                seg_cfg_local = dict(seg_cfg)
+                if enable_polyphony and sub_idx > 0:
+                    seg_cfg_local["use_repeated_note_splitter"] = False
 
-             segs = []
+                segs = _segment_monophonic(
+                    timeline=sub_tl,
+                    conf_thr=voice_conf_gate,
+                    min_note_dur_s=voice_min_dur_s,
+                    gap_tolerance_s=gap_tolerance_s,
+                    min_rms=min_rms,
+                    conf_start=max(start_conf, voice_conf_gate),
+                    conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+                    seg_cfg=seg_cfg_local,
+                    hop_s=hop_s,
+                )
 
-             if use_viterbi:
-                 mask = _viterbi_voicing_mask(
-                     sub_tl,
-                     conf_weight=conf_weight,
-                     energy_weight=energy_weight,
-                     transition_penalty=transition_penalty,
-                     stay_bonus=stay_bonus,
-                     silence_bias=silence_bias,
-                 )
-                 segs = _segments_from_mask(
-                     timeline=sub_tl,
-                     mask=mask,
-                     hop_s=hop_s,
-                     min_note_dur_s=voice_min_dur_s,
-                     min_conf=voice_conf_gate,
-                     min_rms=min_rms,
-                 )
-             else:
-                 seg_cfg_local = dict(seg_cfg)
-                 # For poly decomposition: only allow repeated-note splitter for the strongest track (sub_idx==0)
-                 # to prevent false splits in accompaniment
-                 if enable_polyphony and sub_idx > 0:
-                     seg_cfg_local["use_repeated_note_splitter"] = False
+            for (s, e) in segs:
+                mids = [
+                    sub_tl[i].midi
+                    for i in range(s, e + 1)
+                    if sub_tl[i].midi is not None and sub_tl[i].midi > 0
+                ]
+                hzs = [sub_tl[i].pitch_hz for i in range(s, e + 1) if sub_tl[i].pitch_hz > 0]
+                confs = [sub_tl[i].confidence for i in range(s, e + 1)]
+                rmss = [sub_tl[i].rms for i in range(s, e + 1)]
 
-                 segs = _segment_monophonic(
-                     timeline=sub_tl,
-                     conf_thr=voice_conf_gate,
-                     min_note_dur_s=voice_min_dur_s,
-                     gap_tolerance_s=gap_tolerance_s,
-                     min_rms=min_rms,
-                     conf_start=max(start_conf, voice_conf_gate),
-                     conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
-                     seg_cfg=seg_cfg_local,
-                     hop_s=hop_s,
-                 )
+                if not mids:
+                    continue
+                if rmss and float(np.mean(rmss)) < min_rms:
+                    continue
 
-             for (s, e) in segs:
-                 # Extract data from sub_tl
-                 mids = [sub_tl[i].midi for i in range(s, e + 1) if sub_tl[i].midi is not None and sub_tl[i].midi > 0]
-                 hzs = [sub_tl[i].pitch_hz for i in range(s, e + 1) if sub_tl[i].pitch_hz > 0]
-                 confs = [sub_tl[i].confidence for i in range(s, e + 1)]
-                 rmss = [sub_tl[i].rms for i in range(s, e + 1)]
+                midi_note = int(round(float(np.median(mids))))
+                pitch_hz = float(np.median(hzs)) if hzs else 0.0
+                confidence = float(np.mean(confs)) if confs else 0.0
 
-                 if not mids:
-                     continue
+                midi_vel = _velocity_from_rms(rmss)
+                velocity_norm = float(midi_vel) / 127.0
+                rms_val = float(np.mean(rmss)) if rmss else 0.0
+                dynamic_label = _velocity_to_dynamic(midi_vel)
 
-                 if rmss and np.mean(rmss) < min_rms:
-                     continue
+                start_sec = float(sub_tl[s].time)
+                end_sec = float(sub_tl[e].time + hop_s)
+                if end_sec <= start_sec:
+                    end_sec = start_sec + hop_s
 
-                 midi_note = int(round(float(np.median(mids))))
-                 pitch_hz = float(np.median(hzs)) if hzs else 0.0
-                 confidence = float(np.mean(confs)) if confs else 0.0
+                voice_id = (vidx * 16) + (sub_idx + 1)
 
-                 midi_vel = _velocity_from_rms(rmss)
-                 velocity_norm = float(midi_vel) / 127.0
-                 rms_val = float(np.mean(rmss)) if rmss else 0.0
-                 dynamic_label = _velocity_to_dynamic(midi_vel)
+                notes.append(
+                    NoteEvent(
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        midi_note=midi_note,
+                        pitch_hz=pitch_hz,
+                        confidence=confidence,
+                        velocity=velocity_norm,
+                        rms_value=rms_val,
+                        dynamic=dynamic_label,
+                        voice=voice_id,
+                    )
+                )
 
-                 start_sec = float(sub_tl[s].time)
-                 end_sec = float(sub_tl[e].time + hop_s)
-                 if end_sec <= start_sec:
-                     end_sec = start_sec + hop_s
-
-                 # Stable Voice ID
-                 # vidx = stem index
-                 # sub_idx = local voice index (0..4)
-                 voice_id = (vidx * 16) + (sub_idx + 1)
-
-                 notes.append(
-                     NoteEvent(
-                         start_sec=start_sec,
-                         end_sec=end_sec,
-                         midi_note=midi_note,
-                         pitch_hz=pitch_hz,
-                         confidence=confidence,
-                         velocity=velocity_norm,
-                         rms_value=rms_val,
-                         dynamic=dynamic_label,
-                         voice=voice_id,
-                     )
-                 )
-
-    # Patch C8: Optional Bass Backtracking with Strict Clamp
-    bass_backtrack_ms = float(profile_special.get("stage_c_backtrack_ms", 0.0) or profile_special.get("bass_backtrack_ms", 0.0))
+    # Bass backtracking (optional)
+    bass_backtrack_ms = float(
+        profile_special.get("stage_c_backtrack_ms", 0.0) or profile_special.get("bass_backtrack_ms", 0.0)
+    )
     if bass_backtrack_ms > 0.0 and notes:
         backtrack_sec = bass_backtrack_ms / 1000.0
-        min_dur_s = min_note_dur_s # Use the resolved min dur
+        min_dur_s = float(min_note_dur_s)
 
-        # Sort to ensure safe lookback order
         notes.sort(key=lambda n: n.start_sec)
 
-        # We need to do this per-voice to respect monophonic lines correctly.
-        # Group by voice first.
-        by_voice = {}
+        by_voice: Dict[Any, List[NoteEvent]] = {}
         for n in notes:
-            v = n.voice
-            if v not in by_voice: by_voice[v] = []
-            by_voice[v].append(n)
+            by_voice.setdefault(n.voice, []).append(n)
 
-        for v in by_voice:
-            v_notes = by_voice[v]
-            # Assumed sorted by start_sec
-
+        for _v, v_notes in by_voice.items():
             for i, n in enumerate(v_notes):
-                prev_end = v_notes[i-1].end_sec if i > 0 else 0.0
+                prev_end = v_notes[i - 1].end_sec if i > 0 else 0.0
 
-                # Desired new start
                 new_start = max(0.0, float(n.start_sec) - backtrack_sec)
+                new_start = max(new_start, float(prev_end))
 
-                # Strict clamp: No overlap with previous note in same voice
-                new_start = max(new_start, prev_end)
+                latest_ok_start = float(n.end_sec) - min_dur_s
+                new_start = min(new_start, latest_ok_start)
 
-                # Safety clamp: Ensure min duration remains
-                # If backtracking eats into end, we must stop before end - min_dur
-                max_start_limit = max(new_start, float(n.end_sec) - min_dur_s)
-                # Ideally we don't move start later than it was, only earlier.
-                # But here we are checking if new_start is valid w.r.t end.
-                if new_start < max_start_limit:
+                if new_start < float(n.start_sec):
                     n.start_sec = float(new_start)
 
-    if enable_polyphony:
+    if poly_used:
         notes = _dedupe_overlapping_notes(notes)
         snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
         if snap_ms > 0:
             notes = _snap_chord_starts(notes, tol_ms=snap_ms)
 
-    # Populate diagnostics
+    raw_notes = _sanitize_notes(notes)
+    analysis_data.notes_before_quantization = list(raw_notes)
+
     if hasattr(analysis_data, "diagnostics"):
-         analysis_data.diagnostics["stage_c"] = {
-             "segmentation_method": seg_method,
-             "timelines_processed": len(timelines_to_process),
-             "note_count_raw": len(notes),
-             "selected_stem": stem_name  # Task 2.4: Log selected stem
-         }
+        analysis_data.diagnostics["stage_c"] = {
+            "segmentation_method": seg_method,
+            "timelines_processed": len(timelines_to_process),
+            "note_count_raw": len(raw_notes),
+            "selected_stem": stem_name,
+            "quantize_enabled": quantize_enabled,
+        }
 
-    quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
+    if not quantize_enabled:
+        analysis_data.notes = list(raw_notes)
+        return list(raw_notes)
 
-    # Gap tolerance post-processing (C1 - Glitch tolerance)
-    # Merge notes that are same pitch and extremely close in time, even after quantization if needed,
-    # or before quantization. Merging before is better.
-    # Currently _segment_monophonic handles gap_tolerance in frames.
-    # But if notes are split due to other reasons and land close, we might want to merge.
-    # However, existing logic is mostly sufficient.
-
+    quantized_notes = quantize_notes(raw_notes, analysis_data=analysis_data)
     analysis_data.notes = quantized_notes
     return quantized_notes
 
@@ -1234,23 +1091,19 @@ def _sec_to_beat_index(t: float, beat_times: list[float]) -> float:
     bt = np.asarray(beat_times, dtype=np.float64)
     idx = np.arange(n, dtype=np.float64)
 
-    # interior mapping
     if bt[0] <= t <= bt[-1]:
         return float(np.interp(t, bt, idx))
 
-    # edge intervals (robust)
     dt0 = float(bt[1] - bt[0])
     dt1 = float(bt[-1] - bt[-2])
 
-    # guard against bad beat arrays
     if dt0 <= 1e-6 or dt1 <= 1e-6:
-        # fallback: clamp rather than explode
         return 0.0 if t < bt[0] else float(n - 1)
 
     if t < bt[0]:
-        return float((t - bt[0]) / dt0)  # beat 0 + negative offset
+        return float((t - bt[0]) / dt0)
     else:
-        return float((n - 1) + (t - bt[-1]) / dt1)  # extend beyond last beat
+        return float((n - 1) + (t - bt[-1]) / dt1)
 
 
 def _beat_index_to_sec(b: float, beat_times: list[float]) -> float:
@@ -1284,32 +1137,13 @@ def quantize_notes(
 ) -> List[NoteEvent]:
     """
     Quantize note start/end times to a rhythmic grid.
-
-    Parameters
-    ----------
-    notes : List[NoteEvent]
-    tempo_bpm : float
-        Tempo used to convert beats to seconds when no analysis_data is provided.
-    analysis_data : AnalysisData, optional
-        Preferred source for tempo and time signature; if provided, meta fields
-        take precedence over the tempo_bpm argument.
-    grid : str
-        Grid like "1/16", "1/8", "1/4". Interpreted as fraction of a whole note.
-        In 4/4: one beat = quarter note, so step_beats = 4/denom.
-    min_steps : int
-        Minimum duration in grid steps.
-
-    Returns
-    -------
-    List[NoteEvent]
-        New list with quantized timing.
     """
     if not notes:
         return []
 
     analysis: Optional[AnalysisData] = analysis_data
 
-    beat_times = []
+    beat_times: List[float] = []
     if analysis is not None:
         beat_times = list(getattr(analysis, "beats", []) or [])
         if not beat_times:
@@ -1339,7 +1173,6 @@ def quantize_notes(
     effective_bpm = bpm if bpm and np.isfinite(bpm) else 100.0
     sec_per_beat = 60.0 / effective_bpm
 
-    # Parse grid
     denom = 16
     if not use_soft_snap:
         try:
@@ -1351,7 +1184,6 @@ def quantize_notes(
         except Exception:
             denom = 16
         denom = max(1, denom)
-        # Adaptive grid: slower tempi -> coarser grid
         if effective_bpm < 75:
             denom = min(denom, 8)
         elif effective_bpm > 140:
@@ -1359,7 +1191,7 @@ def quantize_notes(
     else:
         denom = 8
 
-    step_beats = 4.0 / float(max(1, denom))  # in 4/4, quarter note = 1 beat
+    step_beats = 4.0 / float(max(1, denom))
     step_sec = sec_per_beat * step_beats
     step_sec = max(1e-4, step_sec)
 
@@ -1380,9 +1212,12 @@ def quantize_notes(
 
     out: List[NoteEvent] = []
     for n in notes:
-        # Quantize Logic
+        # ensure pitch_hz valid WITHOUT mutating input notes
+        phz = getattr(n, "pitch_hz", None)
+        if phz is None or float(phz) <= 0.0:
+            phz = _midi_to_hz(int(getattr(n, "midi_note", 0) or 0))
+
         if use_beat_times:
-            # Beat-space quantization
             bs = _sec_to_beat_index(float(n.start_sec), beat_times)
             be = _sec_to_beat_index(float(n.end_sec), beat_times)
 
@@ -1392,26 +1227,18 @@ def quantize_notes(
             if qbe <= qbs:
                 qbe = qbs + max(int(min_steps), 1) * step_beats
 
-            # Convert back to seconds
             qs = _beat_index_to_sec(qbs, beat_times)
             qe = _beat_index_to_sec(qbe, beat_times)
 
-            # Clamp negative times from backward extrapolation
             qs = max(0.0, qs)
             qe = max(0.0, qe)
-
-            # Re-enforce duration in seconds after clamping
             if qe <= qs:
-                # Fallback step sec estimation if needed, but we can try to respect grid
-                # Just bump qe
                 qe = qs + 0.05
 
-            # For NoteEvent metrics
             beat_idx = qbs
             duration_beats = qbe - qbs
 
         else:
-            # Constant BPM fallback
             s = float(n.start_sec)
             e = float(n.end_sec)
             qs = round(s / step_sec) * step_sec
@@ -1428,30 +1255,25 @@ def quantize_notes(
         measure = int(beat_idx // beats_per_measure) + 1
         beat_in_measure = (beat_idx % beats_per_measure) + 1
 
-        # Clamp to audio duration if known
         if analysis is not None:
-             dur = getattr(analysis.meta, "duration_sec", 0.0)
-             if dur > 0.0 and qe > dur:
-                 qe = dur
-                 # Recalculate duration_beats if possible, but complex in beat space
-                 # if we clamp qe, duration_beats might be wrong relative to grid
-                 # but strict clamp is safer for validation.
-                 pass
+            dur = getattr(analysis.meta, "duration_sec", 0.0)
+            if dur > 0.0 and qe > dur:
+                qe = dur
 
         out.append(
             NoteEvent(
                 start_sec=float(qs),
                 end_sec=float(qe),
                 midi_note=int(n.midi_note),
-                pitch_hz=float(n.pitch_hz),
-                confidence=float(n.confidence),
-                velocity=float(n.velocity),
-                dynamic=n.dynamic,
+                pitch_hz=float(phz),
+                confidence=float(getattr(n, "confidence", 0.0) or 0.0),
+                velocity=float(getattr(n, "velocity", 0.0) or 0.0),
+                dynamic=getattr(n, "dynamic", None),
                 measure=measure,
                 beat=float(beat_in_measure),
                 duration_beats=float(duration_beats),
-                voice=n.voice,
-                staff=n.staff,
+                voice=getattr(n, "voice", 1),
+                staff=getattr(n, "staff", "treble"),
             )
         )
 
