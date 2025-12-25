@@ -295,7 +295,7 @@ def _segment_monophonic(
     min_rms: float = 0.01,
     conf_start: float | None = None,
     conf_end: float | None = None,
-    seg_cfg: Dict[str, Any] | None = None,
+    seg_cfg: Dict[str, Any] = None,
     hop_s: float = 0.01,
 ) -> List[Tuple[int, int]]:
     """
@@ -306,6 +306,9 @@ def _segment_monophonic(
 
     if len(timeline) < 2:
         return []
+
+    if seg_cfg is None:
+        seg_cfg = {}
 
     # C1: Frame stability onset (>= 3 frames) + release hysteresis (2-3 frames)
     min_on = int(seg_cfg.get("min_onset_frames", 3))

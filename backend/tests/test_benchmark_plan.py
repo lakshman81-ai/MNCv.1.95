@@ -58,7 +58,7 @@ def test_regression_and_profiling_expectations(plan):
 
 def test_ladder_and_artifact_expectations(plan):
     ladder = plan["ladder"]
-    assert ladder["levels"] == ["L0", "L1", "L2", "L3", "L4"]
+    assert ladder["levels"] == ["L0", "L1", "L2", "L3", "L4", "L5.1", "L5.2"]
     assert set(ladder["metrics"]) == {"note_f1", "onset_mae_ms", "offset_mae_ms"}
     assert {"metrics_json", "summary_csv"}.issubset(set(ladder["artifacts"]))
 
