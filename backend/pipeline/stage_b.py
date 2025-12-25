@@ -132,48 +132,6 @@ def _cqt_frame_floor(ctx: Optional[dict], frame_idx: int) -> float:
     col = mag[:, t]
     return float(np.median(col)) + 1e-9
 
-def _cqt_top_peaks(
-    ctx: Optional[dict],
-    frame_idx: int,
-    max_peaks: int = 10,
-    min_ratio: float = 2.0,
-) -> List[Tuple[float, float]]:
-    """Return (hz, conf) peaks from the CQT magnitude at a frame.
-
-    conf is a squashed peak-to-median ratio in [0,1], similar to CQTDetector.
-    This is used to populate FramePitch.active_pitches for chord-aware stages.
-    """
-    if ctx is None:
-        return []
-    mag = ctx.get("mag", None)
-    freqs = ctx.get("freqs", None)
-    if mag is None or freqs is None:
-        return []
-    if getattr(mag, "ndim", 0) != 2 or getattr(freqs, "ndim", 0) != 1 or mag.shape[1] == 0:
-        return []
-    t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
-    col = mag[:, t]
-    if col.size == 0:
-        return []
-    floor = float(np.median(col)) + 1e-9
-    ordered = np.argsort(col)[::-1]
-    out: List[Tuple[float, float]] = []
-    for j in ordered:
-        mval = float(col[j])
-        if mval <= 0.0:
-            continue
-        if mval < floor * float(min_ratio):
-            break
-        hz = float(freqs[j])
-        conf = float(np.clip((mval / floor - 1.0) / 4.0, 0.0, 1.0))
-        if conf <= 0.0 or hz <= 0.0:
-            continue
-        out.append((hz, conf))
-        if len(out) >= int(max(1, max_peaks)):
-            break
-    return out
-
-
 def _postprocess_candidates(
     candidates: List[Tuple[float, float]],
     frame_idx: int,
@@ -1759,8 +1717,7 @@ def extract_features(
         # Only do this for true poly (won't affect L0/L1).
         cqt_ctx = None
         cqt_gate_enabled = bool(b_conf.polyphonic_peeling.get("cqt_gate_enabled", True))
-        use_cqt_peaks = bool(b_conf.polyphonic_peeling.get("use_cqt_peaks", False))
-        if is_true_poly and polyphonic_context and (cqt_gate_enabled or use_cqt_peaks):
+        if is_true_poly and polyphonic_context and cqt_gate_enabled:
             fmin_gate = float(melody_filter_eff.get("fmin_hz", 60.0) or 60.0)
             fmax_gate = float(melody_filter_eff.get("fmax_hz", 2200.0) or 2200.0)
             cqt_ctx = _maybe_compute_cqt_ctx(audio, sr, hop_length, fmin=fmin_gate, fmax=fmax_gate,
@@ -1804,32 +1761,14 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
-            
-            # Optional: add direct CQT peaks as additional candidates (multi-pitch).
-            # This is critical for dense chords: ISS layers + monophonic f0 often miss chord tones.
-            if is_true_poly and polyphonic_context and bool(b_conf.polyphonic_peeling.get("use_cqt_peaks", False)) and cqt_ctx is not None:
-                cqt_peaks = _cqt_top_peaks(
-                    cqt_ctx,
-                    i,
-                    max_peaks=int(b_conf.polyphonic_peeling.get("cqt_max_peaks", 10)),
-                    min_ratio=float(b_conf.polyphonic_peeling.get("cqt_peak_min_ratio", 2.0)),
-                )
-                if cqt_peaks:
-                    candidates.extend(cqt_peaks)
-
             # ---- cleanup: CQT soft gate + dedupe + octave-harmonic suppression + cap ----
-            # IMPORTANT: active_pitches can be larger than tracker capacity; tracker only keeps a stable primary track.
-            max_active = int(
-                b_conf.polyphonic_peeling.get(
-                    "max_active_pitches_per_frame",
-                    b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks),
-                )
-            )
+            # Cap tied to tracker capacity (prevents active_pitches explosion)
+            max_cands = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks))
             candidates = _postprocess_candidates(
                 candidates=candidates,
                 frame_idx=i,
                 cqt_ctx=cqt_ctx,
-                max_candidates=max_active,
+                max_candidates=max_cands,
                 dup_cents=float(b_conf.polyphonic_peeling.get("dup_cents", 35.0)),
                 octave_cents=float(b_conf.polyphonic_peeling.get("octave_cents", 35.0)),
                 cqt_gate_mul=float(b_conf.polyphonic_peeling.get("cqt_gate_mul", 0.25)),
@@ -1837,12 +1776,10 @@ def extract_features(
                 harmonic_drop_ratio=float(b_conf.polyphonic_peeling.get("harmonic_drop_ratio", 0.75)),
             )
 
-            # Preserve candidates for Stage C chord/poly segmentation.
+            # Preserve raw detector/layer candidates for skyline selection in Stage C
             active_candidates = list(candidates)
 
-            # Tracker only sees up to its capacity (keeps primary pitch stable).
-            track_candidates = candidates[: tracker.max_tracks]
-            tracked_pitches, tracked_confs = tracker.step(track_candidates)
+            tracked_pitches, tracked_confs = tracker.step(candidates)
             for voice_idx in range(tracker.max_tracks):
                 track_buffers[voice_idx][i] = tracked_pitches[voice_idx]
                 track_conf_buffers[voice_idx][i] = tracked_confs[voice_idx]
