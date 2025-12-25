@@ -153,6 +153,53 @@ def _autocorr_pitch_per_frame(
     return f0, conf
 
 
+def compute_rms(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    """
+    Compute RMS per frame using optimized cumulative sum.
+    Avoids creating the large (n_frames, frame_length) array.
+    """
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    # Replicate padding logic from _frame_audio
+    if len(y) < frame_length:
+        pad = frame_length - len(y)
+        y = np.pad(y, (0, pad), mode="constant")
+
+    # Calculate number of frames exactly as _frame_audio does
+    # n_frames = 1 + (len(y) - frame_length) // hop_length
+    n_frames = 1 + (len(y) - frame_length) // hop_length
+    if n_frames <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    # Square the signal
+    sq = y ** 2
+
+    # Prefix sum (integral image concept)
+    # cumsum[i] = sum(sq[:i])
+    # sum(sq[start:start+W]) = cumsum[start+W] - cumsum[start]
+    # We want indices:
+    # starts: 0, H, 2H ...
+    # ends: W, H+W, 2H+W ...
+
+    # Prepend 0 for easier indexing
+    integ = np.concatenate(([0.0], np.cumsum(sq)))
+
+    starts = np.arange(n_frames) * hop_length
+    ends = starts + frame_length
+
+    # Safety check for indices
+    # max end is (n_frames-1)*H + W.
+    # integ has size len(y)+1.
+    # We must ensure ends indices are valid in integ.
+    # Logic matches _frame_audio truncation.
+    # But just in case len(y) != integ size-1? No, it is.
+
+    window_sums = integ[ends] - integ[starts]
+    means = window_sums / frame_length
+
+    # Sqrt and ensure non-negative
+    return np.sqrt(np.maximum(means, 0.0))
+
+
 def _autocorr_pitch_per_frame_safe(
     frames: np.ndarray,
     sr: int,

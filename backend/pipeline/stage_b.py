@@ -25,7 +25,7 @@ from .detectors import (
     SwiftF0Detector, SACFDetector, YinDetector,
     CQTDetector, RMVPEDetector, CREPEDetector,
     iterative_spectral_subtraction, create_harmonic_mask,
-    _frame_audio,
+    _frame_audio, compute_rms,
     BasePitchDetector
 )
 
@@ -1619,8 +1619,8 @@ def extract_features(
 
         # Calculate RMS (re-calculated here for final alignment, though ideally shared)
         n_fft = stage_a_out.meta.window_size if stage_a_out.meta.window_size else 2048
-        frames = _frame_audio(audio, n_fft, hop_length)
-        rms_vals = np.sqrt(np.mean(frames**2, axis=1))
+        # Optimization: Use compute_rms to avoid creating large frame matrix
+        rms_vals = compute_rms(audio, n_fft, hop_length)
 
         # Pad/Trim RMS to match dominant F0 (which is now canonical length)
         if len(rms_vals) < len(merged_f0):
