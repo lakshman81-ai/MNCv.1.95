@@ -1326,8 +1326,9 @@ class BenchmarkSuite:
         config.stage_b.apply_instrument_profile = False
         config.stage_c.apply_instrument_profile = False
         config.stage_b.confidence_voicing_threshold = 0.3
-        config.stage_c.confidence_threshold = 0.15
+        config.stage_c.confidence_threshold = 0.05
         config.stage_c.min_note_duration_ms_poly = 50.0
+        config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
 
         # Fix fmin for deep bass notes (MIDI 36 ~ 65Hz, safe margin 30Hz)
         for d in ["crepe", "swiftf0", "yin"]:
@@ -1336,8 +1337,8 @@ class BenchmarkSuite:
         config.stage_b.melody_filtering["fmin_hz"] = 30.0
 
         # Optimize for Sine waves (synth)
-        config.stage_b.polyphonic_peeling["max_layers"] = 4
-        config.stage_b.polyphonic_peeling["max_harmonics"] = 1
+        config.stage_b.polyphonic_peeling["max_layers"] = 8
+        config.stage_b.polyphonic_peeling["max_harmonics"] = 20
         config.stage_b.polyphonic_peeling["residual_flatness_stop"] = 1.0
         config.stage_b.polyphonic_peeling["harmonic_snr_stop_db"] = -100.0
         config.stage_b.polyphonic_peeling["mask_width"] = 0.03
@@ -1358,8 +1359,18 @@ class BenchmarkSuite:
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
+        # Force "classic" mode to prevent global_profile auto-router from overriding our custom L5 settings
+        # (specifically separation and polyphony_filter)
+        setattr(config, "transcription_mode", "classic")
+
         # 4. Run Pipeline
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+        res = run_pipeline_on_audio(
+            audio.astype(np.float32),
+            int(read_sr),
+            config,
+            AudioType.POLYPHONIC,
+            allow_separation=True
+        )
 
         m = self._save_run("L5.1", "kal_ho_na_ho", res, gt, apply_regression_gate=False)
 
@@ -1432,8 +1443,17 @@ class BenchmarkSuite:
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
+        # Force "classic" mode to prevent global_profile auto-router from overriding our custom L5 settings
+        setattr(config, "transcription_mode", "classic")
+
         # 4. Run Pipeline
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
+        res = run_pipeline_on_audio(
+            audio.astype(np.float32),
+            int(read_sr),
+            config,
+            AudioType.POLYPHONIC,
+            allow_separation=True
+        )
 
         m = self._save_run("L5.2", "tumhare_hi_rahenge", res, gt, apply_regression_gate=False)
 
