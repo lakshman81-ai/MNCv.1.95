@@ -1904,6 +1904,7 @@ def extract_features(
 
     # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
+        "transcription_mode": transcription_mode,  # Task 2.4: Explicit mode
         "stage_b_mode": "classic",
         "instrument": str(instrument),
         "profile": profile.instrument if profile else None,

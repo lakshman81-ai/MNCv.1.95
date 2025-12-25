@@ -37,12 +37,17 @@ def snap_onset(frame_idx: int, onset_strength: List[float], radius: int = 2) -> 
     """Refine frame_idx to local maximum of onset_strength within radius."""
     if not onset_strength:
         return frame_idx
+    n = len(onset_strength)
+    if frame_idx < 0 or frame_idx >= n:
+        return frame_idx
+
     lo = max(0, frame_idx - radius)
-    hi = min(len(onset_strength) - 1, frame_idx + radius)
-    # Find index of max value in range [lo, hi]
-    # Note: onset_strength is list[float]
+    hi = min(n - 1, frame_idx + radius)
+
+    # Bias towards the original frame_idx if flat or ties
     best_i = frame_idx
-    best_val = -1.0
+    best_val = onset_strength[frame_idx]
+
     for i in range(lo, hi + 1):
         if onset_strength[i] > best_val:
             best_val = onset_strength[i]
@@ -290,13 +295,15 @@ def _segment_monophonic(
     min_rms: float = 0.01,
     conf_start: float | None = None,
     conf_end: float | None = None,
-    seg_cfg: Dict[str, Any] = {},
+    seg_cfg: Dict[str, Any] | None = None,
     hop_s: float = 0.01,
 ) -> List[Tuple[int, int]]:
     """
     Segment monophonic FramePitch into (start_idx, end_idx) segments.
     Updated for C1 (hysteresis), C2 (gap merge/vibrato), and robustness/glitch tolerance.
     """
+    seg_cfg = seg_cfg or {}
+
     if len(timeline) < 2:
         return []
 
@@ -417,7 +424,10 @@ def _segment_monophonic(
                     else:
                         refined_start = i
 
-                    # Ensure refined start is causally valid (>= current_end + 1?)
+                    # Safe clamp (Task 2.3):
+                    # 1. refined_start <= i (must be within or before new note start frame)
+                    # 2. refined_start >= current_end + 1 (must be after previous note end)
+                    refined_start = min(refined_start, i)
                     refined_start = max(refined_start, current_end + 1)
 
                     current_start = refined_start
@@ -443,6 +453,12 @@ def _segment_monophonic(
                         refined_start = snap_onset(start_idx, onset_strength) if onset_strength else start_idx
                     else:
                         refined_start = start_idx
+
+                    # Safe clamp (Task 2.3):
+                    # 1. refined_start <= i (must be within or before new note start frame)
+                    # 2. refined_start >= current_end + 1 (must be after previous note end)
+                    refined_start = min(refined_start, i)
+                    refined_start = max(refined_start, current_end + 1)
 
                     current_start = refined_start
 
@@ -1190,7 +1206,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
          analysis_data.diagnostics["stage_c"] = {
              "segmentation_method": seg_method,
              "timelines_processed": len(timelines_to_process),
-             "note_count_raw": len(notes)
+             "note_count_raw": len(notes),
+             "selected_stem": stem_name  # Task 2.4: Log selected stem
          }
 
     quantized_notes = quantize_notes(notes, analysis_data=analysis_data)

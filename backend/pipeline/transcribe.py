@@ -679,6 +679,10 @@ def transcribe(
                         if fb_bpm and fb_bpm > 0:
                             meta.tempo_bpm = fb_bpm
 
+                        # Record fallback
+                        if hasattr(stage_a_out, "diagnostics"):
+                            stage_a_out.diagnostics.setdefault("fallbacks", []).append("bpm_detection")
+
                         pipeline_logger.log_event("stage_a", "bpm_fallback_success", {
                             "bpm": fb_bpm,
                             "n_beats": len(fb_beats)
@@ -767,6 +771,9 @@ def transcribe(
                 event="onsets_frames_fallback",
                 payload={"reason": of_diag.get("reason", "zero_notes"), "note_count": note_count},
             )
+            # Record fallback
+            if hasattr(stage_a_out, "diagnostics"):
+                stage_a_out.diagnostics.setdefault("fallbacks", []).append("onsets_frames")
             # fall through to classical B/C path
         else:
             of_notes = of_notes_candidate
@@ -1080,6 +1087,10 @@ def transcribe(
             # Consolidate previous contract statuses into AnalysisData
             if stage_a_out and hasattr(stage_a_out, "diagnostics"):
                 analysis_data.diagnostics.setdefault("contracts", {})["stage_a"] = stage_a_out.diagnostics.get("contracts")
+                # Consolidate fallbacks
+                if "fallbacks" in stage_a_out.diagnostics:
+                    analysis_data.diagnostics.setdefault("fallbacks", []).extend(stage_a_out.diagnostics["fallbacks"])
+
             if stage_b_out and hasattr(stage_b_out, "diagnostics"):
                 analysis_data.diagnostics.setdefault("contracts", {})["stage_b"] = stage_b_out.diagnostics.get("contracts")
 
