@@ -38,9 +38,10 @@ def test_stage_a_monophonic_flow(mock_get_model, mock_apply_model, mock_detect, 
 
     assert isinstance(result, StageAOutput)
     assert result.audio_type == AudioType.MONOPHONIC
-    assert "vocals" in result.stems
-    # Should be resampled to 16000
-    assert result.stems["vocals"].sr == 16000
+
+    # Stage A no longer performs separation, so "vocals" should NOT be present unless provided in input
+    assert "mix" in result.stems
+    assert "vocals" not in result.stems
 
     # verify Demucs was NOT called
     mock_apply_model.assert_not_called()
@@ -79,16 +80,13 @@ def test_stage_a_polyphonic_flow(mock_torch, mock_get_model, mock_apply_model, m
             result = load_and_preprocess(path, target_sr=22050)
 
             assert result.audio_type == AudioType.POLYPHONIC
-            assert "vocals" in result.stems
-            assert "bass" in result.stems
-            assert "other" in result.stems
 
-            # Check Sampling Rates
-            assert result.stems["vocals"].sr == 16000
-            assert result.stems["other"].sr == 44100
+            # Stage A refactor: Separation moved to Stage B. Stage A outputs 'mix' only.
+            assert "mix" in result.stems
+            assert "vocals" not in result.stems
 
-            # Demucs SHOULD be called
-            mock_apply_model.assert_called_once()
+            # Demucs should NOT be called in Stage A anymore
+            mock_apply_model.assert_not_called()
 
     finally:
         if os.path.exists(path):
