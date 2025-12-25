@@ -37,6 +37,7 @@ from backend.pipeline.stage_a import load_and_preprocess
 from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory, quantize_notes
 from backend.pipeline.stage_d import quantize_and_render
+from backend.pipeline.global_profiles import apply_global_profile
 from backend.benchmarks.metrics import (
     note_f1, onset_offset_mae, dtw_note_f1, dtw_onset_error_ms, compute_symptom_metrics
 )
@@ -273,7 +274,10 @@ def run_pipeline_on_audio(
     # the caller explicitly opts in (e.g., to test melody isolation on L2).
     if config.stage_b.separation.get("enabled", False) and not allow_separation:
         config.stage_b.separation["enabled"] = False
-    # NOTE: Do NOT force-enable harmonic masking here. Harmonic masking is a config choice.
+    elif allow_separation:
+        harmonic_mask = config.stage_b.separation.setdefault("harmonic_masking", {})
+        harmonic_mask["enabled"] = True
+        harmonic_mask.setdefault("mask_width", 0.03)
 
     if audio_type == AudioType.POLYPHONIC_DOMINANT:
         # Favor higher-register melody tracking by widening detector ranges and
@@ -323,6 +327,13 @@ def run_pipeline_on_audio(
          pass
 
     stage_a_out = StageAOutput(stems=stems, meta=meta, audio_type=audio_type)
+
+    # Apply global profile / auto-router (tunes Stage B/C knobs)
+    try:
+        apply_global_profile(audio_path=audio_path or "synthetic", stage_a_out=stage_a_out, config=config, pipeline_logger=pipeline_logger)
+    except Exception as e:
+        pipeline_logger.log_event("pipeline", "global_profile_failed", {"error": str(e)})
+
     t_stage_a = time.perf_counter() - t_start
     pipeline_logger.record_timing(
         "stage_a",
@@ -1231,8 +1242,8 @@ class BenchmarkSuite:
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
-        # Synthetic (MIDI->wav) L5 benchmark: prefer SyntheticMDXSeparator; fall back to HTDemucs if available
-        config.stage_b.separation['synthetic_model'] = True
+        # Real song -> Use real separation (HTDemucs), not synthetic
+        config.stage_b.separation['synthetic_model'] = False
         config.stage_b.separation['overlap'] = 0.75
         config.stage_b.separation['shifts'] = 2
         # Enable harmonic masking as fallback if separation fails or for reinforcement
@@ -1275,7 +1286,7 @@ class BenchmarkSuite:
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
         # 4. Run Pipeline
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC, allow_separation=True)
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
 
         m = self._save_run("L5.1", "kal_ho_na_ho", res, gt, apply_regression_gate=False)
 
@@ -1333,7 +1344,7 @@ class BenchmarkSuite:
 
         config.stage_b.separation['enabled'] = True
         config.stage_b.separation['model'] = 'htdemucs'
-        config.stage_b.separation['synthetic_model'] = True  # Synthetic (MIDI->wav) benchmark
+        config.stage_b.separation['synthetic_model'] = False # Real song
         config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
 
         # Enable polyphonic decomposition (non-skyline) for dense chorus
@@ -1349,7 +1360,7 @@ class BenchmarkSuite:
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
         # 4. Run Pipeline
-        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC, allow_separation=True)
+        res = run_pipeline_on_audio(audio.astype(np.float32), int(read_sr), config, AudioType.POLYPHONIC)
 
         m = self._save_run("L5.2", "tumhare_hi_rahenge", res, gt, apply_regression_gate=False)
 
