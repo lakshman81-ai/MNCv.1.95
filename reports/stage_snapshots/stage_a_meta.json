@@ -1,0 +1,7 @@
+{
+  "sample_rate": 44100,
+  "duration_sec": 27.649160997732427,
+  "hop_length": 256,
+  "window_size": 4096,
+  "noise_floor_db": -23.44984070270978
+}
