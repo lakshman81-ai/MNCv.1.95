@@ -152,7 +152,7 @@ def _has_distinct_poly_layers(timeline: List[FramePitch], cents_tolerance: float
         for other in pitches[1:]:
             if ref <= 0 or other <= 0:
                 continue
-            cents = abs(1200.0 * np.log2(other / ref))
+            cents = abs(1200.0 * math.log2(other / ref))
             if cents > cents_tolerance:
                 return True
 
@@ -280,163 +280,6 @@ def _decompose_polyphonic_timeline(
 
     return tracks
 
-
-
-def _segment_pianoroll_chords(
-    timeline: List[FramePitch],
-    *,
-    hop_s: float,
-    conf_start: float,
-    conf_end: float,
-    min_note_dur_s: float,
-    gap_tolerance_s: float,
-    min_rms: float,
-    voice_id: int = 1,
-) -> List[NoteEvent]:
-    """Chord-aware segmentation from FramePitch.active_pitches.
-
-    This treats active_pitches as a (sparse) piano-roll: for each frame we keep
-    the strongest confidence per MIDI note, then run per-note hysteresis + gap
-    tolerance to create NoteEvents. All notes share the same voice_id so Stage D
-    can render them as chords when onsets align.
-
-    Designed for L5-style dense polyphony where monophonic tracking + peeling
-    tends to fragment.
-    """
-    if not timeline:
-        return []
-
-    hop = float(hop_s) if hop_s and hop_s > 1e-9 else _estimate_hop_seconds(timeline)
-    hop = max(hop, 1e-6)
-
-    min_frames = max(1, int(math.ceil(float(min_note_dur_s) / hop)))
-    gap_frames = max(0, int(round(float(gap_tolerance_s) / hop)))
-
-    # Per-midi state
-    states: Dict[int, Dict[str, Any]] = {}
-
-    out: List[NoteEvent] = []
-
-    def _close(midi_note: int, st: Dict[str, Any]) -> None:
-        s = int(st["start"])
-        e = int(st["last"])
-        if e < s:
-            return
-        dur_frames = e - s + 1
-        if dur_frames < min_frames:
-            return
-
-        # Energy gate
-        rms_mean = float(st["rms_sum"]) / max(1, int(st["rms_n"]))
-        if rms_mean < float(min_rms):
-            return
-
-        start_sec = float(timeline[s].time)
-        end_sec = float(timeline[e].time + hop)
-        if end_sec <= start_sec:
-            end_sec = start_sec + hop
-
-        conf_mean = float(st["conf_sum"]) / max(1, int(st["conf_n"]))
-        pitch_hz = 440.0 * (2.0 ** ((float(midi_note) - 69.0) / 12.0))
-
-        midi_vel = _velocity_from_rms([rms_mean])
-        velocity_norm = float(midi_vel) / 127.0
-        dyn = _velocity_to_dynamic(midi_vel)
-
-        out.append(
-            NoteEvent(
-                start_sec=start_sec,
-                end_sec=end_sec,
-                midi_note=int(midi_note),
-                pitch_hz=float(pitch_hz),
-                confidence=float(conf_mean),
-                velocity=float(velocity_norm),
-                rms_value=float(rms_mean),
-                dynamic=dyn,
-                voice=int(voice_id),
-            )
-        )
-
-    for i, fp in enumerate(timeline):
-        ap = getattr(fp, "active_pitches", []) or []
-        frame_best: Dict[int, float] = {}
-
-        # Map active_pitches -> best conf per midi note for this frame
-        for p_hz, c in ap:
-            try:
-                p = float(p_hz)
-                conf = float(c)
-            except Exception:
-                continue
-            if p <= 0.0 or conf <= 0.0:
-                continue
-            # Convert to MIDI
-            midi = int(round(69.0 + 12.0 * math.log2(p / 440.0)))
-            prev = frame_best.get(midi, 0.0)
-            if conf > prev:
-                frame_best[midi] = conf
-
-        present: set[int] = set()
-
-        # Update / start notes that are present this frame
-        for midi, conf in frame_best.items():
-            st = states.get(midi)
-            if st is None:
-                if conf >= conf_start:
-                    states[midi] = {
-                        "active": True,
-                        "start": i,
-                        "last": i,
-                        "conf_sum": conf,
-                        "conf_n": 1,
-                        "rms_sum": float(fp.rms),
-                        "rms_n": 1,
-                    }
-                    present.add(midi)
-                continue
-
-            if st.get("active", True):
-                # Continue if above end threshold
-                if conf >= conf_end:
-                    st["last"] = i
-                    st["conf_sum"] += conf
-                    st["conf_n"] += 1
-                    st["rms_sum"] += float(fp.rms)
-                    st["rms_n"] += 1
-                    present.add(midi)
-            else:
-                # Restart if above start threshold
-                if conf >= conf_start:
-                    st.update(
-                        active=True,
-                        start=i,
-                        last=i,
-                        conf_sum=conf,
-                        conf_n=1,
-                        rms_sum=float(fp.rms),
-                        rms_n=1,
-                    )
-                    present.add(midi)
-
-        # Handle notes that are not present
-        for midi, st in list(states.items()):
-            if not st.get("active", True):
-                continue
-            if midi in present:
-                continue
-            # If within gap tolerance, keep active
-            if (i - int(st["last"])) <= gap_frames:
-                continue
-            # Close note and mark inactive
-            _close(midi, st)
-            st["active"] = False
-
-    # Close any remaining active notes
-    for midi, st in list(states.items()):
-        if st.get("active", True):
-            _close(midi, st)
-
-    return out
 
 def _segment_monophonic(
     timeline: List[FramePitch],
@@ -838,6 +681,70 @@ def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[Not
     return out
 
 
+
+def _timeline_score(timeline: list) -> tuple[float, float]:
+    """Return (voiced_ratio, mean_confidence) for a FramePitch timeline."""
+    if not timeline:
+        return 0.0, 0.0
+    voiced = 0
+    conf_sum = 0.0
+    conf_n = 0
+    for fp in timeline:
+        try:
+            hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
+            if hz > 0.0:
+                voiced += 1
+                c = getattr(fp, "confidence", None)
+                if c is not None:
+                    conf_sum += float(c)
+                    conf_n += 1
+        except Exception:
+            continue
+    total = max(1, len(timeline))
+    voiced_ratio = voiced / total
+    mean_conf = (conf_sum / conf_n) if conf_n else 0.0
+    return voiced_ratio, mean_conf
+
+
+def _select_best_stem_timeline(stem_timelines: dict, config: Any) -> tuple[str, list]:
+    """Pick the best stem timeline based on voiced_ratio/conf within a prefer order."""
+    if not stem_timelines:
+        return "timeline", []
+
+    prefer_order = _get(config, "stem_selection.prefer_order", None)
+    if not prefer_order:
+        # Default favors vocals when present (songs), but falls back safely.
+        prefer_order = ["vocals", "other", "melody_masked", "mix"]
+
+    mix_margin = float(_get(config, "stem_selection.mix_margin", 0.02) or 0.0)
+
+    scores = {}
+    for stem in prefer_order:
+        tl = stem_timelines.get(stem)
+        if tl is None:
+            continue
+        vr, mc = _timeline_score(tl)
+        # Simple scalar score: prioritize being voiced, then confidence.
+        score = vr * (0.5 + mc)
+        scores[stem] = (score, vr, mc)
+
+    if not scores:
+        # fallback: first available
+        stem, tl = next(iter(stem_timelines.items()))
+        return stem, tl
+
+    best_stem = max(scores.items(), key=lambda kv: kv[1][0])[0]
+    best_score = scores[best_stem][0]
+
+    # Optional safety: prefer mix if it's close to best (avoid separation artifacts)
+    if "mix" in scores and best_stem != "mix":
+        mix_score = scores["mix"][0]
+        if mix_score >= best_score - mix_margin:
+            best_stem = "mix"
+
+    return best_stem, stem_timelines[best_stem]
+
+
 def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEvent]:
     """
     Convert FramePitch timelines into NoteEvent list.
@@ -928,16 +835,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     if not stem_timelines:
         analysis_data.notes = []
         return []
-
-    if "mix" in stem_timelines:
-        stem_name = "mix"
-    elif "vocals" in stem_timelines:
-        stem_name = "vocals"
-    else:
-        # Deterministic fallback for primary stem
-        stem_name = sorted(stem_timelines.keys())[0]
-
-    primary_timeline = stem_timelines.get(stem_name, [])
+    stem_name, primary_timeline = _select_best_stem_timeline(stem_timelines, config)
     # Removed strict length check here to allow robust fallback handling loop below
 
     # Thresholds (read from config if available)
@@ -1005,8 +903,6 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     max_tracks = 1 + max_alt_voices
     poly_pitch_tolerance = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
 
-    used_poly = False
-
     for vidx, (vname, timeline) in enumerate(timelines_to_process):
         if not timeline or len(timeline) < 2:
             continue
@@ -1049,7 +945,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
                             # Bonus for continuity
                             if prev_pitch > 0.0:
-                                cents_diff = abs(1200.0 * np.log2(p / prev_pitch))
+                                cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
                                 if cents_diff < 100: # Within semitone
                                     score += 0.1
                                 elif cents_diff < 1200: # Within octave
@@ -1064,7 +960,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     p_best, c_best = best_cand
 
                     # Recompute MIDI
-                    midi_new = int(round(69 + 12 * np.log2(p_best / 440.0)))
+                    midi_new = int(round(69 + 12 * math.log2(p_best / 440.0)))
                     # Create updated frame (assuming immutable-ish usage, creating new is safer)
                     fp2 = FramePitch(
                         time=fp.time,
@@ -1081,37 +977,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             # Replace the timeline for processing
             timeline = new_tl
 
-        
-        # Chord-aware piano-roll mode: segment directly from active_pitches (multi-pitch).
-        # This avoids factorial assignment and reduces fragmentation on dense polyphony.
-        if poly_filter_mode == "pianoroll_chords":
-            # Only run once on the primary timeline to avoid duplicate notes across stems.
-            if vidx != 0:
-                continue
-
-            hop_s_local = _estimate_hop_seconds(timeline)
-            chord_min_dur_s = min_note_dur_s
-            try:
-                if min_note_dur_ms_poly is not None:
-                    chord_min_dur_s = max(chord_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
-            except Exception:
-                pass
-
-            chord_notes = _segment_pianoroll_chords(
-                timeline,
-                hop_s=hop_s_local,
-                conf_start=max(start_conf, poly_conf),
-                conf_end=max(end_conf, poly_conf * 0.8),
-                min_note_dur_s=chord_min_dur_s,
-                gap_tolerance_s=gap_tolerance_s,
-                min_rms=min_rms,
-                voice_id=1,
-            )
-            notes.extend(chord_notes)
-            used_poly = True
-            continue
-
-# Detect polyphonic context based on active pitch annotations
+        # Detect polyphonic context based on active pitch annotations
         poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
 
         # Should we enable polyphonic segmentation?
@@ -1119,12 +985,10 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         # WI implies we should use active_pitches if present, unless explicitly disabled?
         # WI says: "Detect polyphony... OR config signal"
         enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
-        if used_poly:
-            used_poly = True
 
         # Decompose into tracks if polyphony active
         voice_timelines = []
-        if used_poly:
+        if enable_polyphony:
              voice_timelines = _decompose_polyphonic_timeline(
                  timeline,
                  pitch_tolerance_cents=poly_pitch_tolerance,
@@ -1315,7 +1179,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 if new_start < max_start_limit:
                     n.start_sec = float(new_start)
 
-    if used_poly:
+    if enable_polyphony:
         notes = _dedupe_overlapping_notes(notes)
         snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
         if snap_ms > 0:
