@@ -25,7 +25,7 @@ import time
 import csv
 import math
 from typing import Optional
-
+from .global_profiles import apply_global_profile
 from .config import PIANO_61KEY_CONFIG, PipelineConfig
 from .stage_a import load_and_preprocess, detect_tempo_and_beats
 from .stage_b import extract_features
@@ -619,7 +619,10 @@ def transcribe(
         audio_path,
         config=config,
     )
-
+    # --------------------------------------------------------
+    # Global 3-mode auto tuning (auto|song|piano)
+    # --------------------------------------------------------
+    apply_global_profile(audio_path=audio_path, stage_a_out=stage_a_out, config=config, pipeline_logger=pipeline_logger)
     # --------------------------------------------------------
     # BPM Fallback (Gated Safety Net)
     # --------------------------------------------------------
