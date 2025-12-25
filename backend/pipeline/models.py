@@ -1,6 +1,7 @@
+# backend/pipeline/models.py
 """Dataclasses and enums used by the pipeline (namespaced version).
 
-This file duplicates the definitions from the top‑level ``models.py``
+This file duplicates the definitions from the top-level ``models.py``
 module so that tests importing ``backend.pipeline.models`` will find
 all expected classes and enumerations.  The ``ProcessingMode`` enum
 has been added to mirror the usage in Stage A.
@@ -9,7 +10,7 @@ has been added to mirror the usage in Stage A.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any, Literal, Tuple
+from typing import List, Optional, Dict, Any, Tuple
 from enum import Enum
 import numpy as np
 
@@ -132,9 +133,7 @@ class FramePitch:
     midi: Optional[int]                     # None if unvoiced
     confidence: float                       # 0–1
     rms: float = 0.0                        # Frame RMS energy (linear)
-    active_pitches: List[Tuple[float, float]] = field(
-        default_factory=list
-    )  # List of (pitch_hz, confidence)
+    active_pitches: List[Tuple[float, float]] = field(default_factory=list)  # (pitch_hz, confidence)
 
 
 @dataclass
@@ -212,7 +211,10 @@ class AnalysisData:
     pitch_tracker: str = "pyin"           # "pyin" | "crepe" | "swiftf0" etc.
     n_frames: int = 0
     frame_hop_seconds: float = 0.0
+
+    # ✅ Critical: raw (pre-quantization) notes for scoring/diagnostics
     notes_before_quantization: List[NoteEvent] = field(default_factory=list)
+
     benchmark: Optional[BenchmarkResult] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     precalculated_notes: Optional[List[NoteEvent]] = None
@@ -269,9 +271,7 @@ class AnalysisData:
             "pitch_tracker": self.pitch_tracker,
             "n_frames": self.n_frames,
             "frame_hop_seconds": self.frame_hop_seconds,
-            "notes_before_quantization": [
-                asdict(e) for e in self.notes_before_quantization
-            ],
+            "notes_before_quantization": [asdict(e) for e in self.notes_before_quantization],
             "benchmark": asdict(self.benchmark) if self.benchmark else None,
             "diagnostics": self.diagnostics,
         }
@@ -285,7 +285,6 @@ class TranscriptionResult:
 
     def __getitem__(self, key):
         """Allow dict-like access for compatibility."""
-        # Direct attributes on this object
         try:
             return getattr(self, key)
         except AttributeError:
