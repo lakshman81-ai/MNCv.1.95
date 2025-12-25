@@ -1,0 +1,33 @@
+{
+  "stage_a": {
+    "duration_in_sec": 57.2,
+    "duration_out_sec": 27.649160997732427,
+    "trim_reduction_sec": 29.550839002267576,
+    "trim_offset_sec": 14.775419501133788,
+    "sr_out": 44100.0,
+    "loudness_or_rms": -29.7372629421585,
+    "loudness_or_rms_post": -23.00000004538575,
+    "loudness_measurement": "lufs",
+    "loudness_target_lufs": -23.0,
+    "normalization_gain_db": 6.737262942158502,
+    "noise_floor_db": -23.44984070270978
+  },
+  "stage_b": {
+    "voiced_ratio": 0.9886649874055415,
+    "mean_confidence": 0.970517981077922,
+    "octave_jump_rate": 0.0031847133757961785,
+    "f0_zero_ratio": 0.01133501259445846,
+    "timeline_frames": 4764
+  },
+  "stage_c": {
+    "note_count": 0,
+    "note_count_per_10s": 0.0,
+    "median_note_len_ms": 0.0,
+    "fragmentation_score": 0.0
+  },
+  "stage_d": {
+    "quantization_mean_shift_ms": 0.0,
+    "quantization_p95_shift_ms": 0.0,
+    "rendered_notes": 0
+  }
+}

@@ -1,0 +1,46 @@
+[
+  {
+    "level": "L0",
+    "name": "sine_440",
+    "delta_note_f1": 0.0,
+    "delta_onset_mae_ms": 0.0,
+    "previous": {
+      "level": "L0",
+      "name": "sine_440",
+      "note_f1": 0.0,
+      "onset_mae_ms": 125.0,
+      "dtw_note_f1": 0.0,
+      "dtw_onset_error_ms": 125.0,
+      "predicted_count": 1,
+      "gt_count": 1,
+      "vocal_band_ratio": 1.0,
+      "pitch_jump_rate_cents_sec": 0.0,
+      "voicing_ratio": 1.305,
+      "note_density": 0.5,
+      "fragmentation_score": 0.0,
+      "note_count_per_10s": 8.0,
+      "median_note_len_ms": 1250.0,
+      "octave_jump_rate": 0.0,
+      "note_count": 1.0
+    },
+    "current": {
+      "level": "L0",
+      "name": "sine_440",
+      "note_f1": 0.0,
+      "onset_mae_ms": 125.0,
+      "dtw_note_f1": 0.0,
+      "dtw_onset_error_ms": 125.0,
+      "predicted_count": 1,
+      "gt_count": 1,
+      "vocal_band_ratio": 1.0,
+      "pitch_jump_rate_cents_sec": 0.0,
+      "voicing_ratio": 1.305,
+      "note_density": 0.5,
+      "fragmentation_score": 0.0,
+      "note_count_per_10s": 8.0,
+      "median_note_len_ms": 1250.0,
+      "octave_jump_rate": 0.0,
+      "note_count": 1.0
+    }
+  }
+]
