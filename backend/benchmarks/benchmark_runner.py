@@ -33,7 +33,7 @@ from backend.pipeline.instrumentation import PipelineLogger
 from backend.pipeline.models import (
     StageAOutput, MetaData, Stem, AnalysisData, AudioType, NoteEvent
 )
-from backend.pipeline.stage_a import load_and_preprocess
+from backend.pipeline.stage_a import load_and_preprocess, detect_tempo_and_beats
 from backend.pipeline.stage_b import extract_features
 from backend.pipeline.stage_c import apply_theory, quantize_notes
 from backend.pipeline.stage_d import quantize_and_render
@@ -46,6 +46,7 @@ from backend.benchmarks.run_real_songs import run_song as run_real_song
 from backend.benchmarks.ladder.generators import generate_benchmark_example
 from backend.benchmarks.ladder.synth import midi_to_wav_synth
 import music21
+import math # Task 2.2: Ensure math is imported
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -334,6 +335,59 @@ def run_pipeline_on_audio(
     except Exception as e:
         pipeline_logger.log_event("pipeline", "global_profile_failed", {"error": str(e)})
 
+    # --------------------------------------------------------
+    # BPM Fallback Logic (Task 2.4 Parity)
+    # --------------------------------------------------------
+    bpm_cfg = getattr(config.stage_a, "bpm_detection", {}) or {}
+    bpm_enabled = bool(bpm_cfg.get("enabled", True))
+    meta = stage_a_out.meta
+
+    needs_fallback = (
+        bpm_enabled
+        and (len(meta.beats) == 0)
+        and (meta.tempo_bpm is None or meta.tempo_bpm <= 0 or (meta.tempo_bpm == 120.0 and len(meta.beats) == 0))
+        and (meta.duration_sec >= 6.0)
+    )
+
+    if needs_fallback:
+        try:
+            import importlib.util
+            if importlib.util.find_spec("librosa"):
+                pipeline_logger.log_event("stage_a", "bpm_fallback_triggered", {"reason": "missing_beats"})
+                mix_stem = stage_a_out.stems.get("mix")
+                if mix_stem:
+                    fb_bpm, fb_beats = detect_tempo_and_beats(
+                        mix_stem.audio,
+                        sr=mix_stem.sr,
+                        enabled=True,
+                        tightness=float(bpm_cfg.get("tightness", 100.0)),
+                        trim=bool(bpm_cfg.get("trim", True)),
+                        hop_length=meta.hop_length,
+                        pipeline_logger=pipeline_logger,
+                    )
+                    if fb_beats:
+                        fb_beats = sorted([float(b) for b in fb_beats])
+                        dedup = []
+                        last = None
+                        for t in fb_beats:
+                            if last is None or t > last + 1e-6:
+                                dedup.append(t)
+                                last = t
+                        fb_beats = dedup
+                        meta.beats = fb_beats
+                        meta.beat_times = fb_beats
+                        if fb_bpm and fb_bpm > 0:
+                            meta.tempo_bpm = fb_bpm
+
+                        if hasattr(stage_a_out, "diagnostics"):
+                            stage_a_out.diagnostics.setdefault("fallbacks", []).append("bpm_detection")
+
+                        pipeline_logger.log_event("stage_a", "bpm_fallback_success", {"bpm": fb_bpm, "n_beats": len(fb_beats)})
+                    else:
+                        pipeline_logger.log_event("stage_a", "bpm_fallback_no_result")
+        except Exception as e:
+            pipeline_logger.log_event("stage_a", "bpm_fallback_failed", {"error": str(e)})
+
     t_stage_a = time.perf_counter() - t_start
     pipeline_logger.record_timing(
         "stage_a",
@@ -370,6 +424,13 @@ def run_pipeline_on_audio(
     )
     t_c_start = time.perf_counter()
     analysis = AnalysisData(meta=meta, stem_timelines=stage_b_out.stem_timelines)
+
+    # Consolidate fallbacks from Stage A into AnalysisData
+    if hasattr(stage_a_out, "diagnostics") and "fallbacks" in stage_a_out.diagnostics:
+        if not hasattr(analysis, "diagnostics"):
+            analysis.diagnostics = {}
+        analysis.diagnostics.setdefault("fallbacks", []).extend(stage_a_out.diagnostics["fallbacks"])
+
     notes_pred = apply_theory(analysis, config=config)
     t_stage_c = time.perf_counter() - t_c_start
     pipeline_logger.record_timing("stage_c", t_stage_c, metadata={"note_count": len(notes_pred)})
@@ -425,6 +486,7 @@ def run_pipeline_on_audio(
         "stage_b_out": stage_b_out,
         "transcription": transcription_result,
         "resolved_config": config, # Stage B might warn but doesn't mutate much, we log what we passed
+        "analysis_data": analysis, # Task 2.4: Return analysis data to expose fallbacks
         "profiling": {
             "stage_timings": stage_timings,
             "detector_confidences": detector_conf_traces,
@@ -681,7 +743,7 @@ class BenchmarkSuite:
                     vocal_frames += 1
 
                 if last_p > 0:
-                    cents = abs(1200.0 * np.log2(fp.pitch_hz / last_p))
+                    cents = abs(1200.0 * math.log2(fp.pitch_hz / last_p))
                     jump_cents_sum += cents
                     jump_count += 1
                 last_p = fp.pitch_hz
@@ -743,10 +805,19 @@ class BenchmarkSuite:
         detectors_ran = list(res['stage_b_out'].per_detector.get('mix', {}).keys())
         diagnostics = getattr(res.get("stage_b_out"), "diagnostics", {}) if res.get("stage_b_out") else {}
         resolved_config = res.get("resolved_config")
+
+        # New logging fields (Task 2.4)
+        analysis_diag = getattr(res.get("analysis_data"), "diagnostics", {}) if res.get("analysis_data") else {}
+        stage_c_diag = analysis_diag.get("stage_c", {})
+
         run_info = {
             "detectors_ran": detectors_ran,
             "diagnostics": diagnostics,
             "config": asdict(resolved_config) if resolved_config else {},
+            "transcription_mode": diagnostics.get("transcription_mode", "unknown"),
+            "separation_mode": diagnostics.get("separation", {}).get("mode", "unknown"),
+            "selected_stem": stage_c_diag.get("selected_stem", "unknown"),
+            "fallbacks": analysis_diag.get("fallbacks", []),
         }
         profiling = res.get("profiling", {})
         run_info["stage_timings"] = profiling.get("stage_timings", {})
@@ -888,6 +959,8 @@ class BenchmarkSuite:
 
         # Disable trimming for L0 since we manually added silence padding and need exact timing relative to it
         config.stage_a.silence_trimming["enabled"] = False
+        # Also disable BPM detection trimming to prevent beat grid shift in fallback
+        config.stage_a.bpm_detection["trim"] = False
 
         res = run_pipeline_on_audio(audio, sr, config, AudioType.MONOPHONIC)
 
