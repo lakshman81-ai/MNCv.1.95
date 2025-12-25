@@ -362,6 +362,9 @@
       "use_repeated_note_splitter": true,
       "polyphony_filter": {
         "mode": "skyline_top_voice"
+      },
+      "quantize": {
+        "enabled": false
       }
     },
     "stage_d": {
@@ -399,11 +402,11 @@
     "instrument_profiles": []
   },
   "stage_timings": {
-    "stage_a_s": 2.003921822999928,
-    "stage_b_s": 22.259748700000046,
-    "stage_c_s": 0.009390950000124576,
-    "stage_d_s": 0.08768287199995939,
-    "total_s": 24.360744345000057
+    "stage_a_s": 3.7805611580001823,
+    "stage_b_s": 21.72087015599982,
+    "stage_c_s": 0.009590934999778256,
+    "stage_d_s": 0.09762497999963671,
+    "total_s": 25.608647228999416
   },
   "detector_confidences": {
     "mix": {

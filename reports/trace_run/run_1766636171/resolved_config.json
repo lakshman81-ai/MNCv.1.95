@@ -226,6 +226,9 @@
     "use_repeated_note_splitter": true,
     "polyphony_filter": {
       "mode": "skyline_top_voice"
+    },
+    "quantize": {
+      "enabled": true
     }
   },
   "stage_d": {

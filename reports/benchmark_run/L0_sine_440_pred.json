@@ -1,19 +1,19 @@
 [
   {
-    "start_sec": 0.375,
-    "end_sec": 1.625,
+    "start_sec": 0.42376417233560093,
+    "end_sec": 1.6021768707482993,
     "midi_note": 69,
     "pitch_hz": 439.6651611328125,
     "confidence": 0.9855820193079304,
     "velocity": 0.5826771653543307,
-    "rms_value": 0.0,
+    "rms_value": 0.30092797008127414,
     "is_grace": false,
     "dynamic": "mf",
     "voice": 1,
     "staff": "treble",
-    "measure": 1,
-    "beat": 1.75,
-    "duration_beats": 2.5,
+    "measure": null,
+    "beat": null,
+    "duration_beats": null,
     "alternatives": [],
     "spec_thumb": null
   }

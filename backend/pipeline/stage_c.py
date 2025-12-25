@@ -624,6 +624,11 @@ def _sanitize_notes(notes: List[NoteEvent]) -> List[NoteEvent]:
             continue
         if n.end_sec <= n.start_sec:
             continue
+
+        # Patch: Recover missing pitch_hz from midi_note if available (E2E fix)
+        if (n.pitch_hz is None or n.pitch_hz <= 0) and (n.midi_note is not None and n.midi_note > 0):
+            n.pitch_hz = 440.0 * (2.0 ** ((n.midi_note - 69.0) / 12.0))
+
         if n.pitch_hz is None or n.pitch_hz <= 0:
             continue
         clean.append(n)
@@ -1193,7 +1198,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
              "note_count_raw": len(notes)
          }
 
-    quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
+    # Patch: Check quantization flag
+    quant_enabled = bool(_get(config, "stage_c.quantize.enabled", True))
+
+    if quant_enabled:
+        quantized_notes = quantize_notes(notes, analysis_data=analysis_data)
+    else:
+        quantized_notes = notes
 
     # Gap tolerance post-processing (C1 - Glitch tolerance)
     # Merge notes that are same pitch and extremely close in time, even after quantization if needed,

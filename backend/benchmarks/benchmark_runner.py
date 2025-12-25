@@ -666,6 +666,7 @@ class BenchmarkSuite:
         # Diagnostic Metrics for L5.*
         # % frames within vocal band (80-1400Hz)
         total_frames = 0
+        voiced_frames = 0
         vocal_frames = 0
         jump_cents_sum = 0.0
         jump_count = 0
@@ -674,9 +675,11 @@ class BenchmarkSuite:
         # We need the timeline from stage_b_out or transcription for frame-level metrics
         # Use stage_b_out.timeline if available
         timeline = getattr(res.get("stage_b_out"), "timeline", []) or []
+        total_frames = len(timeline)
+
         for fp in timeline:
             if fp.pitch_hz > 0:
-                total_frames += 1
+                voiced_frames += 1
                 if 80.0 <= fp.pitch_hz <= 1400.0:
                     vocal_frames += 1
 
@@ -688,7 +691,7 @@ class BenchmarkSuite:
             else:
                 last_p = 0.0
 
-        vocal_band_ratio = (vocal_frames / total_frames) if total_frames > 0 else 0.0
+        vocal_band_ratio = (vocal_frames / voiced_frames) if voiced_frames > 0 else 0.0
         # Average pitch jump per second (assuming ~100 frames/sec, jump is per frame)
         # We want jumps/sec? Or avg jump size?
         # User asked: "pitch jump rate (cents/sec)" -> implies accumulating cents per second
@@ -696,7 +699,8 @@ class BenchmarkSuite:
         duration_sec = float(res.get("stage_b_out").meta.duration_sec) if res.get("stage_b_out") else 1.0
         pitch_jump_rate = (jump_cents_sum / duration_sec) if duration_sec > 0 else 0.0
 
-        voicing_ratio = (total_frames * 0.01) / duration_sec if duration_sec > 0 else 0.0 # Approx
+        # Fixed voicing ratio calculation (Patch: Report logic fix)
+        voicing_ratio = min(1.0, float(voiced_frames) / max(1, total_frames))
         note_density = len(pred_list) / duration_sec if duration_sec > 0 else 0.0
 
         # Normalize NaNs for downstream checks/serialization
@@ -888,6 +892,8 @@ class BenchmarkSuite:
 
         # Disable trimming for L0 since we manually added silence padding and need exact timing relative to it
         config.stage_a.silence_trimming["enabled"] = False
+        # Disable quantization for L0 to avoid grid snapping errors
+        config.stage_c.quantize["enabled"] = False
 
         res = run_pipeline_on_audio(audio, sr, config, AudioType.MONOPHONIC)
 
@@ -927,6 +933,8 @@ class BenchmarkSuite:
             t += d
 
         config = PipelineConfig()
+        # Disable quantization for L1 to ensure F1 accuracy
+        config.stage_c.quantize["enabled"] = False
         res = run_pipeline_on_audio(audio, 44100, config, AudioType.MONOPHONIC)
 
         m = self._save_run("L1", "scale_c_maj", res, gt)

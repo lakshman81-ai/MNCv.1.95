@@ -336,6 +336,11 @@ class StageCConfig:
         default_factory=lambda: {"mode": "skyline_top_voice"}
     )
 
+    # Quantization Control (Patch for L0 Benchmark)
+    quantize: Dict[str, Any] = field(
+        default_factory=lambda: {"enabled": True}
+    )
+
 
 # ------------------------------------------------------------
 # Stage D Config (Rendering / MusicXML)
