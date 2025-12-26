@@ -337,9 +337,18 @@ def _force_l6_mode_on_cfg(cfg: Any) -> None:
 def _run_transcribe(wav_path: str, cfg: PipelineConfig, device: str, pipeline_logger: PipelineLogger):
     """
     Call transcribe() safely for this repo version.
-    (Do NOT try to pass audio_type kwargs; your pasted transcribe() doesn't accept them.)
+
+    ✅ Tiny but recommended cleanup:
+    Force intent explicitly via transcribe(..., requested_mode="classic_song")
+    so the debug runner cannot silently regress if config routing changes.
     """
-    return transcribe(wav_path, config=cfg, pipeline_logger=pipeline_logger, device=device)
+    return transcribe(
+        wav_path,
+        config=cfg,
+        pipeline_logger=pipeline_logger,
+        device=device,
+        requested_mode="classic_song",
+    )
 
 
 # -------------------------------
@@ -400,7 +409,7 @@ def main() -> int:
     # ---- Baseline config (match L6 intent) ----
     base_cfg = PipelineConfig()
 
-    # ✅ FIX 1: FORCE L6 MODE (this is the critical fix you asked for)
+    # ✅ FIX 1: FORCE L6 MODE (safety net)
     _force_l6_mode_on_cfg(base_cfg)
 
     # Avoid Demucs on synthetic benches (as in benchmark_runner L6)
