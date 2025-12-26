@@ -2,16 +2,18 @@
 """
 tools/l6_debug_runner.py
 
+FIXED + HARDENED VERSION
+
 L6 ("Synthetic Pop Song") debug runner with:
 - deterministic synth generation
 - baseline run + metrics + artifacts
 - parameter sweep for Stage C + quality gate
-- robust forcing of polyphonic intent when transcribe() supports it
-    - prefers transcribe(..., requested_mode="classic_song")
-    - falls back to older "audio_type" style args if present
-- config-path setter that can create missing dict nodes
+- **FORCED polyphonic routing for your current transcribe() implementation**
+  (sets config.stage_b.transcription_mode = "classic_song")
+- config-path setter that can create missing dict nodes + leaf attrs
 - safe handling of decision_trace when it is not a dict
-- clean error if synth backend (soundfile) is missing
+- clean error if synth backend (soundfile/libsndfile) is missing
+- prints sweep results + effective applied params (so you can prove sweeps are real)
 
 Run (repo root):
   python tools/l6_debug_runner.py --reports reports --tag l6_debug --device cpu
@@ -22,7 +24,6 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
-import inspect
 import itertools
 import json
 import logging
@@ -30,10 +31,9 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
-
 
 # -------------------------------
 # Path bootstrap
@@ -41,7 +41,6 @@ import numpy as np
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-
 
 # -------------------------------
 # Imports from repo
@@ -100,7 +99,7 @@ def _cfg_set_path(cfg: Any, path: str, value: Any) -> bool:
     Set cfg field given dotted path, supporting dataclasses/objects and dicts.
     Creates dict nodes if needed.
 
-    Fixes the original sweep bug:
+    FIXES:
     - allows setting missing LEAF attributes (setattr on last segment)
     - creates missing INTERMEDIATE nodes as dict buckets (e.g., post_merge)
     """
@@ -127,8 +126,8 @@ def _cfg_set_path(cfg: Any, path: str, value: Any) -> bool:
             except Exception:
                 return False
 
+        # intermediate attribute might not exist -> create dict bucket
         if not hasattr(cur, p):
-            # create missing intermediate bucket
             try:
                 setattr(cur, p, {})
             except Exception:
@@ -147,11 +146,10 @@ def _cfg_set_path(cfg: Any, path: str, value: Any) -> bool:
     return False
 
 
-def _safe_decision_trace(diag: Dict[str, Any]) -> Dict[str, Any]:
+def _safe_decision_trace(diag: Any) -> Dict[str, Any]:
     dt = diag.get("decision_trace", {}) if isinstance(diag, dict) else {}
     if isinstance(dt, dict):
         return dt
-    # Some builds may store a list of events
     return {"raw": dt}
 
 
@@ -170,9 +168,7 @@ def _extract_notes_tuples(analysis) -> List[Tuple[int, float, float]]:
 
 
 def _voiced_ratio_from_analysis(analysis) -> float:
-    """
-    Prefer timeline-based voiced ratio if available; else approximate by note coverage.
-    """
+    """Prefer timeline-based voiced ratio if available; else approximate by note coverage."""
     try:
         timeline = getattr(analysis, "timeline", None)
         if timeline:
@@ -215,7 +211,7 @@ def _compute_metrics(
     dtw_onset_ms = dtw_onset_error_ms(pred_list, gt)
 
     symptoms = compute_symptom_metrics(pred_list) or {}
-    metrics: Dict[str, Any] = {
+    return {
         "level": level,
         "name": name,
         "note_f1": f1,
@@ -229,7 +225,6 @@ def _compute_metrics(
         "note_count": int(len(pred_list)),
         **symptoms,
     }
-    return metrics
 
 
 def _render_accuracy_report(metrics: Dict[str, Any], run_info: Dict[str, Any]) -> str:
@@ -263,8 +258,8 @@ def _render_accuracy_report(metrics: Dict[str, Any], run_info: Dict[str, Any]) -
     diag_dt = run_info.get("decision_trace") or {}
     if not isinstance(diag_dt, dict):
         diag_dt = {"raw": diag_dt}
-
     resolved = diag_dt.get("resolved", {})
+
     lines.append("## Resolved routing (from decision_trace)\n")
     lines.append("```json")
     lines.append(json.dumps(resolved, indent=2, default=str))
@@ -319,51 +314,32 @@ def _print_file(path: str, title: str) -> None:
         print(f"(could not read {path}: {e})")
 
 
-def _call_transcribe_with_intent(
-    wav_path: str,
-    cfg: PipelineConfig,
-    device: str,
-    pipeline_logger: PipelineLogger,
-    *,
-    forced_mode: str = "classic_song",
-    forced_profile: Optional[str] = None,
-    forced_audio_type: str = "POLYPHONIC_DOMINANT",
-):
+def _force_l6_mode_on_cfg(cfg: Any) -> None:
     """
-    Force L6-like intent without hard-coding to any single transcribe() signature.
+    HARD FORCE for your current backend.pipeline.transcribe() routing:
 
-    Preferred (new) API:
-      transcribe(..., requested_mode="classic_song", requested_profile="piano_61key")
+    transcribe() calls:
+      requested_mode = getattr(config.stage_b, "transcription_mode", "auto")
 
-    Back-compat (older debug runner approach):
-      transcribe(..., audio_type="POLYPHONIC_DOMINANT") if available.
+    So for L6 we *must* set:
+      config.stage_b.transcription_mode = "classic_song"
     """
-    kwargs: Dict[str, Any] = {}
     try:
-        sig = inspect.signature(transcribe)
-        params = sig.parameters
-
-        # NEW: our recommended override path (matches your updated backend/pipeline/transcribe.py)
-        if "requested_mode" in params:
-            kwargs["requested_mode"] = forced_mode
-        if forced_profile is not None and "requested_profile" in params:
-            kwargs["requested_profile"] = forced_profile
-
-        # Older/alternative override names (if they exist in some branches)
-        if "audio_type" in params:
-            kwargs["audio_type"] = forced_audio_type
-        elif "requested_audio_type" in params:
-            kwargs["requested_audio_type"] = forced_audio_type
-        elif "forced_audio_type" in params:
-            kwargs["forced_audio_type"] = forced_audio_type
-        elif "audio_type_override" in params:
-            kwargs["audio_type_override"] = forced_audio_type
-
+        if hasattr(cfg, "stage_b"):
+            setattr(cfg.stage_b, "transcription_mode", "classic_song")
+        else:
+            cfg["stage_b"]["transcription_mode"] = "classic_song"
     except Exception:
-        # If inspect fails, just call normally.
-        kwargs = {}
+        # Don't crash debug runner; the decision_trace will show what happened.
+        pass
 
-    return transcribe(wav_path, config=cfg, pipeline_logger=pipeline_logger, device=device, **kwargs)
+
+def _run_transcribe(wav_path: str, cfg: PipelineConfig, device: str, pipeline_logger: PipelineLogger):
+    """
+    Call transcribe() safely for this repo version.
+    (Do NOT try to pass audio_type kwargs; your pasted transcribe() doesn't accept them.)
+    """
+    return transcribe(wav_path, config=cfg, pipeline_logger=pipeline_logger, device=device)
 
 
 # -------------------------------
@@ -378,20 +354,8 @@ def main() -> int:
     ap.add_argument("--max-combos", type=int, default=9, help="Max sweep combinations to run (cap)")
     ap.add_argument("--duration-sec", type=float, default=60.0, help="Synth duration")
     ap.add_argument("--tempo-bpm", type=float, default=110.0, help="Synth tempo")
-
-    # NEW: explicit forced mode (default fixes L6 mono-routing failures)
-    ap.add_argument(
-        "--forced-mode",
-        default="classic_song",
-        help='Force pipeline mode when supported (e.g. "classic_song", "classic_piano_poly", "classic_melody")',
-    )
-    ap.add_argument(
-        "--forced-profile",
-        default="piano_61key",
-        help='Force profile string when supported (e.g. "piano_61key").',
-    )
-
     args = ap.parse_args()
+
     np.random.seed(args.seed)
 
     reports_root = os.path.abspath(args.reports)
@@ -405,10 +369,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[logging.FileHandler(log_path, mode="w", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
     )
     logger = logging.getLogger("l6_debug_runner")
     logger.info("Run ID: %s", run_id)
@@ -439,12 +400,8 @@ def main() -> int:
     # ---- Baseline config (match L6 intent) ----
     base_cfg = PipelineConfig()
 
-    # Bias profile for synthetic routing (harmless even if unused)
-    try:
-        if hasattr(base_cfg.stage_b, "instrument"):
-            base_cfg.stage_b.instrument = str(args.forced_profile)
-    except Exception:
-        pass
+    # ✅ FIX 1: FORCE L6 MODE (this is the critical fix you asked for)
+    _force_l6_mode_on_cfg(base_cfg)
 
     # Avoid Demucs on synthetic benches (as in benchmark_runner L6)
     try:
@@ -460,28 +417,14 @@ def main() -> int:
     except Exception:
         pass
 
-    # Helpful: enable the common detector set if present (safe no-ops if keys missing)
-    try:
-        dets = getattr(base_cfg.stage_b, "detectors", None)
-        if isinstance(dets, dict):
-            for k in ("swiftf0", "yin", "crepe", "rmvpe"):
-                if k in dets and isinstance(dets[k], dict):
-                    dets[k]["enabled"] = True
-            base_cfg.stage_b.detectors = dets
-    except Exception:
-        pass
-
     # Ensure Stage C is set to extract top voice (Lead-only GT)
     try:
         base_cfg.stage_c.polyphony_filter = {"mode": "skyline_top_voice"}
     except Exception:
         pass
 
-    # Ensure chord snap exists and is a sane default (works even if StageCConfig lacks the field)
-    try:
-        base_cfg.stage_c.chord_onset_snap_ms = 25.0
-    except Exception:
-        pass
+    # chord snap default (sweep will override)
+    _cfg_set_path(base_cfg, "stage_c.chord_onset_snap_ms", 25.0)
 
     # Ensure quality_gate exists as optional dict (transcribe() reads getattr)
     if not hasattr(base_cfg, "quality_gate"):
@@ -491,17 +434,10 @@ def main() -> int:
             pass
 
     # ---- Baseline run ----
-    logger.info("Running baseline transcribe() ... forced_mode=%s forced_profile=%s", args.forced_mode, args.forced_profile)
+    logger.info("Running baseline transcribe() ...")
     plog = PipelineLogger()
     t0 = time.time()
-    tr = _call_transcribe_with_intent(
-        wav_path,
-        cfg=base_cfg,
-        device=args.device,
-        pipeline_logger=plog,
-        forced_mode=str(args.forced_mode),
-        forced_profile=str(args.forced_profile) if args.forced_profile else None,
-    )
+    tr = _run_transcribe(wav_path, cfg=base_cfg, device=args.device, pipeline_logger=plog)
     elapsed = time.time() - t0
 
     analysis = tr.analysis_data
@@ -526,7 +462,6 @@ def main() -> int:
         "stage_c_post": diag.get("stage_c_post", {}) if isinstance(diag, dict) else {},
         "timing": diag.get("timing", {"total_sec": float(elapsed)}) if isinstance(diag, dict) else {"total_sec": float(elapsed)},
         "config": _asdict_safe(base_cfg),
-        "forced": {"mode": str(args.forced_mode), "profile": str(args.forced_profile)},
     }
 
     # Save baseline snapshot files
@@ -565,7 +500,10 @@ def main() -> int:
     for (gap_ms, snap_ms, thr) in combos:
         cfg = copy.deepcopy(base_cfg)
 
-        # Stage C knobs
+        # ✅ FIX 2: force L6 mode for every sweep candidate (paranoia)
+        _force_l6_mode_on_cfg(cfg)
+
+        # Stage C knobs (both new + legacy paths)
         _cfg_set_path(cfg, "stage_c.post_merge.max_gap_ms", float(gap_ms))
         _cfg_set_path(cfg, "stage_c.gap_filling.max_gap_ms", float(gap_ms))  # legacy fallback
         _cfg_set_path(cfg, "stage_c.chord_onset_snap_ms", float(snap_ms))
@@ -584,14 +522,7 @@ def main() -> int:
                 pass
 
         t1 = time.time()
-        tr_s = _call_transcribe_with_intent(
-            wav_path,
-            cfg=cfg,
-            device=args.device,
-            pipeline_logger=PipelineLogger(),
-            forced_mode=str(args.forced_mode),
-            forced_profile=str(args.forced_profile) if args.forced_profile else None,
-        )
+        tr_s = _run_transcribe(wav_path, cfg=cfg, device=args.device, pipeline_logger=PipelineLogger())
         dt_s = time.time() - t1
 
         analysis_s = tr_s.analysis_data
@@ -626,7 +557,7 @@ def main() -> int:
                     "onset_mae_ms": met_s.get("onset_mae_ms"),
                     "voiced_ratio": met_s.get("voiced_ratio"),
                     "fragmentation_score": met_s.get("fragmentation_score"),
-                    "median_note_len_ms": met_s.get("median_note_dur_ms") or met_s.get("median_note_len_ms"),
+                    "median_note_len_ms": met_s.get("median_note_len_ms"),
                     "note_count": met_s.get("note_count"),
                     "octave_jump_rate": met_s.get("octave_jump_rate"),
                     "timing_total_sec": met_s.get("timing_total_sec"),
@@ -641,7 +572,6 @@ def main() -> int:
                 "run_id": run_id,
                 "baseline": {"metrics": metrics, "run_info_path": base_run_info_path},
                 "sweep": sweep_rows,
-                "forced": {"mode": str(args.forced_mode), "profile": str(args.forced_profile)},
             },
             f,
             indent=2,
