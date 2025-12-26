@@ -204,7 +204,6 @@ def transcribe(
                     stem_timelines={},
                     notes=list(notes),
                     notes_before_quantization=list(notes),
-                    quantized_notes=[],
                     chords=[],
                     diagnostics={"decision_trace": cand_trace},
                 )
@@ -267,7 +266,6 @@ def transcribe(
             stem_timelines={},
             notes=[],
             notes_before_quantization=[],
-            quantized_notes=[],
             chords=[],
             diagnostics={},
         )
