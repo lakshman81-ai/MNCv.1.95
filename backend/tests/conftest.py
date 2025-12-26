@@ -1,7 +1,14 @@
 import sys
 import types
 import warnings
+from pathlib import Path
+
 import numpy as np
+
+# Ensure repository root is importable for `backend` package resolution.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 class _StubTensor:

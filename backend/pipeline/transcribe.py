@@ -51,18 +51,22 @@ def _quality_metrics(
     # voiced_ratio:
     # - prefer detector timeline if available (classic path)
     # - else fallback to coverage ratio (E2E path)
-    voiced_ratio = 0.0
+    voiced_ratio: Optional[float] = None
     if timeline_source is not None:
         total_frames = max(1, len(timeline_source))
         voiced_frames = 0
+        frames_with_active_attr = 0
         for fr in timeline_source:
             ap = getattr(fr, "active_pitches", None)
             if ap is None:
                 continue
+            frames_with_active_attr += 1
             if len(ap) > 0:
                 voiced_frames += 1
-        voiced_ratio = float(voiced_frames / total_frames)
-    else:
+        if frames_with_active_attr > 0:
+            voiced_ratio = float(voiced_frames / total_frames)
+
+    if voiced_ratio is None:
         voiced_ratio = float(min(1.0, total_note_dur / duration_sec))
 
     return {
