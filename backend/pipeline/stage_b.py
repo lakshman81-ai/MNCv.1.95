@@ -11,6 +11,7 @@ import warnings
 import logging
 import importlib.util
 import sys
+
 try:
     from scipy.optimize import linear_sum_assignment
 except Exception:  # pragma: no cover - optional dependency
@@ -29,13 +30,11 @@ from .detectors import (
     BasePitchDetector
 )
 
-# PB0: Fix imports
 from copy import deepcopy
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Re-export for tests
 __all__ = [
     "extract_features",
     "create_harmonic_mask",
@@ -53,11 +52,9 @@ def _get(cfg: Any, path: str, default: Any = None) -> Any:
     for part in path.split("."):
         if cur is None:
             return default
-        # dict-style
         if isinstance(cur, dict):
             cur = cur.get(part, default)
             continue
-        # object attribute
         if hasattr(cur, part):
             cur = getattr(cur, part)
             continue
@@ -86,12 +83,14 @@ def _module_available(module_name: str) -> bool:
 # -----------------------------------------------------------------------------
 ROUTING_POLICY_VERSION = "routing_v1"
 
+
 def _safe_import_librosa():
     try:
         import librosa  # type: ignore
         return librosa
     except Exception:
         return None
+
 
 _LIBROSA = _safe_import_librosa()
 
@@ -166,7 +165,6 @@ def _compute_routing_features(mix_audio: np.ndarray, sr: int, duration_sec: floa
         feats["spectral_centroid_std"] = float(np.std(centroid)) if centroid.size else 0.0
         feats["spectral_flatness_mean"] = float(np.mean(flat)) if flat.size else 0.0
 
-        # HPSS
         try:
             harm, perc = _LIBROSA.effects.hpss(y_use)
             eh = float(np.sum(harm * harm) + 1e-12)
@@ -175,7 +173,6 @@ def _compute_routing_features(mix_audio: np.ndarray, sr: int, duration_sec: floa
         except Exception:
             feats["hpss_percussive_ratio"] = 0.0
 
-        # Polyphony estimate via piptrack
         try:
             pitches, mags = _LIBROSA.piptrack(
                 y=y_use, sr=sr, hop_length=512, fmin=80.0, fmax=min(2000.0, sr / 2.2)
@@ -331,8 +328,18 @@ def compute_decision_trace(
 
     decision_trace: Dict[str, Any] = {
         "policy_version": ROUTING_POLICY_VERSION,
-        "requested": {"transcription_mode": str(req_mode), "profile": str(req_profile), "separation_mode": str(resolved_sep if manual_override else req_sep_mode)},
-        "resolved": {"transcription_mode": str(resolved_mode), "profile": str(req_profile), "separation_mode": str(resolved_sep), "audio_type": str(audio_type_str)},
+        # FIX: requested should reflect what was requested (not resolved)
+        "requested": {
+            "transcription_mode": str(req_mode),
+            "profile": str(req_profile),
+            "separation_mode": str(req_sep_mode),
+        },
+        "resolved": {
+            "transcription_mode": str(resolved_mode),
+            "profile": str(req_profile),
+            "separation_mode": str(resolved_sep),
+            "audio_type": str(audio_type_str),
+        },
         "routing_features": dict(routing_features),
         "rule_hits": list(rule_hits),
         "separation": {
@@ -359,12 +366,12 @@ def compute_decision_trace(
     return decision_trace
 
 
-def sigmoid(x):  # safe-ish
+def sigmoid(x):
     x = max(-20.0, min(20.0, x))
     return 1.0 / (1.0 + math.exp(-x))
 
+
 def weighted_median(values, weights):
-    # values: list[float], weights: list[float]
     pairs = sorted(zip(values, weights), key=lambda x: x[0])
     total = sum(w for _, w in pairs)
     if total <= 0:
@@ -376,32 +383,28 @@ def weighted_median(values, weights):
             return v
     return pairs[-1][0]
 
-# ---- Poly candidate cleanup helpers ----------------------------------------
 
 _LOG2_1200 = 1200.0 / math.log(2.0)
 _EPS = 1e-9
+
 
 def _cents_diff(a_hz: float, b_hz: float) -> float:
     if a_hz <= 0.0 or b_hz <= 0.0:
         return 1e9
     return abs(_LOG2_1200 * math.log((a_hz + _EPS) / (b_hz + _EPS)))
 
+
 def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
                            fmin: float, fmax: float,
                            bins_per_octave: int = 36) -> Optional[dict]:
-    """
-    Returns dict with: mag (float32 [n_bins, n_frames]), freqs (float32 [n_bins])
-    or None if librosa missing or computation fails.
-    """
     if not _module_available("librosa"):
         return None
     try:
-        import librosa  # optional
+        import librosa
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
         if y.size == 0:
             return None
 
-        # n_bins spans [fmin, fmax]
         fmin = float(max(20.0, fmin))
         fmax = float(max(fmin * 1.01, fmax))
         n_oct = math.log2(fmax / fmin)
@@ -418,6 +421,7 @@ def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
     except Exception:
         return None
 
+
 def _cqt_mag_at(ctx: Optional[dict], frame_idx: int, hz: float) -> float:
     if ctx is None or hz <= 0.0:
         return 0.0
@@ -426,11 +430,11 @@ def _cqt_mag_at(ctx: Optional[dict], frame_idx: int, hz: float) -> float:
     if mag.ndim != 2 or freqs.ndim != 1:
         return 0.0
     t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
-    # nearest bin
     j = int(np.clip(np.searchsorted(freqs, hz), 0, freqs.size - 1))
     if j > 0 and abs(freqs[j - 1] - hz) < abs(freqs[j] - hz):
         j -= 1
     return float(mag[j, t])
+
 
 def _cqt_frame_floor(ctx: Optional[dict], frame_idx: int) -> float:
     if ctx is None:
@@ -439,9 +443,9 @@ def _cqt_frame_floor(ctx: Optional[dict], frame_idx: int) -> float:
     if mag.ndim != 2 or mag.shape[1] == 0:
         return 0.0
     t = min(max(0, int(frame_idx)), mag.shape[1] - 1)
-    # robust floor for that frame
     col = mag[:, t]
     return float(np.median(col)) + 1e-9
+
 
 def _postprocess_candidates(
     candidates: List[Tuple[float, float]],
@@ -454,16 +458,9 @@ def _postprocess_candidates(
     cqt_support_ratio: float = 2.0,
     harmonic_drop_ratio: float = 0.75,
 ) -> List[Tuple[float, float]]:
-    """
-    - Soft CQT gate: if a candidate lacks spectral support at its fundamental, reduce conf.
-    - Drop near-duplicates (within dup_cents).
-    - Suppress octave-harmonic duplicates when 2x looks like a harmonic of x.
-    - Cap count and renormalize confidences to [0,1] (max=1).
-    """
     if not candidates:
         return []
 
-    # clamp conf and soft CQT gate
     floor = _cqt_frame_floor(cqt_ctx, frame_idx)
     gated: List[Tuple[float, float]] = []
     for f, c in candidates:
@@ -473,7 +470,6 @@ def _postprocess_candidates(
 
         if cqt_ctx is not None and floor > 0.0:
             m = _cqt_mag_at(cqt_ctx, frame_idx, float(f))
-            # support if fundamental bin stands out vs median floor
             if m < floor * float(cqt_support_ratio):
                 c *= float(cqt_gate_mul)
 
@@ -483,45 +479,36 @@ def _postprocess_candidates(
     if not gated:
         return []
 
-    # sort strongest first
     gated.sort(key=lambda x: x[1], reverse=True)
 
     kept: List[Tuple[float, float]] = []
 
-    # helper: decide if hi is likely harmonic of lo using CQT ratio + cents check
     def _looks_like_harmonic(lo: float, hi: float) -> bool:
         if cqt_ctx is None:
             return False
-        # ensure hi ~ 2*lo
         if abs(_cents_diff(hi, 2.0 * lo)) > octave_cents:
             return False
         m_lo = _cqt_mag_at(cqt_ctx, frame_idx, lo)
         m_hi = _cqt_mag_at(cqt_ctx, frame_idx, hi)
-        # if hi is much weaker than lo, it's likely just the 2nd harmonic of lo
         if m_lo <= 0.0:
             return False
         return (m_hi / (m_lo + 1e-9)) < float(harmonic_drop_ratio)
 
     for f, c in gated:
-        # 1) drop near-duplicate pitch (same note repeated across layers)
         dup = False
-        for fk, ck in kept:
+        for fk, _ in kept:
             if _cents_diff(f, fk) <= dup_cents:
                 dup = True
                 break
         if dup:
             continue
 
-        # 2) octave-harmonic suppression: if this candidate is ~2x of an already-kept one
-        # and looks like a harmonic rather than a true octave note, skip it.
         harm = False
         for fk, ck in kept:
-            # if f is hi and fk is lo
             if fk > 0.0 and f > 0.0 and abs(_cents_diff(f, 2.0 * fk)) <= octave_cents:
                 if _looks_like_harmonic(fk, f) and c <= ck * 1.10:
                     harm = True
                     break
-            # if f is lo and fk is hi, we keep lo (strong fundamentals) so no need to drop lo
         if harm:
             continue
 
@@ -532,12 +519,12 @@ def _postprocess_candidates(
     if not kept:
         return []
 
-    # 3) renormalize conf so max=1 (keeps ordering, keeps values bounded)
     max_c = max(c for _, c in kept)
     if max_c > 1e-9:
         kept = [(f, float(c / max_c)) for f, c in kept]
 
     return kept
+
 
 class DetectorReliability:
     def __init__(self, base_w: float, pop_penalty_frames=6):
@@ -548,15 +535,13 @@ class DetectorReliability:
         self.recent = deque(maxlen=5)
 
     def update(self, cents, conf, energy_ok=True):
-        # stability: small derivative over recent frames
-        if cents == cents:  # not NaN
+        if cents == cents:
             self.recent.append(cents)
         stability = 1.0
         if len(self.recent) >= 3:
-            diffs = [abs(self.recent[i]-self.recent[i-1]) for i in range(1,len(self.recent))]
-            stability = 1.0 / (1.0 + (sum(diffs)/len(diffs))/80.0)  # 80 cents scale
+            diffs = [abs(self.recent[i] - self.recent[i - 1]) for i in range(1, len(self.recent))]
+            stability = 1.0 / (1.0 + (sum(diffs) / len(diffs)) / 80.0)
 
-        # octave pop heuristic: ~1200 cents jump without energy change
         if self.prev_cents is not None and cents == cents and self.prev_cents == self.prev_cents:
             jump = abs(cents - self.prev_cents)
             if 900.0 <= jump <= 1500.0 and energy_ok:
@@ -569,85 +554,64 @@ class DetectorReliability:
         else:
             pop_factor = 1.0
 
-        conf_factor = sigmoid((conf - 0.5) * 6.0)  # tune slope
+        conf_factor = sigmoid((conf - 0.5) * 6.0)
         w = self.base_w * conf_factor * stability * pop_factor
         return w
 
+
 def viterbi_pitch(fused_cents, fused_conf, midi_states, transition_smoothness=0.5, jump_penalty=0.6):
-    # fused_cents: list[float] length T
     T = len(fused_cents)
     S = len(midi_states)
     INF = 1e18
-
-    # precompute state cents
-    state_cents = [m*100.0 for m in midi_states]
-
-    # dp[t][s] cost, backpointers
-    dp = [[INF]*S for _ in range(T)]
-    bp = [[-1]*S for _ in range(T)]
+    state_cents = [m * 100.0 for m in midi_states]
+    dp = [[INF] * S for _ in range(T)]
+    bp = [[-1] * S for _ in range(T)]
 
     def emission(t, s):
         c = fused_cents[t]
         if not (c == c) or c <= 0:
-            return 5.0  # allow gaps softly
+            return 5.0
         dist = abs(c - state_cents[s])
         conf = fused_conf[t] if t < len(fused_conf) and fused_conf[t] is not None else 0.5
-        # confidence penalty: if conf is high, we trust fused_cents more (higher cost for deviance)
-        return (dist/50.0) - 0.8*math.log(max(1e-3, conf))
+        return (dist / 50.0) - 0.8 * math.log(max(1e-3, conf))
 
     def transition(s0, s1):
         step = abs(midi_states[s1] - midi_states[s0])
-        # allow small steps (0–2) cheaply, penalize larger jumps
         if step <= 2:
-            return transition_smoothness * step # 0.2 * step in snippet
+            return transition_smoothness * step
         return transition_smoothness * 2.5 + jump_penalty * (step - 2)
 
-    # init
-    for s in range(S):
-        dp[0][s] = emission(0, s)
-
-    # forward
-    for t in range(1, T):
-        # Optimization: prune search space to states near fused pitch if available
-        # But Viterbi is globally optimal, so pruning might hurt.
-        # Given S ~ 88 (or 61), it's fast enough.
-        for s1 in range(S):
-            e = emission(t, s1)
-            # Find best s0
-            # To speed up: inner loop is dense.
-            # But python is slow.
-            # We assume S is small (<100).
-            best_cost = INF
-            best_s0 = -1
-
-            for s0 in range(S):
-                # Transition matrix is symmetric and simple.
-                cost = dp[t-1][s0] + transition(s0, s1)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_s0 = s0
-
-            dp[t][s1] = best_cost + e
-            bp[t][s1] = best_s0
-
-    # backtrack
     if T == 0:
         return []
 
-    s = min(range(S), key=lambda k: dp[T-1][k])
-    path = [s]*T
-    for t in range(T-1, 0, -1):
+    for s in range(S):
+        dp[0][s] = emission(0, s)
+
+    for t in range(1, T):
+        for s1 in range(S):
+            e = emission(t, s1)
+            best_cost = INF
+            best_s0 = -1
+            for s0 in range(S):
+                cost = dp[t - 1][s0] + transition(s0, s1)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_s0 = s0
+            dp[t][s1] = best_cost + e
+            bp[t][s1] = best_s0
+
+    s = min(range(S), key=lambda k: dp[T - 1][k])
+    path = [s] * T
+    for t in range(T - 1, 0, -1):
         s = bp[t][s]
-        path[t-1] = s
-    smoothed_hz = [440.0 * (2**((midi_states[i]-69)/12.0)) for i in path]
+        path[t - 1] = s
+    smoothed_hz = [440.0 * (2 ** ((midi_states[i] - 69) / 12.0)) for i in path]
     return smoothed_hz
 
 
 def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.ndarray:
-    """Lightweight wrapper for simple Butterworth filtering."""
     if SCIPY_SIGNAL is None or len(audio) == 0:
         return audio.copy()
-
     nyq = 0.5 * sr
     norm_cutoff = cutoff / nyq
     norm_cutoff = min(max(norm_cutoff, 1e-4), 0.999)
@@ -656,11 +620,6 @@ def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.
 
 
 def _estimate_global_tuning_cents(f0: np.ndarray) -> float:
-    """
-    Estimate global tuning offset from standard A440 in cents.
-    Returns value in [-50, 50].
-    """
-    # Estimate median fractional MIDI deviation (in cents)
     f = np.asarray(f0, dtype=np.float32)
     f = f[f > 0.0]
     if f.size < 50:
@@ -668,7 +627,6 @@ def _estimate_global_tuning_cents(f0: np.ndarray) -> float:
     midi_float = 69.0 + 12.0 * np.log2(f / 440.0)
     frac = midi_float - np.round(midi_float)
     cents = frac * 100.0
-    # wrap to [-50, 50]
     cents = (cents + 50.0) % 100.0 - 50.0
     return float(np.median(cents))
 
@@ -676,11 +634,6 @@ def _estimate_global_tuning_cents(f0: np.ndarray) -> float:
 class SyntheticMDXSeparator:
     """
     Lightweight separator tuned on procedurally generated sine/saw/square/FM stems.
-
-    The separator derives template spectral envelopes from analytic waveforms, then
-    infers soft weights that are used to project the incoming mix into vocal/bass/
-    drums/other stems. This intentionally mirrors a tiny MDX head without external
-    weights so it can run in constrained environments.
     """
 
     def __init__(self, sample_rate: int = 44100, hop_length: int = 512):
@@ -711,7 +664,6 @@ class SyntheticMDXSeparator:
             ),
         }
 
-        # Simple FM voice to emulate vocal richness
         carrier = 220.0
         modulator = 110.0
         waves["fm_voice"] = np.sin(
@@ -721,7 +673,6 @@ class SyntheticMDXSeparator:
         for name, wave in waves.items():
             templates[name] = _normalize_spec(wave)
 
-        # Broadband template for drums/transients
         broadband = np.hanning(len(t))
         templates["broadband"] = _normalize_spec(broadband)
         return templates
@@ -733,16 +684,14 @@ class SyntheticMDXSeparator:
 
         scores = {}
         for name, tmpl in self.templates.items():
-            # cosine similarity with length alignment so template granularity
-            # doesn't depend on the input duration
             if len(tmpl) != len(spec):
                 x_old = np.linspace(0.0, 1.0, len(tmpl))
                 x_new = np.linspace(0.0, 1.0, len(spec))
-                tmpl = np.interp(x_new, x_old, tmpl)
-                tmpl = tmpl / (np.linalg.norm(tmpl) + 1e-9)
-
-            score = float(np.dot(spec, tmpl))
-            scores[name] = score
+                tmpl2 = np.interp(x_new, x_old, tmpl)
+                tmpl2 = tmpl2 / (np.linalg.norm(tmpl2) + 1e-9)
+            else:
+                tmpl2 = tmpl
+            scores[name] = float(np.dot(spec, tmpl2))
         return scores
 
     def separate(self, audio: np.ndarray, sr: int) -> Dict[str, Any]:
@@ -751,24 +700,11 @@ class SyntheticMDXSeparator:
 
         scores = self._score_mix(audio)
         vocal_score = scores.get("fm_voice", 0.25) + scores.get("sine_stack", 0.25)
-        # Assign Sawtooth score to Bass (L2 uses Saw for Bass)
         bass_score = scores.get("square", 0.25) + scores.get("saw", 0.25)
-
         drum_score = scores.get("broadband", 0.25)
-
-        # Reduce Saw score from 'other' (or remove it from weighted calculation)
-        # But we need 4 weights for the tuple unpacking below?
-        # Actually 'other_w' comes from 'saw_score' in original code.
-        # Let's keep 4 dimensions but repurpose.
-        # Original: vocals, bass, drums, other (from saw)
-        # New: vocals, bass (square+saw), drums, other (residual or 0?)
-
-        # To keep tuple unpacking safe:
-        # We'll just set 'saw_score' to small epsilon if we moved it to bass?
-        # Or better: let 'other' be low.
         other_score = 0.01
 
-        raw_weights = np.array([vocal_score, bass_score, drum_score, other_score])
+        raw_weights = np.array([vocal_score, bass_score, drum_score, other_score], dtype=np.float32)
         weights = raw_weights / (np.sum(raw_weights) + 1e-9)
         vocals_w, bass_w, drums_w, other_w = weights
 
@@ -777,7 +713,6 @@ class SyntheticMDXSeparator:
                 logger.warning("SyntheticMDX: Scipy missing. Falling back to gain-based separation (no frequency filtering).")
                 self._warned_no_scipy = True
 
-            # Normalize to avoid clipping
             s = vocals_w + bass_w
             if s > 1.0:
                 vocals_w /= s
@@ -831,7 +766,6 @@ def _run_htdemucs(
     from demucs.apply import apply_model
     import torch
 
-    # Resolve device
     try:
         dev = torch.device(device) if device else torch.device("cpu")
     except Exception:
@@ -846,25 +780,15 @@ def _run_htdemucs(
 
     model_sr = getattr(model, "samplerate", sr)
 
-    # Handle Mono vs Stereo input logic
-    # Demucs expects (Channels, Time)
-    # If input is (Time,), make it (1, Time) first for logic consistency
     if audio.ndim == 1:
-        audio = audio[None, :]  # (1, T)
+        audio = audio[None, :]
 
-    # Resample if needed
     if model_sr != sr:
-        import torch.nn.functional as F
-        # Use torch for resampling if available to handle channels correctly
-        # or use scipy/numpy carefully.
-        # Simple numpy interp works for 1D, but for (C, T) we need loop.
-        # Let's stick to numpy for minimal deps, but handle channels.
         ratio = float(model_sr) / float(sr)
         new_len = int(audio.shape[-1] * ratio)
         resampled_channels = []
         for ch in range(audio.shape[0]):
             indices = np.arange(0, new_len) / ratio
-            # clamp indices to valid range
             indices = np.clip(indices, 0, audio.shape[-1] - 1)
             res_ch = np.interp(indices, np.arange(audio.shape[-1]), audio[ch])
             resampled_channels.append(res_ch)
@@ -872,50 +796,34 @@ def _run_htdemucs(
     else:
         resampled = audio
 
-    # Demucs expects stereo (2, T)
-    # Robust shape handling rules:
-    # (T,) -> (1, T) -> (2, T)
-    # (1, T) -> (2, T)
-    # (2, T) -> OK
-    # (T, C) -> (C, T) -> OK/Trim
-
-    # First, handle potentially transposed input (T, C) -> (C, T)
-    # Heuristic: if shape[0] > 10 and shape[1] <= 10, assume (T, C)
     if resampled.ndim == 2:
         d0, d1 = resampled.shape
         if d0 > 10 and d1 <= 10:
-             resampled = resampled.T
+            resampled = resampled.T
 
-    # Ensure (C, T)
     if resampled.ndim == 1:
         resampled = resampled[None, :]
 
-    C, T = resampled.shape
+    C, _T = resampled.shape
 
-    # Force stereo
     if C == 1:
         resampled = np.concatenate([resampled, resampled], axis=0)
     elif C > 2:
         resampled = resampled[:2, :]
 
-    # Final guard before inference
     if resampled.shape[0] != 2:
-        # Should be unreachable given above logic, but safety first
         logger.warning(f"HTDemucs input shape unexpected: {resampled.shape}. Forcing stereo duplication.")
         if resampled.shape[0] == 1:
-             resampled = np.concatenate([resampled, resampled], axis=0)
+            resampled = np.concatenate([resampled, resampled], axis=0)
         else:
-             # Fallback: take mean and duplicate
-             mono = np.mean(resampled, axis=0, keepdims=True)
-             resampled = np.concatenate([mono, mono], axis=0)
+            mono = np.mean(resampled, axis=0, keepdims=True)
+            resampled = np.concatenate([mono, mono], axis=0)
 
-    # Prepare tensor: (Batch, Channels, Time) -> (1, 2, T)
     mix_tensor = torch.tensor(resampled, dtype=torch.float32)[None, :, :].to(dev)
 
-    # Hard assert on shape to prevent model crash with cryptic error
     if mix_tensor.shape[1] != 2:
-         logger.error(f"HTDemucs tensor shape invalid: {mix_tensor.shape}. Skipping.")
-         return None
+        logger.error(f"HTDemucs tensor shape invalid: {mix_tensor.shape}. Skipping.")
+        return None
 
     try:
         with torch.no_grad():
@@ -930,9 +838,8 @@ def _run_htdemucs(
         stem_audio = demucs_out[0, idx].mean(dim=0).cpu().numpy()
         separated[name] = stem_audio
 
-    # Ensure canonical stems exist
     for name in ["vocals", "drums", "bass", "other"]:
-        separated.setdefault(name, np.zeros_like(audio))
+        separated.setdefault(name, np.zeros_like(audio.reshape(-1)))
 
     return separated
 
@@ -948,23 +855,14 @@ def _resolve_separation(
     """
     Benchmark-safe separation routing.
 
-    Returns:
-      (stems, sep_trace) where sep_trace matches decision_trace["separation"] schema:
-        {
-          "ran": bool,
-          "backend": "demucs"|"synthetic_mdx"|"none",
-          "skip_reasons": [...],
-          "gates": {...},
-          "outputs": {"stems":[...], "selected_primary_stem": "..."}
-        }
+    Key fix:
+      - If synthetic_model is enabled, DO NOT skip just because synthetic_like=True or mixture_score is low.
+        Those gates are appropriate for Demucs, not for SyntheticMDX.
     """
     sep = getattr(b_conf, "separation", {}) or {}
 
-    # Requested mode normalization
     mode = sep.get("mode", None)
     enabled = sep.get("enabled", True)
-
-    # Capture raw requested state for diagnostics
     sep_enabled = enabled
 
     if isinstance(mode, str):
@@ -986,12 +884,18 @@ def _resolve_separation(
     min_mixture_score = float(gates.get("min_mixture_score", 0.45))
     bypass_if_synth = bool(gates.get("bypass_if_synthetic_like", True))
 
+    # Determine backend intent early so gating can be correct
+    use_synth = bool(sep.get("synthetic_model", False))
+    backend = "synthetic_mdx" if use_synth else "demucs"
+
     def _skip(reason_list: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        stems = getattr(stage_a_out, "stems", {}) or {}
+        mix_only = {"mix": stems.get("mix", None)} if "mix" in stems else stems
         return (
-            getattr(stage_a_out, "stems", {"mix": (getattr(stage_a_out, "stems", {}) or {}).get("mix", None)}),
+            mix_only,
             {
                 "ran": False,
-                "requested": bool(sep_enabled) if 'sep_enabled' in locals() else False,
+                "requested": bool(sep_enabled) if "sep_enabled" in locals() else False,
                 "backend": "none",
                 "skip_reasons": list(reason_list),
                 "gates": {
@@ -1000,7 +904,6 @@ def _resolve_separation(
                     "bypass_if_synthetic_like": bool(bypass_if_synth),
                 },
                 "outputs": {"stems": ["mix"], "selected_primary_stem": "mix"},
-                # Backward compatibility keys
                 "mode": "disabled",
                 "synthetic_ran": False,
                 "htdemucs_ran": False,
@@ -1008,7 +911,6 @@ def _resolve_separation(
             },
         )
 
-    # E2E forces off
     if str(resolved_transcription_mode or "").startswith("e2e_"):
         return _skip(["e2e_mode"])
 
@@ -1016,34 +918,31 @@ def _resolve_separation(
         return _skip(["off"])
 
     skip_reasons: List[str] = []
-    if bypass_if_synth and synthetic_like:
-        skip_reasons.append("synthetic_like")
+
+    # Duration gate applies to both backends
     if duration_sec > 0.0 and duration_sec < min_duration_sec:
         skip_reasons.append("short_duration")
-    if mixture_score < min_mixture_score:
-        skip_reasons.append("low_mixture_score")
+
+    # Demucs-specific gates (do NOT apply to synthetic backend by default)
+    if not use_synth:
+        if bypass_if_synth and synthetic_like:
+            skip_reasons.append("synthetic_like")
+        if mixture_score < min_mixture_score:
+            skip_reasons.append("low_mixture_score")
 
     if skip_reasons:
         return _skip(skip_reasons)
 
-    # Patch: Ensure 'requested' key is present in success path diagnostics too
-    # by merging extras. Ideally _skip() handles it, but success path needs it.
-
-    use_synth = bool(sep.get("synthetic_model", False))
-    backend = "synthetic_mdx" if use_synth else "demucs"
-
     mix_stem = (getattr(stage_a_out, "stems", {}) or {}).get("mix", None)
     if mix_stem is None:
-         return _skip(["no_mix_stem"])
-
+        return _skip(["no_mix_stem"])
     mix_audio = getattr(mix_stem, "audio", None)
     if mix_audio is None:
-         return _skip(["no_audio"])
+        return _skip(["no_audio"])
 
-    # Setup for backward compatibility logic (resolving preset/overlap/shifts)
-    sep_conf = b_conf.separation
-    overlap = sep_conf.get("overlap", 0.25)
-    shifts = sep_conf.get("shifts", 1)
+    sep_conf = getattr(b_conf, "separation", {}) or {}
+    overlap = float(sep_conf.get("overlap", 0.25))
+    shifts = int(sep_conf.get("shifts", 1))
 
     preset_conf: Dict[str, Any] = {}
     preset_name = None
@@ -1065,49 +964,42 @@ def _resolve_separation(
         "preset": preset_name,
         "resolved_overlap": overlap,
         "resolved_shifts": shifts,
-        "shift_range": preset_conf.get("shift_range", None)
+        "shift_range": preset_conf.get("shift_range", None),
     }
 
     try:
         raw_stems = {}
         if use_synth:
-            model = SyntheticMDXSeparator(sample_rate=mix_stem.sr, hop_length=getattr(stage_a_out.meta, "hop_length", 512))
-            raw_stems = model.separate(mix_audio, mix_stem.sr)
+            model = SyntheticMDXSeparator(
+                sample_rate=mix_stem.sr,
+                hop_length=getattr(getattr(stage_a_out, "meta", None), "hop_length", 512),
+            )
+            raw_stems = model.separate(np.asarray(mix_audio, dtype=np.float32), mix_stem.sr)
         else:
             raw_stems = _run_htdemucs(
-                mix_audio,
+                np.asarray(mix_audio, dtype=np.float32),
                 mix_stem.sr,
-                str(sep.get("model_name", "htdemucs")),
+                str(sep_conf.get("model_name", "htdemucs")),
                 overlap,
                 shifts,
-                device
+                device,
             )
 
         if not raw_stems:
-             # Fallback
-             return _skip(["backend_returned_empty"])
+            return _skip(["backend_returned_empty"])
 
-        # Normalize and Resample
-        # Ensure outputs are at mix_stem.sr and match mix_audio length
         target_sr = mix_stem.sr
         target_len = len(mix_audio)
 
         final_stems: Dict[str, Stem] = {}
-        # Always include mix
         final_stems["mix"] = mix_stem
 
         for k, v in raw_stems.items():
             if not isinstance(v, np.ndarray):
                 continue
+            out_audio = np.asarray(v, dtype=np.float32).reshape(-1)
 
-            out_audio = v
-            # If shape mismatch, we might need simple resampling/pad/trim
-            # _run_htdemucs returns at model_sr, but we don't know model_sr here easily without checking length ratio?
-            # Actually _run_htdemucs implementation I have above does NOT resample back.
-            # So if length is different, it means SR is different (assuming duration preserved).
-
-            if len(out_audio) != target_len and target_len > 0:
-                # Simple linear interpolation to match target length
+            if len(out_audio) != target_len and target_len > 0 and len(out_audio) > 0:
                 x_old = np.linspace(0, 1, len(out_audio))
                 x_new = np.linspace(0, 1, target_len)
                 out_audio = np.interp(x_new, x_old, out_audio).astype(np.float32)
@@ -1134,8 +1026,7 @@ def _resolve_separation(
                 "bypass_if_synthetic_like": bool(bypass_if_synth),
             },
             "outputs": {"stems": stem_names, "selected_primary_stem": str(selected)},
-            # Backward compatibility
-            "mode": "synthetic_mdx" if use_synth else sep.get("model_name", "htdemucs"),
+            "mode": "synthetic_mdx" if use_synth else sep_conf.get("model_name", "htdemucs"),
             "synthetic_ran": bool(use_synth),
             "htdemucs_ran": not bool(use_synth),
             "fallback": False,
@@ -1143,11 +1034,10 @@ def _resolve_separation(
         }
 
     except Exception:
-        # Backward compat diag for fallback
         d = _skip(["runtime_error"])[1]
         d["fallback"] = True
         if sep_mode == "auto":
-             d["fallback_reason"] = "htdemucs_failed_or_missing_in_auto"
+            d["fallback_reason"] = "htdemucs_failed_or_missing_in_auto"
         return _skip(["runtime_error"])[0], d
 
 
@@ -1158,7 +1048,6 @@ def _arrays_to_timeline(
     sr: int,
     hop_length: int
 ) -> List[FramePitch]:
-    """Convert f0/conf arrays to List[FramePitch]."""
     timeline = []
     n_frames = len(f0)
     for i in range(n_frames):
@@ -1194,7 +1083,7 @@ def _median_filter(signal: np.ndarray, kernel_size: int) -> np.ndarray:
 
     pad = k // 2
     padded = np.pad(signal, (pad, pad), mode="edge")
-    filtered = [np.median(padded[i : i + k]) for i in range(len(signal))]
+    filtered = [np.median(padded[i: i + k]) for i in range(len(signal))]
     return np.asarray(filtered, dtype=np.float32)
 
 
@@ -1244,15 +1133,12 @@ def _apply_melody_filters(
     f0_out = np.where(conf_out > 0.0, f0_out, 0.0)
     return f0_out, conf_out
 
+
 def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) -> Optional[BasePitchDetector]:
-    """Initialize a detector if enabled."""
     if not conf.get("enabled", False):
         return None
 
-    # Remove control/meta keys we already pass positionally
     kwargs = {k: v for k, v in conf.items() if k not in ("enabled", "hop_length")}
-
-    # 61-key fallback defaults if not provided - B1
     kwargs.setdefault("fmin", 60.0)
     kwargs.setdefault("fmax", 2200.0)
 
@@ -1274,6 +1160,7 @@ def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) ->
         return None
     return None
 
+
 def _ensemble_merge(
     results: Dict[str, Tuple[np.ndarray, np.ndarray]],
     weights: Dict[str, float],
@@ -1281,14 +1168,6 @@ def _ensemble_merge(
     priority_floor: float = 0.0,
     adaptive_fusion: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Merge multiple f0/conf tracks based on weights and disagreement.
-
-    Strategy:
-      * Align frame counts across detectors
-      * Choose the candidate with the highest weighted confidence OR use weighted median (Step 2)
-      * Down-weight winners that have little consensus (large disagreement)
-    """
     if not results:
         return np.array([]), np.array([])
 
@@ -1313,7 +1192,6 @@ def _ensemble_merge(
             return float("inf")
         return float(1200.0 * np.log2((a + 1e-9) / (b + 1e-9)))
 
-    # Initialize reliability trackers if adaptive
     reliabilities = {}
     if adaptive_fusion:
         for name in aligned_results:
@@ -1329,10 +1207,9 @@ def _ensemble_merge(
             c = float(conf[i])
             f = float(f0[i])
 
-            # Prepare data for adaptive fusion
             cents = float("nan")
             if f > 0.0:
-                 cents = 1200.0 * math.log2(f / 440.0) + 6900.0
+                cents = 1200.0 * math.log2(f / 440.0) + 6900.0
 
             detector_outputs.append({
                 "name": name,
@@ -1344,51 +1221,38 @@ def _ensemble_merge(
             if c <= 0.0 or f <= 0.0:
                 continue
 
-            # Priority floor mostly benefits SwiftF0 on synthetic tones
             eff_conf = max(c, priority_floor if name == "swiftf0" else c)
             candidates.append((name, f, eff_conf, w))
 
         if not candidates:
-            # Still update reliabilities with unvoiced?
-            # Step 2 logic: update only if voiced or valid.
-            # Actually we should update tracking state even if unvoiced?
-            # The snippet updates if voiced.
             final_f0[i] = 0.0
             final_conf[i] = 0.0
             continue
 
         if adaptive_fusion:
-            # Step 2: Fuse frame
             vals, wts = [], []
             for out in detector_outputs:
                 cents = out["cents"]
                 if not out.get("voiced", True) or not (cents == cents):
                     continue
-                # Assuming energy_ok is True for now, as we don't pass frame rms here
                 w = reliabilities[out["name"]].update(cents, out["conf"], energy_ok=True)
                 if w > 1e-6:
-                    vals.append(cents); wts.append(w)
+                    vals.append(cents)
+                    wts.append(w)
 
             fused_cents = weighted_median(vals, wts) if vals else float("nan")
 
-            if fused_cents == fused_cents: # not nan
+            if fused_cents == fused_cents:
                 fused_hz = 440.0 * (2.0 ** ((fused_cents - 6900.0) / 1200.0))
                 final_f0[i] = fused_hz
-                # Use max confidence of contributors? Or weighted avg?
-                # Weighted avg confidence seems appropriate
-                final_conf[i] = sum(c[2] for c in candidates) / len(candidates) # rough approx
+                final_conf[i] = sum(c[2] for c in candidates) / len(candidates)
             else:
                 final_f0[i] = 0.0
                 final_conf[i] = 0.0
 
         else:
-            # Original Static Fusion
-            # Pick winner by weighted confidence
-            best_name, best_f0, best_conf, best_w = max(
-                candidates, key=lambda x: x[2] * x[3]
-            )
+            best_name, best_f0, best_conf, best_w = max(candidates, key=lambda x: x[2] * x[3])
 
-            # Consensus weighting: measure how many other detectors agree
             total_w = sum(c[3] for c in candidates)
             support_w = best_w
             for name, f, c, w in candidates:
@@ -1403,8 +1267,8 @@ def _ensemble_merge(
 
     return final_f0, final_conf
 
+
 def _is_polyphonic(audio_type: Any) -> bool:
-    """Check if Stage A classified audio as polyphonic."""
     try:
         if isinstance(audio_type, AudioType):
             return audio_type in (AudioType.POLYPHONIC, AudioType.POLYPHONIC_DOMINANT)
@@ -1422,9 +1286,6 @@ def _augment_with_harmonic_masks(
     n_harmonics: int,
     audio_path: Optional[str] = None,
 ) -> Dict[str, Stem]:
-    """
-    Derive synthetic melody/accompaniment stems by masking harmonics from a quick f0 prior.
-    """
     if SCIPY_SIGNAL is None:
         return {}
 
@@ -1466,7 +1327,6 @@ def _augment_with_harmonic_masks(
             n_harmonics=n_harmonics,
         )
 
-        # Harmonic emphasis keeps bins near f0; residual keeps the rest.
         strength = np.clip(conf, 0.0, 1.0).reshape(1, -1)
         harmonic_keep = np.clip((1.0 - mask) * (0.8 + 0.2 * strength), 0.0, 1.0)
         residual_keep = np.clip(1.0 - harmonic_keep, 0.0, 1.0)
@@ -1494,7 +1354,6 @@ def _augment_with_harmonic_masks(
         melody_audio = np.asarray(melody_audio, dtype=np.float32)
         residual_audio = np.asarray(residual_audio, dtype=np.float32)
 
-        # Match original length
         if melody_audio.size < audio.size:
             melody_audio = np.pad(melody_audio, (0, audio.size - melody_audio.size))
         melody_audio = melody_audio[: audio.size]
@@ -1508,7 +1367,6 @@ def _augment_with_harmonic_masks(
             "residual_masked": Stem(audio=residual_audio, sr=stem.sr, type="residual_masked"),
         }
     except Exception:
-        # Do not let masking failure break the pipeline
         return {}
 
 
@@ -1522,9 +1380,6 @@ def _resolve_polyphony_filter(config: Optional[PipelineConfig]) -> str:
 class MultiVoiceTracker:
     """
     Lightweight multi-voice tracker to keep skyline assignments stable.
-
-    Tracks up to `max_tracks` concurrent voices using a Hungarian assignment on
-    pitch proximity with hangover/hysteresis to avoid rapid swapping.
     """
 
     def __init__(
@@ -1552,7 +1407,6 @@ class MultiVoiceTracker:
         return cents + penalty
 
     def _assign(self, pitches: np.ndarray, confs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # Fallback to greedy ordering when Hungarian solver missing
         if linear_sum_assignment is None or pitches.size == 0:
             ordered = sorted(zip(pitches, confs), key=lambda x: (-x[1], x[0]))
             ordered = ordered[: self.max_tracks]
@@ -1579,7 +1433,6 @@ class MultiVoiceTracker:
 
     def step(self, candidates: List[Tuple[float, float]]) -> Tuple[np.ndarray, np.ndarray]:
         if not candidates:
-            # Apply hangover to keep tracks alive briefly
             carry_pitches = np.where(self.hold > 0, self.prev_pitches, 0.0)
             carry_confs = np.where(self.hold > 0, self.prev_confs * 0.9, 0.0)
             self.hold = np.maximum(self.hold - 1, 0)
@@ -1587,7 +1440,6 @@ class MultiVoiceTracker:
             self.prev_confs = carry_confs.astype(np.float32)
             return self.prev_pitches.copy(), self.prev_confs.copy()
 
-        # Keep only the strongest candidates up to track count
         ordered = sorted(candidates, key=lambda x: (-x[1], x[0]))[: self.max_tracks]
         pitches = np.array([c[0] for c in ordered], dtype=np.float32)
         confs = np.array([c[1] for c in ordered], dtype=np.float32)
@@ -1625,9 +1477,16 @@ def _validate_config_keys(name: str, cfg: dict, allowed: set[str], pipeline_logg
     unknown = set(cfg.keys()) - allowed
     if unknown:
         msg = f"Config unknown keys in {name}: {sorted(list(unknown))}"
-        if pipeline_logger:
-            pipeline_logger.log_event("stage_b", "config_unknown_keys", payload={"section": name, "keys": sorted(list(unknown))})
-        else:
+        try:
+            if pipeline_logger and hasattr(pipeline_logger, "log_event"):
+                pipeline_logger.log_event(
+                    "stage_b_config_unknown_keys",
+                    section=name,
+                    keys=sorted(list(unknown)),
+                )
+            else:
+                logger.warning(msg)
+        except Exception:
             logger.warning(msg)
 
 
@@ -1647,11 +1506,6 @@ def extract_features(
     pipeline_logger: Optional[Any] = None,
     **kwargs
 ) -> StageBOutput:
-    """
-    Stage B: Extract pitch and features.
-    Respects config.stage_b for detector selection, ensemble weights, and
-    optional polyphonic peeling to expose multiple F0 layers.
-    """
     if config is None:
         config = PipelineConfig()
 
@@ -1659,8 +1513,6 @@ def extract_features(
     sr = stage_a_out.meta.sample_rate
     hop_length = stage_a_out.meta.hop_length
 
-    # Patch D1 / B0: Resolve instrument profile + apply overrides (without mutating config)
-    # Priority: kwargs -> config intended instrument -> meta.instrument -> fallback
     instrument = (
         kwargs.get("instrument")
         or (getattr(config, "instrument_override", None) if config else None)
@@ -1669,9 +1521,6 @@ def extract_features(
         or b_conf.instrument
     )
 
-    # -------------------------------------------------------------------------
-    # Stage B Decision Trace (schema-stable, deterministic)
-    # -------------------------------------------------------------------------
     decision_trace = compute_decision_trace(
         stage_a_out,
         config,
@@ -1683,12 +1532,8 @@ def extract_features(
     resolved_mode = str(decision_trace.get("resolved", {}).get("transcription_mode", getattr(b_conf, "transcription_mode", "classic")))
     routing_features = dict(decision_trace.get("routing_features", {}) or {})
 
-    # -------------------------------------------------------------------------
-    # E2E / Neural Transcription Routing (Basic Pitch)
-    # -------------------------------------------------------------------------
     transcription_mode = resolved_mode
 
-    # Auto logic: try to use E2E if basic_pitch is importable
     if transcription_mode == "auto":
         if _module_available("basic_pitch"):
             transcription_mode = "e2e_basic_pitch"
@@ -1703,7 +1548,6 @@ def extract_features(
         try:
             from .neural_transcription import transcribe_basic_pitch_to_notes
 
-            # Use 'mix' stem if available, else first stem
             audio_source = None
             if "mix" in stage_a_out.stems:
                 audio_source = stage_a_out.stems["mix"].audio
@@ -1723,7 +1567,6 @@ def extract_features(
                     melodia_trick=getattr(b_conf, "bp_melodia_trick", True),
                 )
 
-                # Success: return StageBOutput with precalculated_notes
                 return StageBOutput(
                     time_grid=np.array([], dtype=np.float32),
                     f0_main=np.array([], dtype=np.float32),
@@ -1736,22 +1579,18 @@ def extract_features(
                 )
         except Exception as e:
             logger.warning(f"Basic Pitch unavailable/failed; falling back to classic: {e}")
-            # Fallback to classic
 
     profile = config.get_profile(str(instrument)) if (instrument and b_conf.apply_instrument_profile) else None
     profile_special = dict(getattr(profile, "special", {}) or {}) if profile else {}
     profile_applied = bool(profile)
 
-    # Work on copies so we don't mutate config dataclasses
     detector_cfgs = deepcopy(b_conf.detectors)
     weights_eff = dict(b_conf.ensemble_weights)
     melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
 
-    # Patch 1C: Filter weights for enabled detectors only
     enabled_dets = {k for k, v in detector_cfgs.items() if v.get("enabled", False)}
     weights_eff = {k: v for k, v in weights_eff.items() if k in enabled_dets}
 
-    # Patch 7: Config Validator
     common_keys = {"enabled", "fmin", "fmax", "hop_length", "frame_length", "threshold"}
     _validate_config_keys("detectors.crepe", detector_cfgs.get("crepe", {}),
                           common_keys | {"model_capacity", "step_ms", "confidence_threshold", "conf_threshold", "use_viterbi"}, pipeline_logger)
@@ -1760,42 +1599,32 @@ def extract_features(
     _validate_config_keys("detectors.swiftf0", detector_cfgs.get("swiftf0", {}),
                           common_keys | {"confidence_threshold", "n_fft"}, pipeline_logger)
 
-    # Apply Optional nested overrides first
     nested = profile_special.get("stage_b_detectors") or {}
     for det_name, overrides in (nested.items() if isinstance(nested, dict) else []):
         if det_name in detector_cfgs and isinstance(overrides, dict):
             detector_cfgs[det_name].update(overrides)
 
-    # Apply profile overrides and flat keys
     if profile:
-        # Force instrument range everywhere
         for _, dconf in detector_cfgs.items():
             dconf.setdefault("fmin", float(profile.fmin))
             dconf.setdefault("fmax", float(profile.fmax))
-            # If profile provides explicit range, we should arguably prioritize it,
-            # but usually defaults are broader. Let's enforce profile range if set.
             dconf["fmin"] = float(profile.fmin)
             dconf["fmax"] = float(profile.fmax)
 
         melody_filter_eff["fmin_hz"] = float(profile.fmin)
         melody_filter_eff["fmax_hz"] = float(profile.fmax)
 
-        # Ensure recommended algo is enabled
         rec = (profile.recommended_algo or "").lower()
         if rec and rec != "none" and rec in detector_cfgs:
             detector_cfgs[rec]["enabled"] = True
 
-        # Map flat keys to structure
         if "yin_trough_threshold" in profile_special and "yin" in detector_cfgs:
-             detector_cfgs["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
-
+            detector_cfgs["yin"]["trough_threshold"] = float(profile_special["yin_trough_threshold"])
         if "yin_conf_threshold" in profile_special and "yin" in detector_cfgs:
-             detector_cfgs["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
-
+            detector_cfgs["yin"]["threshold"] = float(profile_special["yin_conf_threshold"])
         if "yin_frame_length" in profile_special and "yin" in detector_cfgs:
             detector_cfgs["yin"]["frame_length"] = int(profile_special["yin_frame_length"])
 
-        # Violin-style vibrato smoothing
         if "vibrato_smoothing_ms" in profile_special:
             ms = float(profile_special["vibrato_smoothing_ms"])
             frame_ms = 1000.0 * float(hop_length) / float(sr)
@@ -1805,8 +1634,6 @@ def extract_features(
             current = int(melody_filter_eff.get("median_window", 1) or 1)
             melody_filter_eff["median_window"] = max(current, win)
 
-    # Separation routing happens before harmonic masking/ISS so downstream
-    # detectors always see the requested stem layout.
     device = getattr(config, "device", "cpu")
     resolved_stems, separation_diag = _resolve_separation(
         stage_a_out,
@@ -1815,21 +1642,13 @@ def extract_features(
         routing_features=routing_features,
         resolved_transcription_mode=resolved_mode,
     )
-
-    # attach to decision_trace (schema-stable)
     try:
         decision_trace["separation"] = separation_diag
     except Exception:
         pass
 
-    # Patch OPT6: Apply active_stems filter
     whitelist = getattr(b_conf, "active_stems", None)
     if whitelist is not None:
-        # Keep 'mix' always or check if user excluded it? Usually we keep mix for fallback.
-        # But if whitelist is explicit, maybe we should respect it fully?
-        # Safe bet: always keep mix if it exists, filter others.
-        # Requirement says: "active_stems: Optional[List[str]] = None # e.g. ["bass", "vocals"]; None => all"
-
         filtered_stems = {}
         for sname, sobj in resolved_stems.items():
             if sname == "mix":
@@ -1838,16 +1657,14 @@ def extract_features(
                 filtered_stems[sname] = sobj
         resolved_stems = filtered_stems
 
-    # 1. Initialize Detectors based on Config
     detectors: Dict[str, BasePitchDetector] = {}
     for name, det_conf in detector_cfgs.items():
         det = _init_detector(name, det_conf, sr, hop_length)
         if det:
             detectors[name] = det
 
-    # Ensure baseline fallback if no detectors enabled/working
     if not detectors:
-        logger.warning("No detectors enabled or initialized in Stage B. Falling back to default YIN/ACF.")
+        logger.warning("No detectors enabled or initialized in Stage B. Falling back to default YIN.")
         detectors["yin"] = YinDetector(sr, hop_length)
 
     stem_timelines: Dict[str, List[FramePitch]] = {}
@@ -1856,19 +1673,25 @@ def extract_features(
     all_layers: List[np.ndarray] = []
     iss_total_layers = 0
 
-    # Polyphonic context detection
+    # debug containers (avoid locals() hacks)
+    stem_debug_curves: Dict[str, Any] = {}
+    layer_conf_summaries: Dict[str, Any] = {}
+    tuning_cents_by_stem: Dict[str, float] = {}
+
     polyphonic_context = _is_polyphonic(getattr(stage_a_out, "audio_type", None))
     skyline_mode = _resolve_polyphony_filter(config)
     tracker_cfg = getattr(b_conf, "voice_tracking", {}) or {}
 
-    # Optional harmonic masking to create synthetic melody/bass stems for synthetic material
+    # Harmonic masking config
+    sep_conf = getattr(b_conf, "separation", {}) or {}
+    harmonic_cfg = sep_conf.get("harmonic_masking", {}) or {}
+
     augmented_stems = dict(resolved_stems)
     harmonic_mask_applied = False
-    harmonic_cfg = b_conf.separation.get("harmonic_masking", {}) if hasattr(b_conf, "separation") else {}
-    if harmonic_cfg.get("enabled", False) and "mix" in augmented_stems:
+    if bool(harmonic_cfg.get("enabled", False)) and "mix" in augmented_stems:
         prior_det = detectors.get("swiftf0")
         if prior_det is None:
-            prior_conf = dict(b_conf.detectors.get("swiftf0", {}))
+            prior_conf = dict(getattr(b_conf, "detectors", {}).get("swiftf0", {}) or {})
             prior_conf["enabled"] = True
             prior_det = _init_detector("swiftf0", prior_conf, sr, hop_length)
         if prior_det is None:
@@ -1883,43 +1706,37 @@ def extract_features(
                 audio_path=stage_a_out.meta.audio_path,
             )
             augmented_stems.update(synthetic)
-            harmonic_mask_applied = bool(synthetic) or harmonic_cfg.get("enabled", False)
+            harmonic_mask_applied = bool(synthetic)
 
     stems_for_processing = augmented_stems
-    polyphonic_context = polyphonic_context or len(stems_for_processing) > 1 or b_conf.polyphonic_peeling.get("force_on_mix", False)
+    polyphonic_context = polyphonic_context or (len(stems_for_processing) > 1) or bool(getattr(b_conf, "polyphonic_peeling", {}).get("force_on_mix", False))
 
-    # 2. Process Stems
+    # Canonical n_frames aligned to framing logic (reduces mismatch churn)
     mix_stem_ref = stage_a_out.stems.get("mix") or next(iter(stage_a_out.stems.values()))
-    canonical_n_frames = int(np.ceil(len(mix_stem_ref.audio) / hop_length))
+    n_fft_ref = int(stage_a_out.meta.window_size or 2048)
+    frames_ref = _frame_audio(np.asarray(mix_stem_ref.audio, dtype=np.float32), n_fft_ref, hop_length)
+    canonical_n_frames = int(frames_ref.shape[0])
 
     for stem_name, stem in stems_for_processing.items():
-        audio = stem.audio
+        audio = np.asarray(stem.audio, dtype=np.float32).reshape(-1)
         per_detector[stem_name] = {}
 
-        # Patch D5: Ignore pitch for drums/percussion
         if profile_special.get("ignore_pitch", False):
             merged_f0 = np.zeros(canonical_n_frames, dtype=np.float32)
             merged_conf = np.zeros(canonical_n_frames, dtype=np.float32)
             stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         else:
-            stem_results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+            stem_results = {}
 
-            # Patch B4: Pre-LPF (distorted guitar) before detector predict
-            # We filter a copy of audio for detection, preserving original for other uses
             audio_in = audio
             pre_lpf_hz = float(profile_special.get("pre_lpf_hz", 0.0) or 0.0)
             if pre_lpf_hz > 0.0 and SCIPY_SIGNAL is not None:
-                audio_in = _butter_filter(np.asarray(audio, dtype=np.float32), sr, pre_lpf_hz, "low")
+                audio_in = _butter_filter(audio_in, sr, pre_lpf_hz, "low")
 
-            # Run all initialized detectors on this stem
             for name, det in detectors.items():
                 try:
-                    # Prepare audio for this detector
-                    audio_for_det = np.asarray(audio_in, dtype=np.float32)
+                    f0, conf = det.predict(audio_in, audio_path=stage_a_out.meta.audio_path)
 
-                    f0, conf = det.predict(audio_for_det, audio_path=stage_a_out.meta.audio_path)
-
-                    # B2: Apply stricter SwiftF0 confidence gate if configured
                     if name == "swiftf0":
                         thr = float(detector_cfgs.get("swiftf0", {}).get("confidence_threshold", 0.9))
                         conf = np.where(conf >= thr, conf, 0.0)
@@ -1930,8 +1747,6 @@ def extract_features(
                 except Exception as e:
                     logger.warning(f"Detector {name} failed on stem {stem_name}: {e}")
 
-        # Ensemble Merge with disagreement and SwiftF0 priority floor
-        # Check config for adaptive mode
         use_adaptive = getattr(b_conf, "ensemble_mode", "static") == "adaptive"
 
         if stem_results:
@@ -1943,23 +1758,10 @@ def extract_features(
                 adaptive_fusion=use_adaptive,
             )
         else:
-            merged_f0 = np.zeros(1, dtype=np.float32)
-            merged_conf = np.zeros(1, dtype=np.float32)
+            merged_f0 = np.zeros(canonical_n_frames, dtype=np.float32)
+            merged_conf = np.zeros(canonical_n_frames, dtype=np.float32)
 
-        # TP2 Fix: Pad/Trim merged outputs to canonical length before downstream processing
         if len(merged_f0) != canonical_n_frames:
-            if pipeline_logger:
-                pipeline_logger.log_event(
-                    "stage_b",
-                    "detector_output_len_mismatch",
-                    payload={
-                        "stem": stem_name,
-                        "expected": canonical_n_frames,
-                        "got": len(merged_f0),
-                        "action": "pad_or_trim"
-                    }
-                )
-
             if len(merged_f0) < canonical_n_frames:
                 pad_len = canonical_n_frames - len(merged_f0)
                 merged_f0 = np.pad(merged_f0, (0, pad_len), constant_values=0.0)
@@ -1968,16 +1770,22 @@ def extract_features(
                 merged_f0 = merged_f0[:canonical_n_frames]
                 merged_conf = merged_conf[:canonical_n_frames]
 
-        # B3: Global tuning offset
-        # Store tuning offset in diagnostics per stem or for the first significant stem
-        tuning_cents = 0.0
-        # For simplicity and requirement, compute for current stem (merged_f0)
-        # We'll store it in diagnostics later
         tuning_cents = _estimate_global_tuning_cents(merged_f0)
+        tuning_cents_by_stem[stem_name] = float(tuning_cents)
 
-        # Polyphonic peeling (ISS) – optional and gated by config + context
+        # RMS aligned to canonical length
+        n_fft = int(stage_a_out.meta.window_size or 2048)
+        frames = _frame_audio(audio, n_fft, hop_length)
+        rms_vals = np.sqrt(np.mean(frames ** 2, axis=1)).astype(np.float32)
+        if len(rms_vals) < canonical_n_frames:
+            rms_vals = np.pad(rms_vals, (0, canonical_n_frames - len(rms_vals)))
+        elif len(rms_vals) > canonical_n_frames:
+            rms_vals = rms_vals[:canonical_n_frames]
+
+        # ISS peeling (FIXED: correct call signature / indentation)
         iss_layers: List[Tuple[np.ndarray, np.ndarray]] = []
-        if polyphonic_context and b_conf.polyphonic_peeling.get("max_layers", 0) > 0:
+        poly_peel = getattr(b_conf, "polyphonic_peeling", {}) or {}
+        if polyphonic_context and int(poly_peel.get("max_layers", 0) or 0) > 0:
             primary = detectors.get("swiftf0") or detectors.get("yin") or detectors.get("sacf")
             validator = detectors.get("sacf") or detectors.get("yin")
             if primary:
@@ -1987,48 +1795,37 @@ def extract_features(
                         sr,
                         primary_detector=primary,
                         validator_detector=validator,
-                        max_polyphony=b_conf.polyphonic_peeling.get("max_layers", 4),
-                        mask_width=b_conf.polyphonic_peeling.get("mask_width", 0.03),
-                        min_mask_width=b_conf.polyphonic_peeling.get("min_mask_width", 0.02),
-                        max_mask_width=b_conf.polyphonic_peeling.get("max_mask_width", 0.08),
-                        mask_growth=b_conf.polyphonic_peeling.get("mask_growth", 1.1),
-                        mask_shrink=b_conf.polyphonic_peeling.get("mask_shrink", 0.9),
-                        harmonic_snr_stop_db=b_conf.polyphonic_peeling.get("harmonic_snr_stop_db", 3.0),
-                        residual_rms_stop_ratio=b_conf.polyphonic_peeling.get("residual_rms_stop_ratio", 0.08),
-                        residual_flatness_stop=b_conf.polyphonic_peeling.get("residual_flatness_stop", 0.45),
-                        validator_cents_tolerance=b_conf.polyphonic_peeling.get("validator_cents_tolerance", b_conf.pitch_disagreement_cents),
-                        validator_agree_window=b_conf.polyphonic_peeling.get("validator_agree_window", 5),
-                        validator_disagree_decay=b_conf.polyphonic_peeling.get("validator_disagree_decay", 0.6),
-                        validator_min_agree_frames=b_conf.polyphonic_peeling.get("validator_min_agree_frames", 2),
-                        validator_min_disagree_frames=b_conf.polyphonic_peeling.get("validator_min_disagree_frames", 2),
-                        max_harmonics=b_conf.polyphonic_peeling.get("max_harmonics", 12),
+                        max_polyphony=int(poly_peel.get("max_layers", 4)),
+                        mask_width=float(poly_peel.get("mask_width", 0.03)),
+                        min_mask_width=float(poly_peel.get("min_mask_width", 0.02)),
+                        max_mask_width=float(poly_peel.get("max_mask_width", 0.08)),
+                        mask_growth=float(poly_peel.get("mask_growth", 1.1)),
+                        mask_shrink=float(poly_peel.get("mask_shrink", 0.9)),
+                        harmonic_snr_stop_db=float(poly_peel.get("harmonic_snr_stop_db", 3.0)),
+                        residual_rms_stop_ratio=float(poly_peel.get("residual_rms_stop_ratio", 0.08)),
+                        residual_flatness_stop=float(poly_peel.get("residual_flatness_stop", 0.45)),
+                        validator_cents_tolerance=float(poly_peel.get("validator_cents_tolerance", b_conf.pitch_disagreement_cents)),
+                        validator_agree_window=int(poly_peel.get("validator_agree_window", 5)),
+                        validator_disagree_decay=float(poly_peel.get("validator_disagree_decay", 0.6)),
+                        validator_min_agree_frames=int(poly_peel.get("validator_min_agree_frames", 2)),
+                        validator_min_disagree_frames=int(poly_peel.get("validator_min_disagree_frames", 2)),
+                        max_harmonics=int(poly_peel.get("max_harmonics", 12)),
                         audio_path=stage_a_out.meta.audio_path,
-                    iss_adaptive=b_conf.polyphonic_peeling.get("iss_adaptive", False),
-                    strength_min=b_conf.polyphonic_peeling.get("strength_min", 0.8),
-                    strength_max=b_conf.polyphonic_peeling.get("strength_max", 1.2),
-                    flatness_thresholds=b_conf.polyphonic_peeling.get("flatness_thresholds", [0.3, 0.6]),
-                    use_freq_aware_masks=bool(config.stage_b.polyphonic_peeling.get("use_freq_aware_masks", True)),
+                        iss_adaptive=bool(poly_peel.get("iss_adaptive", False)),
+                        strength_min=float(poly_peel.get("strength_min", 0.8)),
+                        strength_max=float(poly_peel.get("strength_max", 1.2)),
+                        flatness_thresholds=poly_peel.get("flatness_thresholds", [0.3, 0.6]),
+                        use_freq_aware_masks=bool(poly_peel.get("use_freq_aware_masks", True)),
                     )
-                    all_layers.extend([f0 for f0, _ in iss_layers])
+                    for f0_l, _c_l in iss_layers:
+                        all_layers.append(np.asarray(f0_l, dtype=np.float32))
                     iss_total_layers += len(iss_layers)
                 except Exception as e:
                     logger.warning(f"ISS peeling failed for stem {stem_name}: {e}")
 
-        # Calculate RMS (re-calculated here for final alignment, though ideally shared)
-        n_fft = stage_a_out.meta.window_size if stage_a_out.meta.window_size else 2048
-        frames = _frame_audio(audio, n_fft, hop_length)
-        rms_vals = np.sqrt(np.mean(frames**2, axis=1))
-
-        # Pad/Trim RMS to match dominant F0 (which is now canonical length)
-        if len(rms_vals) < len(merged_f0):
-            rms_vals = np.pad(rms_vals, (0, len(merged_f0) - len(rms_vals)))
-        elif len(rms_vals) > len(merged_f0):
-            rms_vals = rms_vals[:len(merged_f0)]
-
-        # Patch B3: Vectorized Transient Lockout (RMS-based)
+        # Transient lockout
         lockout_ms = float(profile_special.get("transient_lockout_ms", 0.0) or 0.0)
         onset_ratio_thr = float(profile_special.get("onset_ratio_thr", 2.5) or 2.5)
-
         lockout_frames = int(round((lockout_ms / 1000.0) * sr / max(hop_length, 1))) if lockout_ms > 0 else 0
 
         if lockout_frames > 0 and len(rms_vals) > 1:
@@ -2039,31 +1836,29 @@ def extract_features(
 
             onset_idx = np.where(rms_ratio >= onset_ratio_thr)[0]
             for idx in onset_idx:
-                lock_mask[idx : min(idx + lockout_frames, len(lock_mask))] = True
+                lock_mask[idx: min(idx + lockout_frames, len(lock_mask))] = True
 
-            # Apply mask to merged
             merged_conf = np.where(lock_mask, 0.0, merged_conf)
-            merged_f0   = np.where(lock_mask, 0.0, merged_f0)
+            merged_f0 = np.where(lock_mask, 0.0, merged_f0)
 
-            # Apply mask to ISS layers too
             masked_iss_layers = []
             for f0_l, c_l in iss_layers:
-                c_l = np.where(lock_mask[:len(c_l)], 0.0, c_l)
-                f0_l = np.where(c_l > 0.0, f0_l, 0.0)
-                masked_iss_layers.append((f0_l, c_l))
+                c_l2 = np.asarray(c_l, dtype=np.float32)
+                f0_l2 = np.asarray(f0_l, dtype=np.float32)
+                L = min(len(lock_mask), len(c_l2))
+                if L > 0:
+                    c_l2[:L] = np.where(lock_mask[:L], 0.0, c_l2[:L])
+                    f0_l2[:L] = np.where(c_l2[:L] > 0.0, f0_l2[:L], 0.0)
+                masked_iss_layers.append((f0_l2, c_l2))
             iss_layers = masked_iss_layers
 
-            # (Optional) Apply mask to per_detector tracks for consistent debugging
-            for det_name in per_detector[stem_name]:
-                 pf0, pconf = per_detector[stem_name][det_name]
-                 if len(pconf) == len(lock_mask):
-                     pconf = np.where(lock_mask, 0.0, pconf)
-                     pf0 = np.where(lock_mask, 0.0, pf0)
-                     per_detector[stem_name][det_name] = (pf0, pconf)
+            for det_name in list(per_detector[stem_name].keys()):
+                pf0, pconf = per_detector[stem_name][det_name]
+                if len(pconf) == len(lock_mask):
+                    pconf2 = np.where(lock_mask, 0.0, pconf)
+                    pf02 = np.where(lock_mask, 0.0, pf0)
+                    per_detector[stem_name][det_name] = (pf02, pconf2)
 
-
-        # Melody stabilization before skyline selection
-        # 4F: Use melody_filter_eff
         merged_f0, merged_conf = _apply_melody_filters(
             merged_f0,
             merged_conf,
@@ -2071,70 +1866,32 @@ def extract_features(
             melody_filter_eff,
         )
 
-        # Capture pre-smoothing (fused) F0 for debug artifacts
         fused_f0_debug = merged_f0.copy()
 
-        # Step 3: Viterbi Smoothing (Optional)
         use_viterbi_smoothing = getattr(b_conf, "smoothing_method", "tracker") == "viterbi"
         if use_viterbi_smoothing and np.any(merged_f0 > 0):
-             # Define state space: e.g. MIDI 21..108
-             midi_states = list(range(21, 109))
-             # Convert f0 to cents for viterbi
-             fused_cents = []
-             for f in merged_f0:
-                 if f > 0:
-                     fused_cents.append(1200.0 * math.log2(f/440.0) + 6900.0)
-                 else:
-                     fused_cents.append(float("nan"))
+            midi_states = list(range(21, 109))
+            fused_cents = []
+            for f in merged_f0:
+                if f > 0:
+                    fused_cents.append(1200.0 * math.log2(f / 440.0) + 6900.0)
+                else:
+                    fused_cents.append(float("nan"))
 
-             # Run Viterbi
-             # Note: merged_conf is used as confidence
-             smoothed_hz = viterbi_pitch(
-                 fused_cents,
-                 merged_conf,
-                 midi_states,
-                 transition_smoothness=getattr(b_conf, "viterbi_transition_smoothness", 0.5),
-                 jump_penalty=getattr(b_conf, "viterbi_jump_penalty", 0.6)
-             )
+            smoothed_hz = viterbi_pitch(
+                fused_cents,
+                merged_conf,
+                midi_states,
+                transition_smoothness=getattr(b_conf, "viterbi_transition_smoothness", 0.5),
+                jump_penalty=getattr(b_conf, "viterbi_jump_penalty", 0.6)
+            )
+            if len(smoothed_hz) == len(merged_f0):
+                merged_f0 = np.array(smoothed_hz, dtype=np.float32)
 
-             if len(smoothed_hz) == len(merged_f0):
-                 # Replace merged_f0 with smoothed (or blend?)
-                 # For now replace, but keep confidence?
-                 merged_f0 = np.array(smoothed_hz, dtype=np.float32)
-
-        # Build timeline with optional skyline selection from poly layers
-        voicing_thr_global = float(b_conf.confidence_voicing_threshold)
-
-        # Apply polyphonic relaxation (if any) to the GLOBAL gate only
-        # GUARD: Only apply this relaxation if we are truly in a polyphonic mode (AudioType check).
-        # This prevents monophonic paths (L0/L1) from using over-relaxed gates which can leak noise.
+        voicing_thr_global = float(getattr(b_conf, "confidence_voicing_threshold", 0.0) or 0.0)
         is_true_poly = _is_polyphonic(getattr(stage_a_out, "audio_type", None))
-
-        if is_true_poly:
-            poly_relax = float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0) or 0.0)
-        else:
-            poly_relax = 0.0
-
-        voicing_thr_effective = voicing_thr_global - poly_relax
-
-        # Melody filter threshold stays a *post-filter* knob (do not silently lower global gate)
-        melody_voiced_thr = float(melody_filter_eff.get("voiced_prob_threshold", voicing_thr_effective))
-
-        # Use voicing_thr_effective for deciding voiced/unvoiced frames
-        voicing_thr = voicing_thr_effective
-
-        # Record fused/smoothed curves for debugging
-        # We use fused_f0_debug (pre-smoothing) and merged_f0 (post-smoothing)
-        # Note: diagnostics is a local variable shadowing the outer one if we are not careful
-        # But here we just want to prepare data to put into the FINAL diagnostics object.
-        # We can store it in 'per_detector' temporarily? No, that's typed.
-        # Let's add it to a new field in StageBOutput if allowed, or put it in per_detector under reserved names.
-
-        # Actually, let's just use the 'diagnostics' dict that we construct at the end of the function.
-        # We need to persist these arrays outside this loop.
-        # Let's use a side-channel dict `stem_debug_curves`
-        if "stem_debug_curves" not in locals():
-            stem_debug_curves = {}
+        poly_relax = float(getattr(b_conf, "polyphonic_voicing_relaxation", 0.0) or 0.0) if is_true_poly else 0.0
+        voicing_thr = voicing_thr_global - poly_relax
 
         stem_debug_curves[stem_name] = {
             "fused_f0": _curve_summary(fused_f0_debug),
@@ -2142,9 +1899,10 @@ def extract_features(
         }
 
         layer_arrays = [(merged_f0, merged_conf)] + iss_layers
-        max_frames = max(len(arr[0]) for arr in layer_arrays)
+        max_frames = max(len(arr[0]) for arr in layer_arrays) if layer_arrays else canonical_n_frames
 
         def _pad_to(arr: np.ndarray, target: int) -> np.ndarray:
+            arr = np.asarray(arr, dtype=np.float32)
             if len(arr) < target:
                 return np.pad(arr, (0, target - len(arr)))
             return arr[:target]
@@ -2152,24 +1910,19 @@ def extract_features(
         padded_layers = [(_pad_to(f0, max_frames), _pad_to(conf, max_frames)) for f0, conf in layer_arrays]
         padded_rms = _pad_to(rms_vals, max_frames)
 
-        # ---- Optional CQT context for poly candidate gating (soft gate) ----
-        # Only do this for true poly (won't affect L0/L1).
         cqt_ctx = None
-        cqt_gate_enabled = bool(b_conf.polyphonic_peeling.get("cqt_gate_enabled", True))
+        cqt_gate_enabled = bool((getattr(b_conf, "polyphonic_peeling", {}) or {}).get("cqt_gate_enabled", True))
         if is_true_poly and polyphonic_context and cqt_gate_enabled:
             fmin_gate = float(melody_filter_eff.get("fmin_hz", 60.0) or 60.0)
             fmax_gate = float(melody_filter_eff.get("fmax_hz", 2200.0) or 2200.0)
-            cqt_ctx = _maybe_compute_cqt_ctx(audio, sr, hop_length, fmin=fmin_gate, fmax=fmax_gate,
-                                             bins_per_octave=int(b_conf.polyphonic_peeling.get("cqt_bins_per_octave", 36)))
+            cqt_ctx = _maybe_compute_cqt_ctx(
+                audio, sr, hop_length,
+                fmin=fmin_gate, fmax=fmax_gate,
+                bins_per_octave=int((getattr(b_conf, "polyphonic_peeling", {}) or {}).get("cqt_bins_per_octave", 36)),
+            )
 
-        # Capture summaries of layer confidences for diagnostics
-        if "layer_conf_summaries" not in locals():
-            layer_conf_summaries = {}
         try:
-            # summaries only, not full arrays
-            layer_conf_summaries[stem_name] = [
-                _curve_summary(conf_arr) for (_, conf_arr) in padded_layers
-            ]
+            layer_conf_summaries[stem_name] = [_curve_summary(conf_arr) for (_, conf_arr) in padded_layers]
         except Exception:
             pass
 
@@ -2186,11 +1939,12 @@ def extract_features(
         track_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         track_conf_buffers = [np.zeros(max_frames, dtype=np.float32) for _ in range(tracker.max_tracks)]
         primary_track = np.zeros(max_frames, dtype=np.float32)
-        # GUARD: Do not use top_voice logic for Monophonic files (L0/L1) even if polyphonic_context=True
-        select_top_voice = is_true_poly and polyphonic_context and "top_voice" in str(skyline_mode)
 
-        # B3: Apply tuning offset during MIDI conversion
-        tuning_semitones = tuning_cents / 100.0
+        select_top_voice = is_true_poly and polyphonic_context and "top_voice" in str(skyline_mode)
+        tuning_semitones = float(tuning_cents) / 100.0
+
+        poly_peel2 = getattr(b_conf, "polyphonic_peeling", {}) or {}
+        max_cands = int(poly_peel2.get("max_candidates_per_frame", tracker.max_tracks))
 
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
@@ -2200,22 +1954,18 @@ def extract_features(
                 if f > 0.0 and c >= voicing_thr:
                     candidates.append((f, c))
 
-            # ---- cleanup: CQT soft gate + dedupe + octave-harmonic suppression + cap ----
-            # Cap tied to tracker capacity (prevents active_pitches explosion)
-            max_cands = int(b_conf.polyphonic_peeling.get("max_candidates_per_frame", tracker.max_tracks))
             candidates = _postprocess_candidates(
                 candidates=candidates,
                 frame_idx=i,
                 cqt_ctx=cqt_ctx,
                 max_candidates=max_cands,
-                dup_cents=float(b_conf.polyphonic_peeling.get("dup_cents", 35.0)),
-                octave_cents=float(b_conf.polyphonic_peeling.get("octave_cents", 35.0)),
-                cqt_gate_mul=float(b_conf.polyphonic_peeling.get("cqt_gate_mul", 0.25)),
-                cqt_support_ratio=float(b_conf.polyphonic_peeling.get("cqt_support_ratio", 2.0)),
-                harmonic_drop_ratio=float(b_conf.polyphonic_peeling.get("harmonic_drop_ratio", 0.75)),
+                dup_cents=float(poly_peel2.get("dup_cents", 35.0)),
+                octave_cents=float(poly_peel2.get("octave_cents", 35.0)),
+                cqt_gate_mul=float(poly_peel2.get("cqt_gate_mul", 0.25)),
+                cqt_support_ratio=float(poly_peel2.get("cqt_support_ratio", 2.0)),
+                harmonic_drop_ratio=float(poly_peel2.get("harmonic_drop_ratio", 0.75)),
             )
 
-            # Preserve raw detector/layer candidates for skyline selection in Stage C
             active_candidates = list(candidates)
 
             tracked_pitches, tracked_confs = tracker.step(candidates)
@@ -2225,40 +1975,27 @@ def extract_features(
 
             primary_idx = 0
             if select_top_voice and tracked_pitches.size:
-                # Fix L5 failure mode: Select by confidence, not highest pitch
-                # Improved: Argmax of (conf - jump_penalty) to maintain continuity
-                prev_p = primary_track[i-1] if i > 0 else 0.0
-
+                prev_p = primary_track[i - 1] if i > 0 else 0.0
                 best_score = -999.0
                 best_idx = 0
                 found_valid = False
 
                 for idx in range(len(tracked_confs)):
-                    p = tracked_pitches[idx]
-                    c = tracked_confs[idx]
-
+                    p = float(tracked_pitches[idx])
+                    c = float(tracked_confs[idx])
                     if p <= 0.0:
                         continue
-
                     found_valid = True
-                    score = float(c)
-
-                    # Apply penalty for jumps from previous frame's selected pitch
+                    score = c
                     if prev_p > 0.0:
-                         cents = abs(1200.0 * np.log2(p / prev_p))
-                         # Penalty: 0.0005 per cent -> 0.05 per semitone
-                         # Reduced from 0.001 to strictly punish octave jumps but allow melodic steps
-                         penalty = cents * 0.0005
-                         score -= penalty
-
+                        cents = abs(1200.0 * np.log2(p / prev_p))
+                        score -= cents * 0.0005
                     if score > best_score:
                         best_score = score
                         best_idx = idx
 
                 if found_valid:
                     primary_idx = best_idx
-                else:
-                    primary_idx = 0
 
             chosen_pitch = float(tracked_pitches[primary_idx]) if tracked_pitches.size else 0.0
             chosen_conf = float(tracked_confs[primary_idx]) if tracked_confs.size else 0.0
@@ -2266,18 +2003,10 @@ def extract_features(
 
             midi = None
             if chosen_pitch > 0.0:
-                # Apply global tuning correction
                 midi_float = 69.0 + 12.0 * np.log2(chosen_pitch / 440.0)
                 midi = int(round(midi_float - tuning_semitones))
 
-            # Use the raw candidates (pre-tracking) to expose all available pitches
-            # to downstream skyline selection instead of only the tracked voices.
             active = [(float(p), float(c)) for (p, c) in active_candidates if p > 0.0]
-
-            # Step 5 prep: Calculate Onset Strength for this frame/stem?
-            # Ideally compute global onset strength once per stem and attach to FramePitch
-            # We don't have it here yet. We can do it in Stage C or compute here.
-            # Let's leave it to Stage C or future.
 
             timeline.append(
                 FramePitch(
@@ -2290,32 +2019,12 @@ def extract_features(
                 )
             )
 
-        if timeline:
-            tail_window = 0.35
-            last_pitch = next((fp.pitch_hz for fp in reversed(timeline) if fp.pitch_hz > 0.0), 0.0)
-            if last_pitch > 0.0:
-                midi_float = 69.0 + 12.0 * np.log2(last_pitch / 440.0)
-                last_midi = int(round(midi_float - tuning_semitones))
-                tail_start = timeline[-1].time - tail_window
-                for fp in reversed(timeline):
-                    if fp.time < tail_start:
-                        break
-                    if fp.pitch_hz <= 0.0:
-                        fp.pitch_hz = last_pitch
-                        fp.midi = last_midi
-                        fp.confidence = max(fp.confidence, voicing_thr)
-
         stem_timelines[stem_name] = timeline
 
-        if not any(fp.pitch_hz > 0.0 for fp in timeline) and np.any(merged_f0 > 0):
-            stem_timelines[stem_name] = _arrays_to_timeline(merged_f0, merged_conf, rms_vals, sr, hop_length)
-
-        # Keep secondary voices as separate layers to aid downstream segmentation/rendering
         for alt in track_buffers[1:]:
             if np.count_nonzero(alt) > 0:
                 all_layers.append(alt)
 
-        # Set main f0 (prefer vocals, then mix)
         main_track = primary_track if select_top_voice else track_buffers[0]
         if stem_name == "vocals":
             f0_main = main_track
@@ -2333,49 +2042,40 @@ def extract_features(
     if len(f0_main) > 0:
         time_grid = np.arange(len(f0_main)) * hop_length / sr
 
-    # Populate diagnostics with tuning_cents (using the last calculated one if multiple stems, or default)
-    # Ideally should be per-stem or mix.
-    # The requirement says "store it in diagnostics".
-    tuning_cents_val = locals().get("tuning_cents", 0.0)
-
-    # Retrieve debug curves if any
-    stem_debug_curves = locals().get("stem_debug_curves", {})
-
-    # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
-        "transcription_mode": resolved_mode,  # Task 2.4: Explicit mode
+        "transcription_mode": resolved_mode,
         "stage_b_mode": "classic",
         "instrument": str(instrument),
         "profile": profile.instrument if profile else None,
         "profile_applied": bool(profile_applied),
-        "profile_special": dict(profile.special) if profile else {},
+        "profile_special": dict(getattr(profile, "special", {}) or {}) if profile else {},
         "polyphonic_context": bool(polyphonic_context),
         "detectors_initialized": list(detectors.keys()),
         "separation": separation_diag,
         "harmonic_masking": {
-            "enabled": harmonic_cfg.get("enabled", False),
-            "applied": harmonic_mask_applied,
+            "enabled": bool(harmonic_cfg.get("enabled", False)),
+            "applied": bool(harmonic_mask_applied),
             "mask_width": harmonic_cfg.get("mask_width"),
             "n_harmonics": harmonic_cfg.get("n_harmonics"),
         },
         "iss": {
-            "enabled": polyphonic_context and b_conf.polyphonic_peeling.get("max_layers", 0) > 0,
-            "layers_found": iss_total_layers,
-            "max_layers": b_conf.polyphonic_peeling.get("max_layers", 0),
+            "enabled": bool(polyphonic_context and int((getattr(b_conf, "polyphonic_peeling", {}) or {}).get("max_layers", 0) or 0) > 0),
+            "layers_found": int(iss_total_layers),
+            "max_layers": int((getattr(b_conf, "polyphonic_peeling", {}) or {}).get("max_layers", 0) or 0),
         },
         "cqt_gate": {
-            "requested": cqt_gate_enabled,
-            "active": cqt_ctx is not None,
-            "librosa_available": _module_available("librosa"),
+            "requested": bool(cqt_gate_enabled),
+            "active": bool(cqt_ctx is not None),
+            "librosa_available": bool(_module_available("librosa")),
         },
         "skyline_mode": skyline_mode,
         "voice_tracking": {
             "max_alt_voices": int(tracker_cfg.get("max_alt_voices", 4) if polyphonic_context else 0),
             "max_jump_cents": tracker_cfg.get("max_jump_cents", 150.0),
         },
-        "global_tuning_cents": tuning_cents_val,
+        "global_tuning_cents_by_stem": tuning_cents_by_stem,
         "debug_curves": stem_debug_curves,
-        "layer_conf_summaries": locals().get("layer_conf_summaries", {}),
+        "layer_conf_summaries": layer_conf_summaries,
         "decision_trace": decision_trace,
     }
 
