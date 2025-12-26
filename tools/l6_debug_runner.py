@@ -16,15 +16,62 @@ import numpy as np
 import soundfile as sf
 import tempfile
 from typing import Dict, Any, List, Tuple, Optional
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 # Add repo root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# -------------------------------------------------------------------------
+# Monkey-Patching TranscriptionResult to fix TypeError/Signature Mismatch
+# -------------------------------------------------------------------------
+import backend.pipeline.models
+from backend.pipeline.models import AnalysisData
+
+# Define the patched class (supports 'midi' argument and tuple unpacking)
+@dataclass
+class PatchedTranscriptionResult:
+    musicxml: str
+    analysis_data: AnalysisData
+    midi: bytes = b""
+    midi_bytes: bytes = b"" # Legacy support field, not used in __init__ unless defaults
+
+    def __post_init__(self):
+        # Handle aliasing
+        if self.midi and not self.midi_bytes:
+            self.midi_bytes = self.midi
+        if self.midi_bytes and not self.midi:
+            self.midi = self.midi_bytes
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def __iter__(self):
+        return iter((self.musicxml, self.midi))
+
+# Force apply the patch to the models module
+backend.pipeline.models.TranscriptionResult = PatchedTranscriptionResult
+
+# NOW import transcribe. It will import models, but models is already loaded.
+# However, if transcribe does `from .models import TranscriptionResult`, it might grab the OLD one
+# if the module was already cached before we patched it?
+# To be safe, we also check if transcribe is loaded and patch it there.
+import backend.pipeline.transcribe
+backend.pipeline.transcribe.TranscriptionResult = PatchedTranscriptionResult
+
+# Also patch stage_d if it imported it
+import backend.pipeline.stage_d
+backend.pipeline.stage_d.TranscriptionResult = PatchedTranscriptionResult
+
+# -------------------------------------------------------------------------
+
 from backend.pipeline.config import PipelineConfig
-from backend.pipeline.models import AudioType, AnalysisData, NoteEvent
+from backend.pipeline.models import AudioType, NoteEvent
+from backend.pipeline.transcribe import transcribe
 from backend.benchmarks.benchmark_runner import (
-    run_pipeline_on_audio,
+    BenchmarkSuite,
     create_pop_song_base
 )
 from backend.benchmarks.ladder.synth import midi_to_wav_synth
@@ -34,92 +81,58 @@ from backend.benchmarks.metrics import (
     compute_symptom_metrics
 )
 
-import music21
-from music21 import tempo, chord
+# Setup logging with FileHandler
+def setup_logging(reports_dir: str):
+    log_path = os.path.join(reports_dir, "bench_run.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    return logging.getLogger("l6_debug_runner")
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logger = logging.getLogger("l6_debug_runner")
-
+logger = None  # Will be initialized in main
 
 def setup_reports_dir(reports_dir: str):
     os.makedirs(reports_dir, exist_ok=True)
     os.makedirs(os.path.join(reports_dir, "snapshots"), exist_ok=True)
     return reports_dir
 
-
 def save_json(path: str, data: Any):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
 
-
-def score_to_gt(score, parts: Optional[List[str]] = None) -> List[Tuple[int, float, float]]:
-    """
-    Convert a music21 score to GT tuples.
-    If parts is provided, only those parts (by partName/id) are used.
-    """
-    tempo_marks = score.flatten().getElementsByClass(tempo.MetronomeMark)
-    bpm = float(tempo_marks[0].number) if tempo_marks else 100.0
-    sec_per_quarter = 60.0 / bpm if bpm else 0.6
-
-    # Select stream to read from
-    if parts:
-        selected_parts = []
-        for p in getattr(score, "parts", []):
-            pname = getattr(p, "partName", None)
-            pid = getattr(p, "id", None)
-            if (pname in parts) or (pid in parts):
-                selected_parts.append(p)
-        if selected_parts:
-            stream_to_read = music21.stream.Stream(selected_parts)
-        else:
-            stream_to_read = score
-
-    gt: List[Tuple[int, float, float]] = []
-    for el in stream_to_read.flatten().notes:
-        start = float(el.offset) * sec_per_quarter
-        dur = float(el.quarterLength) * sec_per_quarter
-        end = start + dur
-
-        if isinstance(el, chord.Chord):
-            for p in el.pitches:
-                gt.append((int(p.midi), start, end))
-        else:
-            gt.append((int(el.pitch.midi), start, end))
-
-    return gt
-
-
-def generate_l6_audio_and_gt(duration_sec: float = 15.0) -> Tuple[np.ndarray, int, List[Tuple[int, float, float]]]:
-    """Generates the synthetic pop song audio and ground truth."""
+def generate_l6_audio_and_gt(duration_sec: float = 15.0) -> Tuple[str, List[Tuple[int, float, float]]]:
+    """Generates the synthetic pop song audio (saved to temp file) and ground truth."""
     sr = 22050
     tempo_bpm = 110
 
     logger.info(f"Generating L6 synthetic pop song score ({duration_sec}s)...")
     score = create_pop_song_base(duration_sec=duration_sec, tempo_bpm=tempo_bpm, seed=0)
 
-    # Ground truth (Lead melody only for L6)
-    gt = score_to_gt(score, parts=["Lead"])
+    # Ground truth (Lead melody only for L6) - reusing BenchmarkSuite static method
+    gt = BenchmarkSuite._score_to_gt(score, parts=["Lead"])
     logger.info(f"Generated GT with {len(gt)} notes (Lead part).")
     if gt:
         logger.info(f"GT Sample: {gt[:3]}")
 
     logger.info("Synthesizing audio...")
-    wav_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = tmp.name
-        midi_to_wav_synth(score, wav_path, sr=sr)
-        audio, read_sr = sf.read(wav_path)
-    finally:
-        if wav_path and os.path.exists(wav_path):
-            os.remove(wav_path)
+    wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(wav_fd)
 
-    if audio.ndim > 1:
-        audio = np.mean(audio, axis=1)
+    # Synth to the path
+    midi_to_wav_synth(score, wav_path, sr=sr)
 
-    return audio.astype(np.float32), int(read_sr), gt
+    # Ensure Mono
+    data, read_sr = sf.read(wav_path)
+    if data.ndim > 1:
+        data = np.mean(data, axis=1)
+        sf.write(wav_path, data, read_sr)
 
+    return wav_path, gt
 
 def get_l6_baseline_config() -> PipelineConfig:
     config = PipelineConfig()
@@ -128,12 +141,13 @@ def get_l6_baseline_config() -> PipelineConfig:
 
     # Encourage melody tracking in a poly mix
     config.stage_b.melody_filtering.update({"fmin_hz": 180.0, "fmax_hz": 1600.0, "voiced_prob_threshold": 0.40})
+
+    # Ensure robust detectors are enabled
     for det in ["rmvpe", "crepe", "swiftf0", "yin"]:
         if det in config.stage_b.detectors:
             config.stage_b.detectors[det]["enabled"] = True
 
     return config
-
 
 def calculate_metrics(pred_notes: List[NoteEvent], gt: List[Tuple[int, float, float]], duration_sec: float) -> Dict[str, Any]:
     pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in pred_notes]
@@ -142,8 +156,6 @@ def calculate_metrics(pred_notes: List[NoteEvent], gt: List[Tuple[int, float, fl
     onset_mae, _ = onset_offset_mae(pred_list, gt)
     symptoms = compute_symptom_metrics(pred_list)
 
-    # Calculate voiced ratio from notes if timeline not available/processed here
-    # (Approximation based on duration coverage)
     total_note_dur = sum(max(0, min(duration_sec, end) - max(0, start)) for _, start, end in pred_list)
     voiced_ratio = total_note_dur / max(1e-6, duration_sec)
 
@@ -160,77 +172,82 @@ def calculate_metrics(pred_notes: List[NoteEvent], gt: List[Tuple[int, float, fl
         "notes_per_sec": len(pred_list) / max(1e-6, duration_sec)
     }
 
+def _set_config_val(config: Any, path: str, value: Any):
+    """Robust setter for nested config objects/dicts."""
+    parts = path.split(".")
+    curr = config
+    for i, part in enumerate(parts[:-1]):
+        if isinstance(curr, dict):
+            if part not in curr:
+                curr[part] = {} # Auto-vivify dicts
+            curr = curr[part]
+        elif hasattr(curr, part):
+            val = getattr(curr, part)
+            if val is None:
+                setattr(curr, part, {})
+                curr = getattr(curr, part)
+            else:
+                curr = val
+        else:
+            try:
+                curr[part] = {}
+                curr = curr[part]
+            except:
+                logger.warning(f"Could not traverse config path {path} at {part}")
+                return
+
+    last = parts[-1]
+    if isinstance(curr, dict):
+        curr[last] = value
+    elif hasattr(curr, last):
+        setattr(curr, last, value)
+    else:
+        try:
+            curr[last] = value
+        except:
+            logger.warning(f"Could not set config path {path} at {last}")
 
 def run_sweep(
-    audio: np.ndarray,
-    sr: int,
+    wav_path: str,
     gt: List[Tuple[int, float, float]],
     base_config: PipelineConfig,
     reports_dir: str,
     duration_sec: float
 ) -> List[Dict[str, Any]]:
 
-    logger.info("Starting Mini Threshold Sweep (Optimized)...")
+    logger.info("Starting Mini Threshold Sweep...")
 
-    # Reduced sweep parameters to avoid timeouts
     sweeps = []
-    # 1. max_gap_ms: Baseline is 100? Let's try tighter.
-    sweeps.append(({"stage_c": {"post_merge": {"max_gap_ms": 60}}}, "max_gap_ms=60"))
-
-    # 2. chord_onset_snap_ms: Baseline 25.
-    sweeps.append(({"stage_c": {"chord_onset_snap_ms": 35}}, "chord_snap_ms=35"))
-
-    # 3. quality_gate.threshold: Baseline None/0.45.
-    sweeps.append(({"quality_gate": {"threshold": 0.45}}, "qgate_thr=0.45"))
+    # Reduced to minimal set to avoid timeout
+    for val in [60]:
+        sweeps.append(("stage_c.post_merge.max_gap_ms", val))
+    for val in [25]:
+        sweeps.append(("stage_c.chord_onset_snap_ms", val))
+    for val in [0.45]:
+        sweeps.append(("quality_gate.threshold", val))
 
     results = []
 
-    for overrides, label in sweeps:
+    for path, val in sweeps:
+        label = f"{path}={val}"
         logger.info(f"Sweep: {label}")
-        sys.stdout.flush()
 
         cfg = copy.deepcopy(base_config)
-
-        # Apply overrides
-        if "post_merge" in overrides.get("stage_c", {}):
-             val = overrides["stage_c"]["post_merge"]["max_gap_ms"]
-             if not hasattr(cfg.stage_c, "post_merge") or cfg.stage_c.post_merge is None:
-                 cfg.stage_c.post_merge = {}
-             if isinstance(cfg.stage_c.post_merge, dict):
-                 cfg.stage_c.post_merge["max_gap_ms"] = val
-             else:
-                 try: setattr(cfg.stage_c.post_merge, "max_gap_ms", val)
-                 except: pass
-
-        if "chord_onset_snap_ms" in overrides.get("stage_c", {}):
-            cfg.stage_c.chord_onset_snap_ms = overrides["stage_c"]["chord_onset_snap_ms"]
-
-        if "quality_gate" in overrides:
-            val = overrides["quality_gate"]["threshold"]
-            if hasattr(cfg, "quality_gate"):
-                 if isinstance(cfg.quality_gate, dict):
-                     cfg.quality_gate["threshold"] = val
-                 else:
-                     try: setattr(cfg.quality_gate, "threshold", val)
-                     except: pass
-            else:
-                 cfg.quality_gate = {"threshold": val}
+        _set_config_val(cfg, path, val)
 
         try:
-            res = run_pipeline_on_audio(
-                audio, sr, cfg, AudioType.POLYPHONIC_DOMINANT, allow_separation=False
-            )
+            res = transcribe(wav_path, config=cfg)
+            notes = res.analysis_data.notes
+            metrics = calculate_metrics(notes, gt, duration_sec)
 
-            metrics = calculate_metrics(res["notes"], gt, duration_sec)
-
-            analysis_diag = getattr(res.get("analysis_data"), "diagnostics", {}) or {}
+            analysis_diag = getattr(res.analysis_data, "diagnostics", {}) or {}
             qgate = analysis_diag.get("quality_gate", {})
             selected_id = qgate.get("selected_candidate_id", "unknown")
 
-            stage_b_diag = getattr(res.get("stage_b_out"), "diagnostics", {}) or {}
             resolved_mode = "unknown"
-            if "decision_trace" in stage_b_diag:
-                 resolved_mode = stage_b_diag["decision_trace"].get("resolved", {}).get("transcription_mode", "unknown")
+            dt = analysis_diag.get("decision_trace", {})
+            if dt:
+                resolved_mode = dt.get("resolved", {}).get("transcription_mode", "unknown")
 
             results.append({
                 "run_label": label,
@@ -251,68 +268,37 @@ def run_sweep(
     save_json(sweep_path, results)
     return results
 
-
 def write_gate_matrix(run_info: Dict[str, Any], path: str):
     """Generates reports/l6_gate_matrix.json from run info."""
 
-    diags = run_info.get("diagnostics", {}) # Stage B diagnostics
-    analysis_diags = run_info.get("analysis_diagnostics", {})
+    stage_b_diag = run_info.get("diagnostics", {}) or {}
+    analysis_diag = run_info.get("analysis_diagnostics", {}) or {}
 
-    decision_trace = diags.get("decision_trace", {})
-    if not decision_trace:
-         decision_trace = analysis_diags.get("decision_trace", {})
+    decision_trace = stage_b_diag.get("decision_trace") or analysis_diag.get("decision_trace") or {}
+    sep = decision_trace.get("separation", {}) or {}
 
-    q_gate = analysis_diags.get("quality_gate", {})
-    stage_c_post = analysis_diags.get("stage_c_post", {})
-    separation = diags.get("separation", {})
+    q_gate = analysis_diag.get("quality_gate", {}) or {}
+    stage_c_post = analysis_diag.get("stage_c_post", {}) or {}
 
     gate_matrix = {
-        "Stage B routing gates": {
-            "requested": {
-                "mode": decision_trace.get("requested", {}).get("mode"),
-                "profile": decision_trace.get("requested", {}).get("profile"),
-                "separation_mode": decision_trace.get("requested", {}).get("separation_mode"),
-            },
-            "resolved": {
-                "mode": decision_trace.get("resolved", {}).get("transcription_mode"),
-                "profile": decision_trace.get("resolved", {}).get("profile"),
-                "separation_mode": decision_trace.get("resolved", {}).get("separation_mode"),
-                "audio_type": decision_trace.get("resolved", {}).get("audio_type"),
-            },
-            "routing_features": decision_trace.get("features", {}),
+        "stage_b_routing": {
+            "requested": decision_trace.get("requested", {}),
+            "resolved": decision_trace.get("resolved", {}),
+            "routing_features": decision_trace.get("routing_features", {}),
             "rule_hits": decision_trace.get("rule_hits", []),
         },
-        "Separation gates": {
-            "ran": separation.get("ran", False),
-            "backend": separation.get("backend", "none"),
-            "skip_reasons": separation.get("skip_reasons", []),
-            "gates": {
-                "min_duration_sec": separation.get("gates", {}).get("min_duration_sec"),
-                "min_mixture_score": separation.get("gates", {}).get("min_mixture_score"),
-                "bypass_if_synthetic_like": separation.get("gates", {}).get("bypass_if_synthetic_like"),
-            },
-            "outputs": {
-                "stems": list(separation.get("stems", {}).keys()),
-                "selected_primary_stem": analysis_diags.get("stage_c", {}).get("selected_stem"),
-            }
+        "separation": {
+            "ran": sep.get("ran", False),
+            "backend": sep.get("backend", "none"),
+            "skip_reasons": sep.get("skip_reasons", []),
+            "gates": sep.get("gates", {}),
+            "outputs": sep.get("outputs", {}),
         },
-        "Quality gate": {
-            "enabled": q_gate.get("enabled"),
-            "threshold": q_gate.get("threshold"),
-            "all_candidates": q_gate.get("candidates", []),
-            "selected_candidate_id": q_gate.get("selected_candidate_id"),
-            "fallbacks_triggered": q_gate.get("fallbacks_triggered", [])
-        },
-        "Stage C post": {
-            "gap_merges": stage_c_post.get("gap_merges"),
-            "chord_snaps": stage_c_post.get("chord_snaps"),
-            "snap_tol_ms": stage_c_post.get("snap_tol_ms"),
-            "merge_gap_ms": stage_c_post.get("merge_gap_ms")
-        }
+        "quality_gate": q_gate,
+        "stage_c_post": stage_c_post,
     }
 
     save_json(path, gate_matrix)
-
 
 def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], path: str):
     """Generates reports/l6_accuracy_report.md"""
@@ -335,7 +321,6 @@ def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], 
     lines.append("## 2) Failure Mode Diagnosis")
     lines.append("")
 
-    # Simple heuristics
     modes = []
     nc = metrics.get('note_count', 0)
     vr = metrics.get('voiced_ratio', 0.0)
@@ -368,7 +353,6 @@ def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], 
     lines.append("| Knob | Current Value | L6 Observed Value | Judgment | Recommendation |")
     lines.append("|---|---|---|---|---|")
 
-    # Helper to extract vals
     def safe_get(d, keys, default="N/A"):
         v = d
         for k in keys:
@@ -376,8 +360,7 @@ def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], 
             else: return default
         return v if v is not {} else default
 
-    # Stage B
-    routing_feats = safe_get(gate_matrix, ["Stage B routing gates", "routing_features"], {})
+    routing_feats = safe_get(gate_matrix, ["stage_b_routing", "routing_features"], {})
 
     dense_poly = routing_feats.get("dense_polyphony_score", "N/A")
     lines.append(f"| dense_poly_threshold | Config Dependent | {dense_poly} | - | Check routing rules if poly mode failed |")
@@ -385,26 +368,22 @@ def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], 
     mix_score = routing_feats.get("mixture_score", "N/A")
     lines.append(f"| mixture_score | Config Dependent | {mix_score} | - | Adjust if separation skipped unexpectedly |")
 
-    # Separation
-    sep_gates = safe_get(gate_matrix, ["Separation gates", "gates"], {})
+    sep_gates = safe_get(gate_matrix, ["separation", "gates"], {})
     min_dur = sep_gates.get("min_duration_sec", "N/A")
     lines.append(f"| sep.min_duration_sec | {min_dur} | 60.0 | OK | Keep as is |")
 
-    # Quality
-    q_gate = safe_get(gate_matrix, ["Quality gate"], {})
+    q_gate = safe_get(gate_matrix, ["quality_gate"], {})
     thresh = q_gate.get("threshold", "N/A")
     sel_cand = q_gate.get("selected_candidate_id", "none")
-    # Find score of selected
     sel_score = "N/A"
-    for c in q_gate.get("all_candidates", []):
+    for c in q_gate.get("candidates", []):
         if c.get("candidate_id") == sel_cand:
             sel_score = c.get("score")
             break
 
     lines.append(f"| quality.threshold | {thresh} | Selected Score: {sel_score} | - | If score close to threshold, lower it |")
 
-    # Stage C
-    sc_post = safe_get(gate_matrix, ["Stage C post"], {})
+    sc_post = safe_get(gate_matrix, ["stage_c_post"], {})
     max_gap = sc_post.get("merge_gap_ms", "N/A")
     merges = sc_post.get("gap_merges", 0)
     lines.append(f"| post_merge.max_gap_ms | {max_gap} | Merges: {merges} | - | Increase if fragmentation high |")
@@ -416,9 +395,11 @@ def write_accuracy_report(metrics: Dict[str, Any], gate_matrix: Dict[str, Any], 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-
 def main():
     reports_dir = setup_reports_dir("reports")
+    global logger
+    logger = setup_logging(reports_dir)
+
     run_id = f"run_{int(time.time())}"
     snapshot_dir = os.path.join(reports_dir, "snapshots", run_id)
     os.makedirs(snapshot_dir, exist_ok=True)
@@ -426,86 +407,91 @@ def main():
     logger.info(f"Reports directory: {reports_dir}")
     logger.info(f"Snapshot directory: {snapshot_dir}")
 
-    # 1. Generate L6 Data (Reduced to 15s to fit in CPU timeout)
-    duration_sec = 15.0
-    audio, sr, gt = generate_l6_audio_and_gt(duration_sec=duration_sec)
+    # 1. Generate L6 Data (5s for debug speed and flush safety)
+    duration_sec = 5.0
+    wav_path, gt = generate_l6_audio_and_gt(duration_sec=duration_sec)
 
-    # 2. Baseline Run
+    # 2. Baseline Run with transcribe()
     logger.info("Running L6 Baseline...")
     config = get_l6_baseline_config()
 
-    # Execute Pipeline
-    res = run_pipeline_on_audio(
-        audio, sr, config, AudioType.POLYPHONIC_DOMINANT, allow_separation=False
-    )
+    try:
+        res = transcribe(wav_path, config=config)
 
-    # Calculate Metrics
-    metrics = calculate_metrics(res["notes"], gt, duration_sec)
-    metrics["level"] = "L6"
-    metrics["name"] = "synthetic_pop_song"
+        metrics = calculate_metrics(res.analysis_data.notes, gt, duration_sec)
+        metrics["level"] = "L6"
+        metrics["name"] = "synthetic_pop_song"
 
-    # Debug logging for F1=0
-    if metrics["note_f1"] == 0.0:
-        logger.warning("F1 is 0.0! Dumping top notes:")
-        if gt:
-            logger.warning(f"GT (first 5): {gt[:5]}")
-        else:
-            logger.warning("GT is empty!")
+        analysis_diag = getattr(res.analysis_data, "diagnostics", {}) or {}
+        stage_b_diag = {"decision_trace": analysis_diag.get("decision_trace", {})}
 
-        pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in res["notes"]]
-        if pred_list:
-            logger.warning(f"Pred (first 5): {pred_list[:5]}")
-        else:
-            logger.warning("Pred is empty!")
+        run_info = {
+            "level": "L6",
+            "name": "synthetic_pop_song",
+            "metrics": metrics,
+            "config": asdict(config),
+            "diagnostics": stage_b_diag,
+            "analysis_diagnostics": analysis_diag,
+        }
 
-    # Extract RICH diagnostics
-    stage_b_out = res.get("stage_b_out")
-    analysis_data = res.get("analysis_data")
+        base_name = "L6_synthetic_pop_song"
+        save_json(os.path.join(snapshot_dir, f"{base_name}_metrics.json"), metrics)
+        save_json(os.path.join(snapshot_dir, f"{base_name}_run_info.json"), run_info)
 
-    stage_b_diag = getattr(stage_b_out, "diagnostics", {}) if stage_b_out else {}
-    analysis_diag = getattr(analysis_data, "diagnostics", {}) if analysis_data else {}
+        gate_matrix_path = os.path.join(reports_dir, "l6_gate_matrix.json")
+        write_gate_matrix(run_info, gate_matrix_path)
 
-    # Construct Full Run Info
-    run_info = {
-        "level": "L6",
-        "name": "synthetic_pop_song",
-        "metrics": metrics,
-        "config": asdict(res["resolved_config"]),
-        "diagnostics": stage_b_diag,          # Stage B diagnostics
-        "analysis_diagnostics": analysis_diag, # Stage C / Quality Gate diagnostics
-    }
+        acc_report_path = os.path.join(reports_dir, "l6_accuracy_report.md")
+        gm = json.load(open(gate_matrix_path))
+        write_accuracy_report(metrics, gm, acc_report_path)
 
-    # Save Baseline Artifacts
-    base_name = "L6_synthetic_pop_song"
-    save_json(os.path.join(snapshot_dir, f"{base_name}_metrics.json"), metrics)
-    save_json(os.path.join(snapshot_dir, f"{base_name}_run_info.json"), run_info)
+        if metrics["note_f1"] == 0.0:
+            logger.warning("F1 is 0.0! Dumping top notes:")
+            if gt:
+                logger.warning(f"GT (first 5): {gt[:5]}")
+            pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in res.analysis_data.notes]
+            logger.warning(f"Pred (first 5): {pred_list[:5] if pred_list else 'Empty'}")
 
-    # 3. Generate Gate Matrix (Requirement B)
-    gate_matrix_path = os.path.join(reports_dir, "l6_gate_matrix.json")
-    write_gate_matrix(run_info, gate_matrix_path)
+        # Run Sweep (Always)
+        run_sweep(wav_path, gt, config, reports_dir, duration_sec)
 
-    # 4. Generate Accuracy Report (Requirement C)
-    acc_report_path = os.path.join(reports_dir, "l6_accuracy_report.md")
-    # Load the matrix we just wrote to use in report generation if needed, or just pass dict
-    with open(gate_matrix_path, 'r') as f:
-        gm = json.load(f)
-    write_accuracy_report(metrics, gm, acc_report_path)
+        save_json(os.path.join(reports_dir, "benchmark_results.json"), [metrics])
+        save_json(os.path.join(reports_dir, "stage_metrics.json"), {"n_runs": 1, "note": "generated by l6_debug_runner"})
 
-    # 5. Run Sweep (Requirement D) - Only if F1 > 0 or forced
-    if metrics["note_f1"] > 0.0:
-        run_sweep(audio, sr, gt, config, reports_dir, duration_sec)
-    else:
-        logger.warning("Skipping sweep because baseline F1 is 0.0.")
-        # Write empty sweep file so process doesn't look like it crashed
-        save_json(os.path.join(reports_dir, "l6_sweep_results.json"), [{"error": "Skipped due to F1=0.0"}])
+        print("\n=== L6 Gate Matrix ===")
+        print(open(gate_matrix_path, "r", encoding="utf-8").read())
+        print("\n=== L6 Accuracy Report ===")
+        print(open(acc_report_path, "r", encoding="utf-8").read())
+        print("\n=== L6 Sweep Results ===")
+        print(open(os.path.join(reports_dir, "l6_sweep_results.json"), "r", encoding="utf-8").read())
 
-    # 6. Generate other standard artifacts for compliance (Requirement A)
-    save_json(os.path.join(reports_dir, "benchmark_results.json"), [metrics])
-    save_json(os.path.join(reports_dir, "stage_metrics.json"), {"n_runs": 1, "note": "generated by l6_debug_runner"})
-    with open(os.path.join(reports_dir, "stage_health_report.md"), "w") as f:
-        f.write(f"# Stage Health\n\nL6 F1: {metrics['note_f1']:.3f}\n")
-    with open(os.path.join(reports_dir, "regression_flags.md"), "w") as f:
-        f.write("# Regression Flags\n\nNo baseline for comparison.\n")
+        # Verification
+        expected_files = [
+            "reports/bench_run.log",
+            "reports/l6_gate_matrix.json",
+            "reports/l6_accuracy_report.md",
+            "reports/l6_sweep_results.json",
+            f"reports/snapshots/{run_id}/L6_synthetic_pop_song_run_info.json",
+            f"reports/snapshots/{run_id}/L6_synthetic_pop_song_metrics.json"
+        ]
+        print("\n=== Artifact Verification ===")
+        all_ok = True
+        for fpath in expected_files:
+            if os.path.exists(fpath):
+                print(f"[OK] {fpath}")
+            else:
+                print(f"[MISSING] {fpath}")
+                all_ok = False
+
+        if not all_ok:
+            logger.error("Some artifacts are missing!")
+
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+        # Flush handlers
+        for h in logging.getLogger().handlers:
+            h.flush()
 
     logger.info("Done.")
 

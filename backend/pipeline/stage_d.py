@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Tuple, Any
+from typing import List, Optional, Dict, Tuple, Any, Union
 import numpy as np
 import tempfile
 import os
@@ -99,19 +99,44 @@ def light_quantize_time(t, grid_times, max_shift=0.03):
     return t
 
 def quantize_and_render(
-    events: List[NoteEvent],
-    analysis_data: AnalysisData,
-    config: PipelineConfig = PIANO_61KEY_CONFIG,
+    events_or_analysis: Union[List[NoteEvent], AnalysisData],
+    analysis_data_or_config: Union[AnalysisData, PipelineConfig],
+    config_opt: Optional[PipelineConfig] = None,
     pipeline_logger: Optional[Any] = None,
 ) -> TranscriptionResult:
     """
     Stage D: Render Sheet Music (MusicXML) and MIDI using music21.
 
     Returns TranscriptionResult containing musicxml string and midi bytes.
+    Supports polymorphic calling:
+      1. (events, analysis_data, config) -> used by benchmark_runner
+      2. (analysis_data, config) -> used by transcribe.py
     """
 
+    # Polymorphic Argument Handling
+    events: List[NoteEvent] = []
+    analysis_data: AnalysisData
+    config: PipelineConfig = PIANO_61KEY_CONFIG
+
+    if isinstance(events_or_analysis, AnalysisData):
+        # Case 2: (analysis_data, config, [logger])
+        analysis_data = events_or_analysis
+        config = analysis_data_or_config if isinstance(analysis_data_or_config, (PipelineConfig, type(None))) else PIANO_61KEY_CONFIG
+        # Extract events from analysis data (prefer quantized)
+        events = getattr(analysis_data, "notes", []) or []
+
+        # Shift logger if passed as 3rd arg
+        if config_opt is not None and pipeline_logger is None:
+             pipeline_logger = config_opt
+
+    else:
+        # Case 1: (events, analysis_data, config, [logger])
+        events = events_or_analysis
+        analysis_data = analysis_data_or_config
+        config = config_opt if config_opt else PIANO_61KEY_CONFIG
+
     if not MUSIC21_AVAILABLE:
-        if pipeline_logger:
+        if pipeline_logger and hasattr(pipeline_logger, "log_event"):
             pipeline_logger.log_event(
                 "stage_d",
                 "feature_disabled",
@@ -120,7 +145,7 @@ def quantize_and_render(
         return TranscriptionResult(
             musicxml="",
             analysis_data=analysis_data,
-            midi_bytes=b"",
+            midi=b"",
         )
 
     d_conf = config.stage_d
@@ -229,7 +254,7 @@ def quantize_and_render(
 
     use_beat_grid = len(beat_times) > 1
 
-    if pipeline_logger and use_beat_grid:
+    if pipeline_logger and hasattr(pipeline_logger, "log_event") and use_beat_grid:
         pipeline_logger.log_event("stage_d", "beat_grid_selected", payload={
             "source": beat_source,
             "count": len(beat_times),
@@ -616,7 +641,7 @@ def quantize_and_render(
     return TranscriptionResult(
         musicxml=musicxml_str,
         analysis_data=analysis_data,
-        midi_bytes=midi_bytes
+        midi=midi_bytes
     )
 
 

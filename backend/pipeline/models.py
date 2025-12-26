@@ -281,7 +281,11 @@ class AnalysisData:
 class TranscriptionResult:
     musicxml: str
     analysis_data: AnalysisData
-    midi_bytes: bytes = b""
+    midi: bytes = b""
+
+    @property
+    def midi_bytes(self) -> bytes:
+        return self.midi
 
     def __getitem__(self, key):
         """Allow dict-like access for compatibility."""
@@ -289,3 +293,7 @@ class TranscriptionResult:
             return getattr(self, key)
         except AttributeError:
             raise KeyError(key)
+
+    def __iter__(self):
+        """Allow unpacking as (musicxml, midi_bytes)."""
+        return iter((self.musicxml, self.midi))
