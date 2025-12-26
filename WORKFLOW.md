@@ -4,126 +4,113 @@ This document outlines the detailed call graph, data flow, algorithms, and confi
 
 ## Detailed Pipeline Flowchart
 
-This chart explicitly details the Algorithm Selection Logic (Profile $\rightarrow$ Weights $\rightarrow$ Fallback) and expands the Detector Bank to include every algorithm mentioned in Section 2.
+This chart details the end-to-end flow, including Signal Conditioning, Routing Logic, Source Separation, Polyphonic Processing, and Rendering.
 
 ```mermaid
 flowchart TD
-    %% Main Entry Point
-    Start(["Start: Audio Input"]) --> StageA["Stage A: Signal Conditioning"]
-
-    %% Stage A Summary
-    subgraph StageA_Process [Stage A: Preprocessing]
-        SA1["Resample / Mono / Trim"]
-        SA2["Loudness Norm EBU R128"]
-        SA3["Transient Emphasis (Optional)"]
-        SA1 --> SA2 --> SA3
+    %% --- STAGE A ---
+    subgraph StageA [Stage A: Signal Conditioning]
+        direction TB
+        Start(Audio Input) --> SA_Cond[Resample / Mono / Trim]
+        SA_Cond --> SA_Norm[Loudness Norm <br> EBU R128 / RMS]
+        SA_Norm --> SA_Trans[Transient Emphasis <br> Warped LPC]
+        SA_Trans --> SA_Anal[Global Analysis <br> BPM / AudioType]
     end
-    StageA --> SA1
 
     %% Decision: Neural E2E vs Standard
-    SA3 --> CheckE2E{"E2E Mode?<br>Basic Pitch / Auto"}
-    CheckE2E -- Yes --> NeuralTrans["Neural Transcription<br>Basic Pitch / O&F"]
+    SA_Anal --> CheckE2E{E2E Mode?}
+    CheckE2E -- Yes --> NeuralTrans[Neural Transcription <br> Basic Pitch / O&F]
     NeuralTrans --> StageD
 
-    CheckE2E -- No --> LogicStart
+    CheckE2E -- No --> SB_Start
 
-    %% --- STAGE B: FEATURE EXTRACTION ---
-    subgraph StageB_Process [Stage B: Feature Extraction]
+    %% --- STAGE B ---
+    subgraph StageB [Stage B: Feature Extraction]
         direction TB
-
-        %% --- SECTION 3: SELECTION LOGIC ---
-        subgraph Selection_Logic [Selection Logic]
+        SB_Start(Input Context) --> SB_Route[Decision Trace <br> Routing v1]
+        
+        %% Separation Logic
+        SB_Route --> SB_Sep{Separation?}
+        SB_Sep -- Yes --> SB_Demucs[HTDemucs / Synthetic <br> Extract Stems]
+        SB_Sep -- No --> SB_Mix[Use Mix Stem]
+        
+        SB_Demucs --> SB_Stems(Stems: Vocals, Bass...)
+        SB_Mix --> SB_Stems
+        
+        %% Detector Bank (Applied per Stem)
+        subgraph Per_Stem [Per-Stem Processing]
             direction TB
-            LogicStart(Input Context)
-
-            %% Logic 1: Instrument Profile
-            SL1{"1. Instrument<br>Profile?"}
-            LogicStart --> SL1
-
-            SL1 -- Yes --> SL1_Load["Load Preset Config<br>e.g. Violin=CREPE, Bass=YIN"]
-            SL1 -- No --> SL1_Def["Load Default Config"]
-
-            SL1_Load & SL1_Def --> SL2{"Decision Trace<br>(Routing v1)"}
+            SB_Stems --> SB_Pre[Pre-Process <br> LPF / Lockout]
+            SB_Pre --> SB_Detect[Detector Bank]
+            
+            subgraph Detectors [Algorithms]
+               D_YIN[YIN]
+               D_Swift[SwiftF0]
+               D_Crepe[CREPE]
+               D_Other[...]
+            end
+            SB_Detect --- Detectors
+            
+            Detectors --> SB_Ens[Ensemble Fusion <br> Static / Adaptive]
+            
+            %% Polyphony / ISS
+            SB_Ens --> SB_Poly{Poly Context?}
+            SB_Poly -- Yes --> SB_ISS[ISS Peeling <br> Freq-Aware / Adaptive]
+            SB_ISS --> SB_Layers(Main + Layers)
+            SB_Poly -- No --> SB_Layers
+            
+            SB_Layers --> SB_Smooth[Smoothing <br> Viterbi / Tracker]
         end
-
-        %% --- SECTION 2: NOTE EXTRACTION ALGORITHMS ---
-        subgraph Detectors [Detector Bank]
-            direction TB
-            %% Setup Inputs
-            SL2 --> D_Input("Run Detectors Parallel")
-
-            %% The 6 Algorithms from Section 2
-            D_Input --> Alg_YIN
-            D_Input --> Alg_Swift
-            D_Input --> Alg_SACF
-            D_Input --> Alg_CREPE
-            D_Input --> Alg_RMVPE
-            D_Input --> Alg_CQT
-
-            Alg_YIN["**YIN**<br>Time-domain Autocorr<br><i>Best for: Bass/Clean</i>"]
-            Alg_Swift["**SwiftF0**<br>Learning-based Est.<br><i>Priority: High</i>"]
-            Alg_SACF["**SACF**<br>Simple Autocorr<br><i>Legacy/Fast</i>"]
-            Alg_CREPE["**CREPE**<br>Neural Network<br><i>Best for: Violin/Flute</i>"]
-            Alg_RMVPE["**RMVPE**<br>Vocal Extraction<br><i>Best for: Vocals</i>"]
-            Alg_CQT["**CQT**<br>Constant-Q Transform<br><i>Validation/Spec</i>"]
-        end
-
-        %% --- SECTION 3: ENSEMBLE WEIGHTS (Parallel Path 1) ---
-        Alg_YIN & Alg_Swift & Alg_SACF & Alg_CREPE & Alg_RMVPE & Alg_CQT --> Ensemble
-
-        subgraph Ensemble_Logic [Ensemble & Smoothing]
-            Ensemble["**2. Ensemble Fusion**<br>Merge Outputs"]
-
-            %% Logic 2: Fusion Mode
-            Ensemble --> Fusion{"Mode?"}
-            Fusion -- Static --> W_Avg["Weighted Average"]
-            Fusion -- Adaptive --> W_Med["Reliability-Gated<br>Weighted Median"]
-
-            W_Avg & W_Med --> Smoothing{"Smoothing?"}
-            Smoothing -- Tracker --> S_Track["Hungarian Tracker"]
-            Smoothing -- Viterbi --> S_Vit["Viterbi Path"]
-
-            S_Track & S_Vit --> ResultB(["Main Stage B Output"])
-        end
-
-        %% --- ISS / POLYPHONY (Parallel Path 2) ---
-        %% ISS runs independently using a primary detector to peel layers
-        LogicStart -.-> CheckPoly{"Polyphonic?"}
-        CheckPoly -- Yes --> ISS["**Iterative Spectral Subtraction**<br>Peel multiple layers<br>(Adaptive / Freq-Aware)"]
-        ISS --> PolyLayers(["Polyphonic Layers"])
-        CheckPoly -- No --> NoPoly["No Peeling"]
     end
 
-    %% Merge Paths
-    ResultB & PolyLayers --> StageC["Stage C: Apply Theory"]
-    ResultB & NoPoly --> StageC
+    SB_Smooth --> StageC
 
-    subgraph StageC_Process [Stage C]
-        SC1["Segmentation<br>(Threshold / HMM / Decomposed)"]
-        SC2["Refinement<br>(Onset Snap / Splitter)"]
-        SC3["Duration/Velocity Filter"]
-        SC1 --> SC2 --> SC3
+    %% --- STAGE C ---
+    subgraph StageC [Stage C: Segmentation]
+        direction TB
+        SC_Sel[Stem Selection] --> SC_Filter{Poly Filter?}
+        
+        SC_Filter -- Skyline --> SC_Sky[Skyline Top Voice <br> Bias Vocal Range]
+        SC_Filter -- Decompose --> SC_Dec[Full Decomposition <br> Graph Search]
+        
+        SC_Sky & SC_Dec --> SC_Seg[Segmentation <br> HMM / Threshold]
+        SC_Seg --> SC_Refine[Refinement <br> Onset Snap / Splitter]
+        SC_Refine --> SC_Post[Post-Processing <br> Gap Merge / Chord Snap]
     end
 
-    subgraph StageD_Process [Stage D: Quantize & Render]
-        SC3 --> StageD_Quant["Quantization"]
-        StageD_Quant --> StageD_Render["Export XML/MIDI"]
+    SC_Post --> StageD
+
+    %% --- STAGE D ---
+    subgraph StageD [Stage D: Rendering]
+        direction TB
+        SD_Quant[Quantization <br> Grid / Light Rubato] --> SD_Voice[Voice Assignment <br> Treble / Bass Split]
+        SD_Voice --> SD_Gliss[Glissando Detection]
+        SD_Gliss --> SD_Exp[Export <br> MusicXML / MIDI]
     end
-    StageD_Render --> End(["Final Output"])
+
+    SD_Exp --> End(Final Output)
 ```
 
 ## Flowchart Explainer
 
 ### Stage A: Preprocessing
-*   **Signal Conditioning**: The input audio is resampled (44.1/22.05kHz), mixed to mono, and trimmed of silence.
-    *   **Transient Emphasis**: Optional whitening filter (warped linear prediction) to enhance attacks (e.g., piano/drums).
-*   **Normalization**: Loudness is normalized to a target (e.g., -23 LUFS) or RMS-based gain.
-*   **Texture Detection**: Heuristics classify audio as Monophonic, Polyphonic, or Poly-Dominant.
+*   **Signal Conditioning**: The input audio is resampled to a consistent rate (44.1kHz or 22.05kHz), mixed to mono, and trimmed of silence.
+    *   **Transient Emphasis**: Optional whitening filter (warped linear prediction, alpha ~0.97) to enhance attacks (e.g., piano/drums).
+*   **Normalization**: Loudness is normalized to a target (e.g., -23 LUFS) to ensure consistent detector response.
+*   **Global Analysis**:
+    *   **BPM Detection**: `librosa.beat.beat_track` with clamping/octave correction.
+    *   **Texture Detection**: Heuristics classify audio as Monophonic, Polyphonic, or Poly-Dominant (`AudioType`).
 *   **E2E Bypass**: If `transcription_mode` is set to "e2e_basic_pitch" or "onsets_and_frames", the classic detector pipeline is bypassed.
 
 ### Stage B: Selection & Detectors
-*   **Decision Trace (Routing v1)**: Deterministic policy engine that resolves `transcription_mode` and parameters based on input features (density, texture, spectrum).
-*   **Instrument Profiles**: Configuration overrides (e.g., "Electric Guitar Distorted") apply Pre-LPF, Transient Lockout, and specific detector weights.
+*   **Decision Trace (Routing v1)**:
+    *   Evaluates input features (density, mixture score) to deterministically resolve `transcription_mode` ("classic", "e2e", "auto") and parameters.
+*   **Source Separation**:
+    *   **HTDemucs**: Neural separation for vocals/bass/drums.
+    *   **SyntheticMDX**: Fast, template-based separation for L2 benchmarks.
+*   **Pre-Processing**:
+    *   **LPF**: Low-pass filter for distorted signals (e.g., electric guitar).
+    *   **Lockout**: Zeroes confidence during high-energy transients to prevent pitch errors.
 *   **Detector Bank**: Up to six algorithms run in parallel:
     *   **YIN/SACF**: Robust DSP methods for bass and clean signals.
     *   **SwiftF0/RMVPE/CREPE**: High-accuracy neural estimators.
@@ -132,31 +119,34 @@ flowchart TD
 ### Stage B: Polyphony & Ensemble
 *   **Ensemble Fusion**:
     *   **Static**: Traditional weighted averaging.
-    *   **Adaptive**: Reliability-gated weighted median (robust against outliers, penalizes unstable detectors).
-*   **Smoothing**:
-    *   **Tracker**: Hungarian assignment for voice continuity.
-    *   **Viterbi**: HMM-based pathfinding for optimal global pitch contour.
+    *   **Adaptive**: Reliability-gated weighted median (robust against outliers; penalizes unstable detectors).
 *   **Polyphony (ISS)**: **Iterative Spectral Subtraction** peels accompaniment voices.
     *   **Adaptive Strength**: Adjusts subtraction depth based on residual energy.
     *   **Frequency-Aware Masks**: Wider masks for bass frequencies to capture dense harmonics.
-*   **Active Stems**: Optional whitelist (e.g., `["vocals", "bass"]`) to restrict processing to specific source-separated stems.
+*   **Smoothing**:
+    *   **Tracker**: Hungarian assignment for voice continuity.
+    *   **Viterbi**: HMM-based pathfinding for optimal global pitch contour.
 
 ### Stage C: Segmentation
 *   **Note Extraction**:
     *   **Skyline Top Voice**: Biases selection towards the vocal range (80-1400Hz) and continuity/confidence.
-    *   **Decomposed Melody**: Fully decomposes polyphony and picks the strongest track.
+    *   **Decomposed Melody**: Fully decomposes polyphony and picks the strongest track (L5 optimization).
 *   **Refinement**:
     *   **Onset Snapping (`snap_onset`)**: Aligns note starts to local peaks in spectral flux (onset strength).
     *   **Repeated Note Splitter**: Detects re-articulations (energy bumps) within sustained pitch segments.
 *   **Post-Processing**:
-    *   **Gap Merging**: Bridges tiny dropouts in sustained notes.
+    *   **Gap Merging**: Bridges micro-gaps (<60ms) in legato phrases.
     *   **Chord Snapping**: Aligns nearly-simultaneous onsets to form clean chords.
 
 ### Stage D: Quantization & Rendering
 *   **Quantization**:
     *   **Grid Mode**: Hard snap to nearest grid unit (e.g., 1/16th).
     *   **Light Rubato**: Snaps only notes close to the grid (within ~30ms), preserving expressive timing elsewhere.
-*   **Rendering**: Formats notes into MusicXML (Grand Staff grouping) and MIDI (including glissando events if enabled).
+*   **Voice Assignment**:
+    *   Groups events by (Staff, Voice). Defaults to Treble/Bass split at C4 (MIDI 60).
+*   **Glissando Detection**:
+    *   Identifies sequential notes with small pitch gaps and short time intervals to insert `music21.spanner.Glissando`.
+*   **Rendering**: Formats notes into MusicXML (Grand Staff layout with braces) and MIDI.
 
 ## Tunable Parameters (Tuner/Audit)
 
