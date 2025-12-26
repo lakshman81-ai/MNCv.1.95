@@ -212,7 +212,18 @@ def transcribe(
                 # Classic + BasicPitch both go through Stage B -> Stage C
                 stage_b_out = extract_features(stage_a_out, config=cand_cfg, pipeline_logger=pipeline_logger, device=device)
                 cand_trace = dict((stage_b_out.diagnostics or {}).get("decision_trace", {})) if hasattr(stage_b_out, "diagnostics") else {}
-                cand_analysis = apply_theory(stage_b_out, cand_cfg, pipeline_logger=pipeline_logger)
+
+                # Convert StageBOutput to AnalysisData for Stage C
+                cand_analysis = AnalysisData(
+                    meta=stage_b_out.meta,
+                    timeline=stage_b_out.timeline,
+                    stem_timelines=stage_b_out.stem_timelines,
+                    diagnostics=stage_b_out.diagnostics,
+                    precalculated_notes=stage_b_out.precalculated_notes
+                )
+
+                # Stage C (updates cand_analysis.notes in-place)
+                apply_theory(cand_analysis, cand_cfg)
 
                 # Ensure decision trace is visible at top-level too
                 try:
@@ -293,11 +304,13 @@ def transcribe(
         analysis_data.diagnostics["decision_trace"] = base_trace
 
     # ---------------- Stage D ----------------
-    musicxml_str, midi_bytes = quantize_and_render(analysis_data, config, pipeline_logger=pipeline_logger)
+    tr = quantize_and_render(analysis_data.notes, analysis_data, config, pipeline_logger=pipeline_logger)
+    musicxml_str = tr.musicxml
+    midi_bytes = tr.midi_bytes
 
     analysis_data.diagnostics["timing"] = {
         "total_sec": float(time.time() - t0),
         "selected_candidate_score": float(selected_score),
     }
 
-    return TranscriptionResult(musicxml=musicxml_str, analysis_data=analysis_data, midi=midi_bytes)
+    return TranscriptionResult(musicxml=musicxml_str, analysis_data=analysis_data, midi_bytes=midi_bytes)
