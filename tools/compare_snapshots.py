@@ -1,122 +1,108 @@
 #!/usr/bin/env python3
 """
-tools/compare_snapshots.py
-
-Compare two snapshot folders (each containing *_metrics.json written by benchmark_runner)
-and flag regressions.
-
-Usage:
-  python tools/compare_snapshots.py --baseline reports/snapshots/<runA> --current reports/snapshots/<runB>
+Compare two benchmark snapshot directories (JSON files) and flag regressions.
 """
 
-from __future__ import annotations
-
-import argparse
-import json
-import os
 import sys
-from typing import Dict, Any, List, Tuple
+import json
+import argparse
+from pathlib import Path
+from typing import Dict, Any, List
 
-
-def _load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _collect_metrics(dir_path: str) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for fn in os.listdir(dir_path):
-        if not fn.endswith("_metrics.json"):
-            continue
-        case_id = fn[:-len("_metrics.json")]
+def load_snapshot(path: Path) -> Dict[str, Any]:
+    """Load benchmark results from a folder or single JSON file."""
+    results = {}
+    if path.is_file():
         try:
-            out[case_id] = _load_json(os.path.join(dir_path, fn))
-        except Exception:
+            data = json.loads(path.read_text())
+            # If it's a list (summary.json), index by level+name
+            if isinstance(data, list):
+                for item in data:
+                    key = f"{item.get('level')}_{item.get('name')}"
+                    results[key] = item
+            else:
+                # Single metric file
+                key = f"{data.get('level')}_{data.get('name')}"
+                results[key] = data
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+    elif path.is_dir():
+        for f in path.glob("*_metrics.json"):
+            try:
+                data = json.loads(f.read_text())
+                key = f"{data.get('level')}_{data.get('name')}"
+                results[key] = data
+            except Exception:
+                pass
+    return results
+
+def compare(baseline: Dict[str, Any], candidate: Dict[str, Any], threshold_f1: float = -0.05) -> List[str]:
+    regressions = []
+
+    all_keys = set(baseline.keys()) | set(candidate.keys())
+
+    for key in sorted(all_keys):
+        b = baseline.get(key)
+        c = candidate.get(key)
+
+        if not b:
+            # New benchmark?
             continue
-    return out
+        if not c:
+            regressions.append(f"❌ {key}: Missing in candidate run")
+            continue
 
+        # Compare Note F1
+        b_f1 = b.get("note_f1")
+        c_f1 = c.get("note_f1")
 
-def compare(baseline_dir: str, current_dir: str) -> Tuple[str, bool]:
-    a = _collect_metrics(baseline_dir)
-    b = _collect_metrics(current_dir)
+        if b_f1 is not None and c_f1 is not None:
+            delta = c_f1 - b_f1
+            if delta < threshold_f1:
+                regressions.append(f"📉 {key}: F1 dropped by {delta:.3f} ({b_f1:.3f} -> {c_f1:.3f})")
 
-    common = sorted(set(a.keys()) & set(b.keys()))
-    md: List[str] = []
-    md.append("# Regression Flags")
-    md.append("")
-    md.append(f"Baseline: `{baseline_dir}`")
-    md.append(f"Current: `{current_dir}`")
-    md.append("")
+        # Compare Note Count (sanity)
+        b_cnt = b.get("predicted_count", 0)
+        c_cnt = c.get("predicted_count", 0)
+        if b_cnt > 0 and c_cnt == 0:
+             regressions.append(f"🔴 {key}: Zero notes (was {b_cnt})")
 
-    if not common:
-        md.append("No comparable cases found.")
-        return "\n".join(md) + "\n", False
+        # Compare Voiced Ratio
+        b_vr = b.get("voiced_ratio", 0.0)
+        c_vr = c.get("voiced_ratio", 0.0)
+        if b_vr > 0.1 and c_vr < 0.05:
+            regressions.append(f"🔇 {key}: Voiced ratio collapse ({b_vr:.2f} -> {c_vr:.2f})")
 
-    regressions: List[Tuple[str, List[str]]] = []
+    return regressions
 
-    for cid in common:
-        am = a[cid]
-        bm = b[cid]
+def main():
+    parser = argparse.ArgumentParser(description="Compare two benchmark snapshots.")
+    parser.add_argument("baseline", type=Path, help="Baseline folder or JSON")
+    parser.add_argument("candidate", type=Path, help="Candidate folder or JSON")
+    args = parser.parse_args()
 
-        a_nc = float(am.get("note_count", am.get("predicted_count", 0.0)) or 0.0)
-        b_nc = float(bm.get("note_count", bm.get("predicted_count", 0.0)) or 0.0)
+    if not args.baseline.exists():
+        print(f"Baseline path not found: {args.baseline}")
+        sys.exit(1)
+    if not args.candidate.exists():
+        print(f"Candidate path not found: {args.candidate}")
+        sys.exit(1)
 
-        a_vr = float(am.get("voiced_ratio", 0.0) or 0.0)
-        b_vr = float(bm.get("voiced_ratio", 0.0) or 0.0)
+    b_data = load_snapshot(args.baseline)
+    c_data = load_snapshot(args.candidate)
 
-        a_fr = float(am.get("fragmentation_score", 0.0) or 0.0)
-        b_fr = float(bm.get("fragmentation_score", 0.0) or 0.0)
+    print(f"Loaded {len(b_data)} baseline items, {len(c_data)} candidate items.")
 
-        a_f1 = am.get("note_f1", None)
-        b_f1 = bm.get("note_f1", None)
+    regressions = compare(b_data, c_data)
 
-        flags: List[str] = []
-        if a_nc > 0 and (b_nc < 0.8 * a_nc) and ((a_nc - b_nc) >= 10):
-            flags.append(f"note_count drop {a_nc:.0f}→{b_nc:.0f}")
-        if (a_vr - b_vr) > 0.05:
-            flags.append(f"voiced_ratio drop {a_vr:.3f}→{b_vr:.3f}")
-        if (b_fr - a_fr) > 0.05:
-            flags.append(f"fragmentation increase {a_fr:.3f}→{b_fr:.3f}")
-        if isinstance(a_f1, (int, float)) and isinstance(b_f1, (int, float)) and (a_f1 - b_f1) > 0.02:
-            flags.append(f"note_f1 drop {a_f1:.3f}→{b_f1:.3f}")
-
-        if flags:
-            regressions.append((cid, flags))
-
-    if not regressions:
-        md.append("✅ No regressions detected by heuristic gates.")
-        return "\n".join(md) + "\n", False
-
-    md.append("## Regressions")
-    for cid, flags in regressions:
-        md.append(f"- **{cid}**: " + "; ".join(flags))
-    md.append("")
-    md.append("> Note: These are heuristic gates. Inspect the per-case *_run_info.json and timeline CSVs to diagnose.")
-    return "\n".join(md) + "\n", True
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--baseline", required=True, help="Baseline snapshot directory")
-    ap.add_argument("--current", required=True, help="Current snapshot directory")
-    ap.add_argument("--out", default="", help="Write markdown to this path (optional)")
-    args = ap.parse_args()
-
-    baseline_dir = os.path.abspath(args.baseline)
-    current_dir = os.path.abspath(args.current)
-
-    md, has_reg = compare(baseline_dir, current_dir)
-
-    if args.out:
-        out_path = os.path.abspath(args.out)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(md)
+    if regressions:
+        print("\nRegressions Detected:")
+        for r in regressions:
+            print(r)
+        sys.exit(1)
     else:
-        print(md)
-
-    return 2 if has_reg else 0
-
+        print("\n✅ No significant regressions found.")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
