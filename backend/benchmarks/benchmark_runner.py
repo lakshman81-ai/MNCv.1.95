@@ -1543,23 +1543,155 @@ class BenchmarkSuite:
         m = self._save_run("L5.2", "tumhare_hi_rahenge", res, gt, apply_regression_gate=False)
         logger.info(f"L5.2 Complete. F1: {m['note_f1']}")
 
-    def _save_real_song_result(self, level, name, res):
+    def _save_real_song_result(self, level: str, name: str, res: Dict[str, Any]):
+        """
+        Save a real-song run (no GT). Robust to different return shapes from run_real_song.
+
+        Writes:
+          - {level}_{name}_metrics.json
+          - {level}_{name}_run_info.json  (includes decision_trace + quality_gate if present)
+          - optional {level}_{name}_timeline.csv (if timeline available)
+        """
+        # Locate AnalysisData
+        analysis = res.get("analysis_data", None)
+        transcription = res.get("transcription", None) or res.get("transcription_result", None) or res.get("result", None)
+
+        if analysis is None and transcription is not None:
+            analysis = getattr(transcription, "analysis_data", None)
+
+        # Locate notes
+        notes_obj = None
+        if analysis is not None:
+            notes_obj = getattr(analysis, "notes_before_quantization", None) or getattr(analysis, "notes", None)
+        if notes_obj is None:
+            notes_obj = res.get("notes", []) or []
+
+        pred_notes = list(notes_obj) if notes_obj is not None else []
+        pred_list = [
+            (int(getattr(n, "midi_note", 0)), float(getattr(n, "start_sec", 0.0)), float(getattr(n, "end_sec", 0.0)))
+            for n in pred_notes
+        ]
+
+        # Duration
+        duration_sec = 0.0
+        try:
+            if analysis is not None and getattr(analysis, "meta", None) is not None:
+                duration_sec = float(getattr(analysis.meta, "duration_sec", 0.0) or 0.0)
+        except Exception:
+            duration_sec = 0.0
+
+        # Voiced ratio: prefer timeline active_pitches; else approximate by coverage
+        voiced_ratio = 0.0
+        try:
+            timeline = getattr(analysis, "timeline", None) if analysis is not None else None
+            if timeline:
+                total = max(1, len(timeline))
+                voiced = 0
+                for fr in timeline:
+                    ap = getattr(fr, "active_pitches", None)
+                    if ap is not None and len(ap) > 0:
+                        voiced += 1
+                voiced_ratio = float(voiced / total)
+            else:
+                if duration_sec > 0 and pred_list:
+                    total_note_dur = 0.0
+                    for _, s, e in pred_list:
+                        total_note_dur += max(0.0, float(e) - float(s))
+                    voiced_ratio = float(min(1.0, total_note_dur / max(1e-6, duration_sec)))
+        except Exception:
+            voiced_ratio = 0.0
+
+        symptoms = compute_symptom_metrics(pred_list)
+
+        # Metrics (no GT -> note_f1/onset_mae_ms are None)
         metrics = {
             "level": level,
             "name": name,
-            "note_f1": res["note_f1"],
-            "onset_mae_ms": res["onset_mae_ms"],
-            "predicted_count": res["predicted_notes"],
-            "gt_count": res["gt_notes"],
+            "note_f1": None,
+            "onset_mae_ms": None,
+            "predicted_count": int(symptoms.get("note_count", 0.0) or 0.0),
+            "gt_count": None,
+            "fragmentation_score": float(symptoms.get("fragmentation_score", 0.0) or 0.0),
+            "note_count_per_10s": float(symptoms.get("note_count_per_10s", 0.0) or 0.0),
+            "median_note_len_ms": float(symptoms.get("median_note_len_ms", 0.0) or 0.0),
+            "octave_jump_rate": float(symptoms.get("octave_jump_rate", 0.0) or 0.0),
+            "voiced_ratio": float(voiced_ratio),
+            "note_count": int(symptoms.get("note_count", 0.0) or 0.0),
         }
         self.results.append(metrics)
 
         base_path = os.path.join(self.output_dir, f"{level}_{name}")
-        with open(f"{base_path}_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
+        with open(f"{base_path}_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, default=str)
 
-        with open(f"{base_path}_run_info.json", "w") as f:
-            json.dump({"config": asdict(res["resolved_config"])}, f, indent=2, default=str)
+        # Build rich run_info
+        resolved_config = res.get("resolved_config", None) or res.get("config", None)
+        stage_b_out = res.get("stage_b_out", None)
+        stage_b_diag = {}
+        if stage_b_out is not None:
+            stage_b_diag = getattr(stage_b_out, "diagnostics", None) or {}
+
+        analysis_diag = {}
+        if analysis is not None:
+            analysis_diag = getattr(analysis, "diagnostics", None) or {}
+
+        decision_trace = None
+        if isinstance(stage_b_diag, dict) and "decision_trace" in stage_b_diag:
+            decision_trace = stage_b_diag.get("decision_trace")
+        elif isinstance(analysis_diag, dict) and "decision_trace" in analysis_diag:
+            decision_trace = analysis_diag.get("decision_trace")
+
+        quality_gate = analysis_diag.get("quality_gate") if isinstance(analysis_diag, dict) else None
+        stage_c_post = analysis_diag.get("stage_c_post") if isinstance(analysis_diag, dict) else None
+
+        profiling = res.get("profiling", {}) or {}
+
+        run_info = {
+            "level": level,
+            "name": name,
+            "duration_sec": float(duration_sec or 0.0),
+            "note_count": int(metrics["note_count"]),
+            "voiced_ratio": float(metrics["voiced_ratio"]),
+            "decision_trace": decision_trace if decision_trace is not None else {},
+            "quality_gate": quality_gate if quality_gate is not None else {},
+            "stage_c_post": stage_c_post if stage_c_post is not None else {},
+            "stage_timings": profiling.get("stage_timings", {}),
+            "detector_confidences": profiling.get("detector_confidences", {}),
+            "artifacts_present": profiling.get("artifacts", {}),
+            "config": asdict(resolved_config) if resolved_config is not None and is_dataclass(resolved_config) else {},
+            "diagnostics": stage_b_diag if isinstance(stage_b_diag, dict) else {},
+        }
+
+        with open(f"{base_path}_run_info.json", "w", encoding="utf-8") as f:
+            json.dump(run_info, f, indent=2, default=str)
+
+        # Optional timeline CSV (minimal)
+        try:
+            if analysis is not None:
+                timeline = getattr(analysis, "timeline", None)
+                if timeline and "write_frame_timeline_csv" in globals():
+                    csv_rows = []
+                    hop = float(getattr(getattr(analysis, "meta", None), "hop_length", 512) or 512)
+                    sr = float(getattr(getattr(analysis, "meta", None), "sample_rate", 22050) or 22050)
+                    for t, fr in enumerate(timeline):
+                        hz = 0.0
+                        ap = getattr(fr, "active_pitches", None)
+                        if ap:
+                            try:
+                                hz = float(ap[0].hz)
+                            except Exception:
+                                hz = 0.0
+                        csv_rows.append({
+                            "t": int(t),
+                            "time_sec": float((t * hop) / sr),
+                            "f0_hz": float(hz),
+                            "voiced": bool(hz > 0),
+                        })
+                    if csv_rows:
+                        write_frame_timeline_csv(f"{base_path}_timeline.csv", csv_rows)
+        except Exception:
+            pass
+
 
     def generate_summary(self):
         summary_path = os.path.join(self.output_dir, "summary.csv")
