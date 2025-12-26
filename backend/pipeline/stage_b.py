@@ -48,6 +48,317 @@ if importlib.util.find_spec("scipy.signal"):
     import scipy.signal as SCIPY_SIGNAL
 
 
+def _get(cfg: Any, path: str, default: Any = None) -> Any:
+    cur = cfg
+    for part in path.split("."):
+        if cur is None:
+            return default
+        # dict-style
+        if isinstance(cur, dict):
+            cur = cur.get(part, default)
+            continue
+        # object attribute
+        if hasattr(cur, part):
+            cur = getattr(cur, part)
+            continue
+        return default
+    return default if cur is None else cur
+
+
+def _module_available(module_name: str) -> bool:
+    """Helper to avoid importing heavy optional deps when missing."""
+    mod = sys.modules.get(module_name)
+    if mod is not None and getattr(mod, "__spec__", None) is None:
+        return False
+
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ModuleNotFoundError, ValueError):
+        spec = None
+
+    if spec is None and module_name in sys.modules:
+        return True
+    return spec is not None
+
+
+# -----------------------------------------------------------------------------
+# Stage B Routing Policy (WI Task 1.1–1.4)
+# -----------------------------------------------------------------------------
+ROUTING_POLICY_VERSION = "routing_v1"
+
+def _safe_import_librosa():
+    try:
+        import librosa  # type: ignore
+        return librosa
+    except Exception:
+        return None
+
+_LIBROSA = _safe_import_librosa()
+
+
+def _infer_audio_type_str(stage_a_out: StageAOutput, routing_features: Dict[str, Any]) -> str:
+    """Best-effort audio_type string for diagnostics."""
+    try:
+        at = getattr(stage_a_out, "audio_type", None)
+        if at is not None:
+            return str(getattr(at, "value", at))
+    except Exception:
+        pass
+
+    pm = float(routing_features.get("polyphony_mean", 0.0) or 0.0)
+    if pm >= 2.0:
+        return "polyphonic"
+    if pm >= 1.3:
+        return "polyphonic_dominant"
+    if pm > 0.0:
+        return "monophonic"
+    return "unknown"
+
+
+def _is_piano_like(profile: Optional[str]) -> bool:
+    s = str(profile or "").lower()
+    return any(k in s for k in ("piano", "keys", "keyboard", "rhodes"))
+
+
+def _compute_routing_features(mix_audio: np.ndarray, sr: int, duration_sec: float) -> Tuple[Dict[str, Any], Dict[str, bool]]:
+    """
+    Cheap routing features (optional-dep safe).
+    Deterministic; bounded compute by truncating analysis window.
+    """
+    feats: Dict[str, Any] = {
+        "duration_sec": float(duration_sec or 0.0),
+        "sr": int(sr or 0),
+        "rms_mean": 0.0,
+        "spectral_centroid_mean": 0.0,
+        "spectral_centroid_std": 0.0,
+        "spectral_flatness_mean": 0.0,
+        "hpss_percussive_ratio": 0.0,
+        "polyphony_mean": 0.0,
+        "active_pitches_mean": 0.0,
+        "active_pitches_p95": 0.0,
+        "synthetic_like": False,
+        "mixture_score": 0.0,
+    }
+    missing = {"librosa": False}
+
+    if mix_audio is None or sr <= 0:
+        return feats, missing
+
+    y = np.asarray(mix_audio, dtype=np.float32).flatten()
+    if y.size == 0:
+        return feats, missing
+
+    feats["rms_mean"] = float(np.sqrt(np.mean(y * y) + 1e-12))
+
+    if _LIBROSA is None:
+        missing["librosa"] = True
+        return feats, missing
+
+    try:
+        max_sec = 20.0
+        n = int(min(float(duration_sec or 0.0), max_sec) * float(sr))
+        y_use = y[:n] if (n > 0 and y.size > n) else y
+
+        centroid = _LIBROSA.feature.spectral_centroid(y=y_use, sr=sr)
+        flat = _LIBROSA.feature.spectral_flatness(y=y_use)
+
+        feats["spectral_centroid_mean"] = float(np.mean(centroid)) if centroid.size else 0.0
+        feats["spectral_centroid_std"] = float(np.std(centroid)) if centroid.size else 0.0
+        feats["spectral_flatness_mean"] = float(np.mean(flat)) if flat.size else 0.0
+
+        # HPSS
+        try:
+            harm, perc = _LIBROSA.effects.hpss(y_use)
+            eh = float(np.sum(harm * harm) + 1e-12)
+            ep = float(np.sum(perc * perc) + 1e-12)
+            feats["hpss_percussive_ratio"] = float(ep / (eh + ep))
+        except Exception:
+            feats["hpss_percussive_ratio"] = 0.0
+
+        # Polyphony estimate via piptrack
+        try:
+            pitches, mags = _LIBROSA.piptrack(
+                y=y_use, sr=sr, hop_length=512, fmin=80.0, fmax=min(2000.0, sr / 2.2)
+            )
+            if mags.size:
+                thr = float(np.percentile(mags, 95)) * 0.10
+                active = mags > max(1e-8, thr)
+                counts = np.sum(active, axis=0).astype(np.float32)
+                feats["active_pitches_mean"] = float(np.mean(counts)) if counts.size else 0.0
+                feats["active_pitches_p95"] = float(np.percentile(counts, 95)) if counts.size else 0.0
+                feats["polyphony_mean"] = float(feats["active_pitches_mean"])
+        except Exception:
+            pass
+
+        centroid_mean = float(feats["spectral_centroid_mean"] or 0.0)
+        centroid_std = float(feats["spectral_centroid_std"] or 0.0)
+        centroid_cv = float(centroid_std / max(1e-6, centroid_mean))
+        percr = float(feats["hpss_percussive_ratio"] or 0.0)
+
+        feats["synthetic_like"] = bool(
+            (centroid_cv < 0.03) and (percr < 0.08) and (float(feats["spectral_flatness_mean"]) < 0.10)
+        )
+
+        mix_score = 0.60 * percr + 0.25 * centroid_cv + 0.15 * float(feats["spectral_flatness_mean"] or 0.0)
+        feats["mixture_score"] = float(max(0.0, min(1.0, mix_score)))
+
+    except Exception:
+        pass
+
+    return feats, missing
+
+
+def _normalize_separation_mode(b_conf) -> str:
+    sep = getattr(b_conf, "separation", {}) or {}
+    mode = sep.get("mode", None)
+    enabled = sep.get("enabled", True)
+
+    if isinstance(mode, str):
+        m = mode.lower().strip()
+        if m in ("off", "disabled", "none", "false", "0"):
+            return "off"
+        if m in ("auto", "demucs"):
+            return m
+
+    if isinstance(enabled, str) and enabled.lower().strip() == "auto":
+        return "auto"
+    if not bool(enabled):
+        return "off"
+    return "auto"
+
+
+def compute_decision_trace(
+    stage_a_out: StageAOutput,
+    config: Optional[PipelineConfig],
+    *,
+    requested_mode: Optional[str] = None,
+    requested_profile: Optional[str] = None,
+    requested_separation_mode: Optional[str] = None,
+    pipeline_logger: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Schema-stable routing decision trace (deterministic).
+    Stored in StageBOutput.diagnostics["decision_trace"].
+    """
+    if config is None:
+        config = PipelineConfig()
+    b_conf = config.stage_b
+
+    req_mode = str(requested_mode or getattr(b_conf, "transcription_mode", "classic"))
+    req_profile = str(
+        requested_profile
+        or getattr(b_conf, "instrument", None)
+        or getattr(getattr(stage_a_out, "meta", None), "instrument", None)
+        or "unknown"
+    )
+    req_sep_mode = str(requested_separation_mode or _normalize_separation_mode(b_conf))
+
+    sr = int(getattr(getattr(stage_a_out, "meta", None), "sample_rate", 0) or 0)
+    duration_sec = float(getattr(getattr(stage_a_out, "meta", None), "duration_sec", 0.0) or 0.0)
+
+    mix_stem = (getattr(stage_a_out, "stems", {}) or {}).get("mix", None)
+    mix_audio = getattr(mix_stem, "audio", None) if mix_stem is not None else None
+
+    routing_features, missing = _compute_routing_features(
+        mix_audio if mix_audio is not None else np.array([], dtype=np.float32),
+        sr,
+        duration_sec,
+    )
+
+    dense_thr = float(_get(config, "stage_b.routing.dense_poly_threshold", 1.8))
+    song_mix_thr = float(_get(config, "stage_b.routing.song_like_mixture_score", 0.55))
+    song_perc_thr = float(_get(config, "stage_b.routing.song_like_percussive_ratio", 0.35))
+
+    dense_poly = bool(
+        (float(routing_features.get("polyphony_mean", 0.0)) >= dense_thr)
+        or (float(routing_features.get("active_pitches_mean", 0.0)) >= dense_thr)
+    )
+    song_like = bool(
+        (float(routing_features.get("hpss_percussive_ratio", 0.0)) >= song_perc_thr)
+        or (float(routing_features.get("mixture_score", 0.0)) >= song_mix_thr)
+    )
+    piano_like = _is_piano_like(req_profile)
+
+    oaf_enabled = bool(_get(config, "stage_b.onsets_and_frames.enabled", False))
+    oaf_available = bool(oaf_enabled and _module_available("torch"))
+    bp_available = bool(_module_available("basic_pitch"))
+
+    manual_override = (str(req_mode).lower().strip() != "auto")
+
+    rule_hits: List[Dict[str, Any]] = []
+    rule_hits.append({"rule_id": "R0_manual_override", "passed": bool(manual_override), "score": 1.0 if manual_override else 0.0})
+    rule_hits.append({
+        "rule_id": "R1_dense_poly_piano_e2e_oaf",
+        "passed": bool((not manual_override) and dense_poly and piano_like),
+        "score": float(max(float(routing_features.get("polyphony_mean", 0.0)), float(routing_features.get("active_pitches_mean", 0.0))))
+        if ((not manual_override) and dense_poly and piano_like) else 0.0,
+    })
+    rule_hits.append({
+        "rule_id": "R2_dense_poly_harmonic_e2e_basic_pitch",
+        "passed": bool((not manual_override) and dense_poly and (not piano_like)),
+        "score": float(max(float(routing_features.get("polyphony_mean", 0.0)), float(routing_features.get("active_pitches_mean", 0.0))))
+        if ((not manual_override) and dense_poly and (not piano_like)) else 0.0,
+    })
+    rule_hits.append({
+        "rule_id": "R3_mixture_song_classic_song",
+        "passed": bool((not manual_override) and (not dense_poly) and song_like),
+        "score": float(max(float(routing_features.get("hpss_percussive_ratio", 0.0)), float(routing_features.get("mixture_score", 0.0))))
+        if ((not manual_override) and (not dense_poly) and song_like) else 0.0,
+    })
+    rule_hits.append({"rule_id": "R4_default_classic_melody", "passed": bool(not manual_override), "score": 1.0 if (not manual_override) else 0.0})
+
+    resolved_mode = req_mode
+    if manual_override:
+        if resolved_mode == "e2e_onsets_frames" and (not oaf_available):
+            resolved_mode = "classic_piano_poly" if dense_poly else "classic_melody"
+        if resolved_mode == "e2e_basic_pitch" and (not bp_available):
+            resolved_mode = "classic_piano_poly" if dense_poly else "classic_melody"
+    else:
+        if dense_poly and piano_like:
+            resolved_mode = "e2e_onsets_frames" if oaf_available else "classic_piano_poly"
+        elif dense_poly:
+            resolved_mode = "e2e_basic_pitch" if bp_available else "classic_piano_poly"
+        elif song_like:
+            resolved_mode = "classic_song"
+        else:
+            resolved_mode = "classic_melody"
+
+    resolved_sep = req_sep_mode if req_sep_mode in ("off", "auto", "demucs") else _normalize_separation_mode(b_conf)
+    if str(resolved_mode).startswith("e2e_"):
+        resolved_sep = "off"
+
+    audio_type_str = _infer_audio_type_str(stage_a_out, routing_features)
+
+    decision_trace: Dict[str, Any] = {
+        "policy_version": ROUTING_POLICY_VERSION,
+        "requested": {"transcription_mode": str(req_mode), "profile": str(req_profile), "separation_mode": str(resolved_sep if manual_override else req_sep_mode)},
+        "resolved": {"transcription_mode": str(resolved_mode), "profile": str(req_profile), "separation_mode": str(resolved_sep), "audio_type": str(audio_type_str)},
+        "routing_features": dict(routing_features),
+        "rule_hits": list(rule_hits),
+        "separation": {
+            "ran": False,
+            "backend": "none",
+            "skip_reasons": [],
+            "gates": {
+                "min_duration_sec": float(_get(config, "stage_b.separation.gates.min_duration_sec", 8.0)),
+                "min_mixture_score": float(_get(config, "stage_b.separation.gates.min_mixture_score", 0.45)),
+                "bypass_if_synthetic_like": bool(_get(config, "stage_b.separation.gates.bypass_if_synthetic_like", True)),
+            },
+            "outputs": {"stems": ["mix"], "selected_primary_stem": "mix"},
+        },
+        "missing_deps": dict(missing),
+        "availability": {"onsets_frames": bool(oaf_available), "basic_pitch": bool(bp_available)},
+    }
+
+    try:
+        if pipeline_logger is not None and hasattr(pipeline_logger, "log_event"):
+            pipeline_logger.log_event("stage_b_decision_trace", decision_trace=decision_trace)
+    except Exception:
+        pass
+
+    return decision_trace
+
+
 def sigmoid(x):  # safe-ish
     x = max(-20.0, min(20.0, x))
     return 1.0 / (1.0 + math.exp(-x))
@@ -330,21 +641,6 @@ def viterbi_pitch(fused_cents, fused_conf, midi_states, transition_smoothness=0.
         path[t-1] = s
     smoothed_hz = [440.0 * (2**((midi_states[i]-69)/12.0)) for i in path]
     return smoothed_hz
-
-def _module_available(module_name: str) -> bool:
-    """Helper to avoid importing heavy optional deps when missing."""
-    mod = sys.modules.get(module_name)
-    if mod is not None and getattr(mod, "__spec__", None) is None:
-        return False
-
-    try:
-        spec = importlib.util.find_spec(module_name)
-    except (ModuleNotFoundError, ValueError):
-        spec = None
-
-    if spec is None and module_name in sys.modules:
-        return True
-    return spec is not None
 
 
 def _butter_filter(audio: np.ndarray, sr: int, cutoff: float, btype: str) -> np.ndarray:
@@ -641,52 +937,120 @@ def _run_htdemucs(
     return separated
 
 
-def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _resolve_separation(
+    stage_a_out: StageAOutput,
+    b_conf,
+    device: str = "cpu",
+    *,
+    routing_features: Optional[Dict[str, Any]] = None,
+    resolved_transcription_mode: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Resolve separation strategy and track which path actually executed.
-    Returns (stems, diagnostics).
+    Benchmark-safe separation routing.
+
+    Returns:
+      (stems, sep_trace) where sep_trace matches decision_trace["separation"] schema:
+        {
+          "ran": bool,
+          "backend": "demucs"|"synthetic_mdx"|"none",
+          "skip_reasons": [...],
+          "gates": {...},
+          "outputs": {"stems":[...], "selected_primary_stem": "..."}
+        }
     """
-    sep_enabled = b_conf.separation.get("enabled", True)
-    # Patch 6: explicit auto handling
-    is_auto = (isinstance(sep_enabled, str) and sep_enabled.lower() == "auto")
-    should_run = bool(sep_enabled)  # True or "auto" are truthy
+    sep = getattr(b_conf, "separation", {}) or {}
 
-    diag = {
-        "requested": sep_enabled,
-        "is_auto": is_auto,
-        "synthetic_requested": bool(b_conf.separation.get("synthetic_model", False)),
-        "mode": "disabled",
-        "synthetic_ran": False,
-        "htdemucs_ran": False,
-        "fallback": False,
-        "preset": None,
-        "resolved_overlap": None,
-        "resolved_shifts": None,
-        "shift_range": None,
-    }
+    # Requested mode normalization
+    mode = sep.get("mode", None)
+    enabled = sep.get("enabled", True)
 
-    if not should_run:
-        return stage_a_out.stems, diag
+    # Capture raw requested state for diagnostics
+    sep_enabled = enabled
 
-    if len(stage_a_out.stems) > 1 and any(k != "mix" for k in stage_a_out.stems.keys()):
-        diag["mode"] = "preseparated"
-        return stage_a_out.stems, diag
+    if isinstance(mode, str):
+        sep_mode = mode.lower().strip()
+    else:
+        sep_mode = "auto" if bool(enabled) else "off"
+        if isinstance(enabled, str) and enabled.lower().strip() == "auto":
+            sep_mode = "auto"
+    if sep_mode not in ("off", "auto", "demucs"):
+        sep_mode = "auto"
 
-    mix_stem = stage_a_out.stems.get("mix")
+    rf = routing_features or {}
+    duration_sec = float(getattr(getattr(stage_a_out, "meta", None), "duration_sec", 0.0) or 0.0)
+    synthetic_like = bool(rf.get("synthetic_like", False))
+    mixture_score = float(rf.get("mixture_score", 0.0) or 0.0)
+
+    gates = sep.get("gates", {}) or {}
+    min_duration_sec = float(gates.get("min_duration_sec", 8.0))
+    min_mixture_score = float(gates.get("min_mixture_score", 0.45))
+    bypass_if_synth = bool(gates.get("bypass_if_synthetic_like", True))
+
+    def _skip(reason_list: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        return (
+            getattr(stage_a_out, "stems", {"mix": (getattr(stage_a_out, "stems", {}) or {}).get("mix", None)}),
+            {
+                "ran": False,
+                "requested": bool(sep_enabled) if 'sep_enabled' in locals() else False,
+                "backend": "none",
+                "skip_reasons": list(reason_list),
+                "gates": {
+                    "min_duration_sec": float(min_duration_sec),
+                    "min_mixture_score": float(min_mixture_score),
+                    "bypass_if_synthetic_like": bool(bypass_if_synth),
+                },
+                "outputs": {"stems": ["mix"], "selected_primary_stem": "mix"},
+                # Backward compatibility keys
+                "mode": "disabled",
+                "synthetic_ran": False,
+                "htdemucs_ran": False,
+                "fallback": False,
+            },
+        )
+
+    # E2E forces off
+    if str(resolved_transcription_mode or "").startswith("e2e_"):
+        return _skip(["e2e_mode"])
+
+    if sep_mode == "off":
+        return _skip(["off"])
+
+    skip_reasons: List[str] = []
+    if bypass_if_synth and synthetic_like:
+        skip_reasons.append("synthetic_like")
+    if duration_sec > 0.0 and duration_sec < min_duration_sec:
+        skip_reasons.append("short_duration")
+    if mixture_score < min_mixture_score:
+        skip_reasons.append("low_mixture_score")
+
+    if skip_reasons:
+        return _skip(skip_reasons)
+
+    # Patch: Ensure 'requested' key is present in success path diagnostics too
+    # by merging extras. Ideally _skip() handles it, but success path needs it.
+
+    use_synth = bool(sep.get("synthetic_model", False))
+    backend = "synthetic_mdx" if use_synth else "demucs"
+
+    mix_stem = (getattr(stage_a_out, "stems", {}) or {}).get("mix", None)
     if mix_stem is None:
-        return stage_a_out.stems, diag
+         return _skip(["no_mix_stem"])
 
+    mix_audio = getattr(mix_stem, "audio", None)
+    if mix_audio is None:
+         return _skip(["no_audio"])
+
+    # Setup for backward compatibility logic (resolving preset/overlap/shifts)
     sep_conf = b_conf.separation
     overlap = sep_conf.get("overlap", 0.25)
     shifts = sep_conf.get("shifts", 1)
 
     preset_conf: Dict[str, Any] = {}
+    preset_name = None
     if getattr(stage_a_out, "audio_type", None) == AudioType.POLYPHONIC_DOMINANT:
         preset_conf = sep_conf.get("polyphonic_dominant_preset", {}) or {}
-        diag["preset"] = "polyphonic_dominant"
+        preset_name = "polyphonic_dominant"
         overlap = float(preset_conf.get("overlap", overlap))
-        if preset_conf.get("shift_range"):
-            diag["shift_range"] = list(preset_conf.get("shift_range"))
         if "shifts" in preset_conf:
             shifts = int(preset_conf.get("shifts", shifts))
         else:
@@ -697,46 +1061,95 @@ def _resolve_separation(stage_a_out: StageAOutput, b_conf, device: str = "cpu") 
                 except (TypeError, ValueError):
                     shifts = int(shifts)
 
-    diag["resolved_overlap"] = overlap
-    diag["resolved_shifts"] = shifts
+    diag_extras = {
+        "preset": preset_name,
+        "resolved_overlap": overlap,
+        "resolved_shifts": shifts,
+        "shift_range": preset_conf.get("shift_range", None)
+    }
 
-    if diag["synthetic_requested"]:
-        synthetic = SyntheticMDXSeparator(sample_rate=mix_stem.sr, hop_length=stage_a_out.meta.hop_length)
-        try:
-            synthetic_stems = synthetic.separate(mix_stem.audio, mix_stem.sr)
-            if synthetic_stems:
-                diag.update({"mode": "synthetic_mdx", "synthetic_ran": True})
-                return {
-                    name: type(mix_stem)(audio=audio, sr=mix_stem.sr, type=name)
-                    for name, audio in synthetic_stems.items()
-                } | {"mix": mix_stem}, diag
-        except Exception as exc:
-            logger.warning(
-                f"Synthetic separator failed; falling back to {sep_conf.get('model', 'htdemucs')}: {exc}"
+    try:
+        raw_stems = {}
+        if use_synth:
+            model = SyntheticMDXSeparator(sample_rate=mix_stem.sr, hop_length=getattr(stage_a_out.meta, "hop_length", 512))
+            raw_stems = model.separate(mix_audio, mix_stem.sr)
+        else:
+            raw_stems = _run_htdemucs(
+                mix_audio,
+                mix_stem.sr,
+                str(sep.get("model_name", "htdemucs")),
+                overlap,
+                shifts,
+                device
             )
-            diag["fallback"] = True
 
-    separated = _run_htdemucs(
-        mix_stem.audio,
-        mix_stem.sr,
-        sep_conf.get("model", "htdemucs"),
-        overlap,
-        shifts,
-        device=device,
-    )
+        if not raw_stems:
+             # Fallback
+             return _skip(["backend_returned_empty"])
 
-    if separated:
-        diag.update({"mode": sep_conf.get("model", "htdemucs"), "htdemucs_ran": True})
-        return {
-            name: type(mix_stem)(audio=audio, sr=mix_stem.sr, type=name)
-            for name, audio in separated.items()
-        } | {"mix": mix_stem}, diag
+        # Normalize and Resample
+        # Ensure outputs are at mix_stem.sr and match mix_audio length
+        target_sr = mix_stem.sr
+        target_len = len(mix_audio)
 
-    diag["mode"] = "passthrough"
-    if is_auto:
-        diag["fallback_reason"] = "htdemucs_failed_or_missing_in_auto"
+        final_stems: Dict[str, Stem] = {}
+        # Always include mix
+        final_stems["mix"] = mix_stem
 
-    return stage_a_out.stems, diag
+        for k, v in raw_stems.items():
+            if not isinstance(v, np.ndarray):
+                continue
+
+            out_audio = v
+            # If shape mismatch, we might need simple resampling/pad/trim
+            # _run_htdemucs returns at model_sr, but we don't know model_sr here easily without checking length ratio?
+            # Actually _run_htdemucs implementation I have above does NOT resample back.
+            # So if length is different, it means SR is different (assuming duration preserved).
+
+            if len(out_audio) != target_len and target_len > 0:
+                # Simple linear interpolation to match target length
+                x_old = np.linspace(0, 1, len(out_audio))
+                x_new = np.linspace(0, 1, target_len)
+                out_audio = np.interp(x_new, x_old, out_audio).astype(np.float32)
+
+            final_stems[k] = type(mix_stem)(audio=out_audio, sr=target_sr, type=k)
+
+        stem_names = sorted(list(final_stems.keys()))
+        selected = "mix"
+        if "vocals" in final_stems:
+            selected = "vocals"
+        elif "other" in final_stems:
+            selected = "other"
+        elif stem_names:
+            selected = stem_names[0]
+
+        return final_stems, {
+            "ran": True,
+            "requested": bool(sep_enabled),
+            "backend": backend,
+            "skip_reasons": [],
+            "gates": {
+                "min_duration_sec": float(min_duration_sec),
+                "min_mixture_score": float(min_mixture_score),
+                "bypass_if_synthetic_like": bool(bypass_if_synth),
+            },
+            "outputs": {"stems": stem_names, "selected_primary_stem": str(selected)},
+            # Backward compatibility
+            "mode": "synthetic_mdx" if use_synth else sep.get("model_name", "htdemucs"),
+            "synthetic_ran": bool(use_synth),
+            "htdemucs_ran": not bool(use_synth),
+            "fallback": False,
+            **diag_extras
+        }
+
+    except Exception:
+        # Backward compat diag for fallback
+        d = _skip(["runtime_error"])[1]
+        d["fallback"] = True
+        if sep_mode == "auto":
+             d["fallback_reason"] = "htdemucs_failed_or_missing_in_auto"
+        return _skip(["runtime_error"])[0], d
+
 
 def _arrays_to_timeline(
     f0: np.ndarray,
@@ -1257,9 +1670,23 @@ def extract_features(
     )
 
     # -------------------------------------------------------------------------
+    # Stage B Decision Trace (schema-stable, deterministic)
+    # -------------------------------------------------------------------------
+    decision_trace = compute_decision_trace(
+        stage_a_out,
+        config,
+        requested_mode=getattr(b_conf, "transcription_mode", "classic"),
+        requested_profile=str(instrument),
+        requested_separation_mode=_normalize_separation_mode(b_conf),
+        pipeline_logger=pipeline_logger,
+    )
+    resolved_mode = str(decision_trace.get("resolved", {}).get("transcription_mode", getattr(b_conf, "transcription_mode", "classic")))
+    routing_features = dict(decision_trace.get("routing_features", {}) or {})
+
+    # -------------------------------------------------------------------------
     # E2E / Neural Transcription Routing (Basic Pitch)
     # -------------------------------------------------------------------------
-    transcription_mode = getattr(b_conf, "transcription_mode", "classic")
+    transcription_mode = resolved_mode
 
     # Auto logic: try to use E2E if basic_pitch is importable
     if transcription_mode == "auto":
@@ -1304,7 +1731,7 @@ def extract_features(
                     stem_timelines={},
                     per_detector={},
                     meta=stage_a_out.meta,
-                    diagnostics={"stage_b_mode": "e2e_basic_pitch"},
+                    diagnostics={"stage_b_mode": "e2e_basic_pitch", "decision_trace": decision_trace},
                     precalculated_notes=notes,
                 )
         except Exception as e:
@@ -1381,7 +1808,19 @@ def extract_features(
     # Separation routing happens before harmonic masking/ISS so downstream
     # detectors always see the requested stem layout.
     device = getattr(config, "device", "cpu")
-    resolved_stems, separation_diag = _resolve_separation(stage_a_out, b_conf, device=device)
+    resolved_stems, separation_diag = _resolve_separation(
+        stage_a_out,
+        b_conf,
+        device=device,
+        routing_features=routing_features,
+        resolved_transcription_mode=resolved_mode,
+    )
+
+    # attach to decision_trace (schema-stable)
+    try:
+        decision_trace["separation"] = separation_diag
+    except Exception:
+        pass
 
     # Patch OPT6: Apply active_stems filter
     whitelist = getattr(b_conf, "active_stems", None)
@@ -1904,7 +2343,7 @@ def extract_features(
 
     # Patch D6: Diagnostics recording resolved profile
     diagnostics = {
-        "transcription_mode": transcription_mode,  # Task 2.4: Explicit mode
+        "transcription_mode": resolved_mode,  # Task 2.4: Explicit mode
         "stage_b_mode": "classic",
         "instrument": str(instrument),
         "profile": profile.instrument if profile else None,
@@ -1937,6 +2376,7 @@ def extract_features(
         "global_tuning_cents": tuning_cents_val,
         "debug_curves": stem_debug_curves,
         "layer_conf_summaries": locals().get("layer_conf_summaries", {}),
+        "decision_trace": decision_trace,
     }
 
     primary_timeline = (

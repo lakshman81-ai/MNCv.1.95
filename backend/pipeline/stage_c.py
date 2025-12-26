@@ -648,6 +648,113 @@ def _snap_chord_starts(notes: List[NoteEvent], tol_ms: float = 25.0) -> List[Not
     return out
 
 
+def _snap_chord_starts_with_count(notes: List[NoteEvent], tol_ms: float = 25.0) -> Tuple[List[NoteEvent], int]:
+    """Chord snap + count of moved notes."""
+    if not notes:
+        return notes, 0
+    tol = tol_ms / 1000.0
+    notes = sorted(notes, key=lambda n: (float(n.start_sec), int(getattr(n, "midi_note", 0))))
+    moved = 0
+    i = 0
+    out: List[NoteEvent] = []
+    while i < len(notes):
+        j = i + 1
+        group = [notes[i]]
+        while j < len(notes) and abs(float(notes[j].start_sec) - float(notes[i].start_sec)) <= tol:
+            group.append(notes[j])
+            j += 1
+        if len(group) >= 2:
+            s0 = min(float(n.start_sec) for n in group)
+            for n in group:
+                if abs(float(n.start_sec) - s0) > 1e-9:
+                    moved += 1
+                n.start_sec = s0
+        out.extend(group)
+        i = j
+    return out, moved
+
+
+def _merge_same_pitch_gaps(
+    notes: List[NoteEvent],
+    max_gap_ms: float = 60.0,
+    *,
+    max_merge_dur_s: float = 8.0,
+    clamp_factor: float = 4.0,
+) -> Tuple[List[NoteEvent], int]:
+    """
+    Merge same-pitch notes separated by tiny gaps to reduce fragmentation.
+    Guardrails:
+      - same midi_note
+      - same voice (when present)
+      - gap <= max_gap_ms
+      - prevents absurd merges (max_merge_dur_s, clamp_factor)
+    """
+    if not notes:
+        return notes, 0
+
+    gap_s = float(max_gap_ms) / 1000.0
+    notes_sorted = sorted(
+        notes,
+        key=lambda n: (
+            int(getattr(n, "voice", -1) if getattr(n, "voice", None) is not None else -1),
+            int(getattr(n, "midi_note", 0)),
+            float(n.start_sec),
+            float(n.end_sec),
+        ),
+    )
+
+    merged = 0
+    out: List[NoteEvent] = []
+    i = 0
+    while i < len(notes_sorted):
+        cur = notes_sorted[i]
+        j = i + 1
+        while j < len(notes_sorted):
+            nxt = notes_sorted[j]
+            if int(getattr(nxt, "midi_note", -999)) != int(getattr(cur, "midi_note", -999)):
+                break
+            if getattr(cur, "voice", None) is not None or getattr(nxt, "voice", None) is not None:
+                if getattr(cur, "voice", None) != getattr(nxt, "voice", None):
+                    break
+
+            gap = float(nxt.start_sec) - float(cur.end_sec)
+            if gap < -1e-6:
+                break
+            if gap > gap_s:
+                break
+
+            new_end = max(float(cur.end_sec), float(nxt.end_sec))
+            new_dur = new_end - float(cur.start_sec)
+            cur_dur = float(cur.end_sec) - float(cur.start_sec)
+            nxt_dur = float(nxt.end_sec) - float(nxt.start_sec)
+            ref = max(cur_dur, nxt_dur, 1e-6)
+
+            if new_dur > float(max_merge_dur_s):
+                break
+            if new_dur > float(clamp_factor) * ref:
+                break
+
+            cur.end_sec = new_end
+            try:
+                cur.confidence = float(max(float(getattr(cur, "confidence", 0.0) or 0.0), float(getattr(nxt, "confidence", 0.0) or 0.0)))
+            except Exception:
+                pass
+            if getattr(cur, "velocity", None) is not None and getattr(nxt, "velocity", None) is not None:
+                try:
+                    cur.velocity = float(max(float(cur.velocity), float(nxt.velocity)))
+                except Exception:
+                    pass
+
+            merged += 1
+            j += 1
+
+        out.append(cur)
+        i = j
+
+    out = sorted(out, key=lambda n: (float(n.start_sec), float(n.end_sec), int(getattr(n, "midi_note", 0))))
+    return out, merged
+
+
 def _timeline_score(timeline: list) -> tuple[float, float]:
     """Return (voiced_ratio, mean_confidence) for a FramePitch timeline."""
     if not timeline:
@@ -1056,11 +1163,34 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                 if new_start < float(n.start_sec):
                     n.start_sec = float(new_start)
 
-    if poly_used:
+    # ---------------------------------------------------------------------
+    # Stage C Post-processing (poly stability)
+    # ---------------------------------------------------------------------
+    snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
+    merge_gap_ms = float(
+        _get(config, "stage_c.post_merge.max_gap_ms", None)
+        or _get(config, "stage_c.gap_filling.max_gap_ms", None)
+        or 60.0
+    )
+    merge_gap_ms = float(min(max(merge_gap_ms, 0.0), 200.0))
+
+    gap_merges = 0
+    chord_snaps = 0
+
+    do_poly_post = bool(poly_used) or len(notes) >= 2
+    if do_poly_post:
         notes = _dedupe_overlapping_notes(notes)
-        snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
+
+        if merge_gap_ms > 0:
+            notes, gap_merges = _merge_same_pitch_gaps(
+                notes,
+                max_gap_ms=merge_gap_ms,
+                max_merge_dur_s=float(_get(config, "stage_c.post_merge.max_merge_dur_s", 8.0) or 8.0),
+                clamp_factor=float(_get(config, "stage_c.post_merge.clamp_factor", 4.0) or 4.0),
+            )
+
         if snap_ms > 0:
-            notes = _snap_chord_starts(notes, tol_ms=snap_ms)
+            notes, chord_snaps = _snap_chord_starts_with_count(notes, tol_ms=snap_ms)
 
     raw_notes = _sanitize_notes(notes)
     analysis_data.notes_before_quantization = list(raw_notes)
@@ -1072,6 +1202,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             "note_count_raw": len(raw_notes),
             "selected_stem": stem_name,
             "quantize_enabled": quantize_enabled,
+        }
+        analysis_data.diagnostics["stage_c_post"] = {
+            "gap_merges": int(locals().get("gap_merges", 0) or 0),
+            "chord_snaps": int(locals().get("chord_snaps", 0) or 0),
+            "snap_tol_ms": float(locals().get("snap_ms", 0.0) or 0.0),
+            "merge_gap_ms": float(locals().get("merge_gap_ms", 0.0) or 0.0),
         }
 
     if not quantize_enabled:
