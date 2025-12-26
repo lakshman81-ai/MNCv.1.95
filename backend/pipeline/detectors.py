@@ -124,9 +124,14 @@ def _autocorr_pitch_per_frame(
 
         # FFT based autocorrelation
         # Use scipy.fft if available (via _FFT_LIB)
-        X = _FFT_LIB.rfft(x_batch, n=n_fft, axis=1)
+        # Use next_fast_len for optimal FFT size if using SciPy
+        fft_len = n_fft
+        if _FFT_LIB is not np.fft and hasattr(_FFT_LIB, "next_fast_len"):
+             fft_len = _FFT_LIB.next_fast_len(n_fft)
+
+        X = _FFT_LIB.rfft(x_batch, n=fft_len, axis=1)
         P = X * np.conj(X)
-        ac = _FFT_LIB.irfft(P, n=n_fft, axis=1)
+        ac = _FFT_LIB.irfft(P, n=fft_len, axis=1)
 
         # 5. Extract non-negative lags (0 to frame_length-1)
         # The first 'frame_length' samples of irfft result correspond to lags 0..L-1
