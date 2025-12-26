@@ -6,7 +6,9 @@ L6 ("Synthetic Pop Song") debug runner with:
 - deterministic synth generation
 - baseline run + metrics + artifacts
 - parameter sweep for Stage C + quality gate
-- robust forcing of polyphonic intent (POLYPHONIC_DOMINANT) when transcribe() supports it
+- robust forcing of polyphonic intent when transcribe() supports it
+    - prefers transcribe(..., requested_mode="classic_song")
+    - falls back to older "audio_type" style args if present
 - config-path setter that can create missing dict nodes
 - safe handling of decision_trace when it is not a dict
 - clean error if synth backend (soundfile) is missing
@@ -98,7 +100,7 @@ def _cfg_set_path(cfg: Any, path: str, value: Any) -> bool:
     Set cfg field given dotted path, supporting dataclasses/objects and dicts.
     Creates dict nodes if needed.
 
-    This version fixes the original sweep bug:
+    Fixes the original sweep bug:
     - allows setting missing LEAF attributes (setattr on last segment)
     - creates missing INTERMEDIATE nodes as dict buckets (e.g., post_merge)
     """
@@ -317,22 +319,37 @@ def _print_file(path: str, title: str) -> None:
         print(f"(could not read {path}: {e})")
 
 
-def _transcribe_force_polyphonic(
+def _call_transcribe_with_intent(
     wav_path: str,
     cfg: PipelineConfig,
     device: str,
     pipeline_logger: PipelineLogger,
+    *,
+    forced_mode: str = "classic_song",
+    forced_profile: Optional[str] = None,
     forced_audio_type: str = "POLYPHONIC_DOMINANT",
 ):
     """
-    Force L6-like intent without relying on unverified config strings.
-    If transcribe() supports an 'audio_type' (or similar) kwarg, pass it.
-    Otherwise, just call transcribe() normally (and the report will show resolved routing).
+    Force L6-like intent without hard-coding to any single transcribe() signature.
+
+    Preferred (new) API:
+      transcribe(..., requested_mode="classic_song", requested_profile="piano_61key")
+
+    Back-compat (older debug runner approach):
+      transcribe(..., audio_type="POLYPHONIC_DOMINANT") if available.
     """
     kwargs: Dict[str, Any] = {}
     try:
         sig = inspect.signature(transcribe)
         params = sig.parameters
+
+        # NEW: our recommended override path (matches your updated backend/pipeline/transcribe.py)
+        if "requested_mode" in params:
+            kwargs["requested_mode"] = forced_mode
+        if forced_profile is not None and "requested_profile" in params:
+            kwargs["requested_profile"] = forced_profile
+
+        # Older/alternative override names (if they exist in some branches)
         if "audio_type" in params:
             kwargs["audio_type"] = forced_audio_type
         elif "requested_audio_type" in params:
@@ -341,8 +358,10 @@ def _transcribe_force_polyphonic(
             kwargs["forced_audio_type"] = forced_audio_type
         elif "audio_type_override" in params:
             kwargs["audio_type_override"] = forced_audio_type
+
     except Exception:
-        pass
+        # If inspect fails, just call normally.
+        kwargs = {}
 
     return transcribe(wav_path, config=cfg, pipeline_logger=pipeline_logger, device=device, **kwargs)
 
@@ -359,8 +378,20 @@ def main() -> int:
     ap.add_argument("--max-combos", type=int, default=9, help="Max sweep combinations to run (cap)")
     ap.add_argument("--duration-sec", type=float, default=60.0, help="Synth duration")
     ap.add_argument("--tempo-bpm", type=float, default=110.0, help="Synth tempo")
-    args = ap.parse_args()
 
+    # NEW: explicit forced mode (default fixes L6 mono-routing failures)
+    ap.add_argument(
+        "--forced-mode",
+        default="classic_song",
+        help='Force pipeline mode when supported (e.g. "classic_song", "classic_piano_poly", "classic_melody")',
+    )
+    ap.add_argument(
+        "--forced-profile",
+        default="piano_61key",
+        help='Force profile string when supported (e.g. "piano_61key").',
+    )
+
+    args = ap.parse_args()
     np.random.seed(args.seed)
 
     reports_root = os.path.abspath(args.reports)
@@ -374,7 +405,10 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(log_path, mode="w", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
     logger = logging.getLogger("l6_debug_runner")
     logger.info("Run ID: %s", run_id)
@@ -405,16 +439,16 @@ def main() -> int:
     # ---- Baseline config (match L6 intent) ----
     base_cfg = PipelineConfig()
 
-    # Avoid Demucs on synthetic benches (as in benchmark_runner L6)
+    # Bias profile for synthetic routing (harmless even if unused)
     try:
-        base_cfg.stage_b.separation["enabled"] = False
+        if hasattr(base_cfg.stage_b, "instrument"):
+            base_cfg.stage_b.instrument = str(args.forced_profile)
     except Exception:
         pass
 
-    # Ensure we are in classic (non-e2e) unless you explicitly want e2e
-    # (Do NOT assume "classic_song" exists; keep it schema-valid.)
+    # Avoid Demucs on synthetic benches (as in benchmark_runner L6)
     try:
-        base_cfg.stage_b.transcription_mode = "classic"
+        base_cfg.stage_b.separation["enabled"] = False
     except Exception:
         pass
 
@@ -426,13 +460,24 @@ def main() -> int:
     except Exception:
         pass
 
+    # Helpful: enable the common detector set if present (safe no-ops if keys missing)
+    try:
+        dets = getattr(base_cfg.stage_b, "detectors", None)
+        if isinstance(dets, dict):
+            for k in ("swiftf0", "yin", "crepe", "rmvpe"):
+                if k in dets and isinstance(dets[k], dict):
+                    dets[k]["enabled"] = True
+            base_cfg.stage_b.detectors = dets
+    except Exception:
+        pass
+
     # Ensure Stage C is set to extract top voice (Lead-only GT)
     try:
         base_cfg.stage_c.polyphony_filter = {"mode": "skyline_top_voice"}
     except Exception:
         pass
 
-    # Make sure chord snap exists and is a sane default (your config.py defines it)
+    # Ensure chord snap exists and is a sane default (works even if StageCConfig lacks the field)
     try:
         base_cfg.stage_c.chord_onset_snap_ms = 25.0
     except Exception:
@@ -446,10 +491,17 @@ def main() -> int:
             pass
 
     # ---- Baseline run ----
-    logger.info("Running baseline transcribe() ...")
+    logger.info("Running baseline transcribe() ... forced_mode=%s forced_profile=%s", args.forced_mode, args.forced_profile)
     plog = PipelineLogger()
     t0 = time.time()
-    tr = _transcribe_force_polyphonic(wav_path, cfg=base_cfg, device=args.device, pipeline_logger=plog)
+    tr = _call_transcribe_with_intent(
+        wav_path,
+        cfg=base_cfg,
+        device=args.device,
+        pipeline_logger=plog,
+        forced_mode=str(args.forced_mode),
+        forced_profile=str(args.forced_profile) if args.forced_profile else None,
+    )
     elapsed = time.time() - t0
 
     analysis = tr.analysis_data
@@ -474,6 +526,7 @@ def main() -> int:
         "stage_c_post": diag.get("stage_c_post", {}) if isinstance(diag, dict) else {},
         "timing": diag.get("timing", {"total_sec": float(elapsed)}) if isinstance(diag, dict) else {"total_sec": float(elapsed)},
         "config": _asdict_safe(base_cfg),
+        "forced": {"mode": str(args.forced_mode), "profile": str(args.forced_profile)},
     }
 
     # Save baseline snapshot files
@@ -531,7 +584,14 @@ def main() -> int:
                 pass
 
         t1 = time.time()
-        tr_s = _transcribe_force_polyphonic(wav_path, cfg=cfg, device=args.device, pipeline_logger=PipelineLogger())
+        tr_s = _call_transcribe_with_intent(
+            wav_path,
+            cfg=cfg,
+            device=args.device,
+            pipeline_logger=PipelineLogger(),
+            forced_mode=str(args.forced_mode),
+            forced_profile=str(args.forced_profile) if args.forced_profile else None,
+        )
         dt_s = time.time() - t1
 
         analysis_s = tr_s.analysis_data
@@ -566,7 +626,7 @@ def main() -> int:
                     "onset_mae_ms": met_s.get("onset_mae_ms"),
                     "voiced_ratio": met_s.get("voiced_ratio"),
                     "fragmentation_score": met_s.get("fragmentation_score"),
-                    "median_note_len_ms": met_s.get("median_note_len_ms"),
+                    "median_note_len_ms": met_s.get("median_note_dur_ms") or met_s.get("median_note_len_ms"),
                     "note_count": met_s.get("note_count"),
                     "octave_jump_rate": met_s.get("octave_jump_rate"),
                     "timing_total_sec": met_s.get("timing_total_sec"),
@@ -581,6 +641,7 @@ def main() -> int:
                 "run_id": run_id,
                 "baseline": {"metrics": metrics, "run_info_path": base_run_info_path},
                 "sweep": sweep_rows,
+                "forced": {"mode": str(args.forced_mode), "profile": str(args.forced_profile)},
             },
             f,
             indent=2,
