@@ -108,8 +108,16 @@ def _candidate_order(routed_mode: str) -> List[str]:
     """
     Deterministic fallback chain.
     (We don’t run everything; we run until we find an accepted candidate.)
+
+    NOTE: These mode ids must match your routing + Stage B logic.
     """
-    all_modes = ["e2e_onsets_frames", "e2e_basic_pitch", "classic_piano_poly", "classic_song", "classic_melody"]
+    all_modes = [
+        "e2e_onsets_frames",
+        "e2e_basic_pitch",
+        "classic_piano_poly",
+        "classic_song",
+        "classic_melody",
+    ]
     routed_mode = routed_mode if routed_mode in all_modes else "classic_melody"
     rest = [m for m in all_modes if m != routed_mode]
     return [routed_mode] + rest
@@ -120,7 +128,21 @@ def transcribe(
     config: Optional[PipelineConfig] = None,
     pipeline_logger: Optional[PipelineLogger] = None,
     device: str = "cpu",
+    *,
+    # ---- NEW: explicit caller overrides (fixes L6 debug runner relying on "auto") ----
+    requested_mode: Optional[str] = None,
+    requested_profile: Optional[str] = None,
+    requested_separation_mode: Optional[str] = None,
 ) -> TranscriptionResult:
+    """
+    High-level transcription entry point with unified quality gate.
+
+    Why the new args:
+    - Some benchmarks/debug runners generate synthetic audio with weak/unknown metadata.
+      In those cases, auto-routing can pick a mono-biased mode and tank L6 results.
+    - Callers (like tools/l6_debug_runner.py) can now force the intended mode explicitly:
+        transcribe(..., requested_mode="classic_song")
+    """
     if config is None:
         config = PipelineConfig()
     if pipeline_logger is None:
@@ -132,16 +154,29 @@ def transcribe(
     stage_a_out = load_and_preprocess(audio_path, config, pipeline_logger=pipeline_logger)
     duration_sec = float(getattr(getattr(stage_a_out, "meta", None), "duration_sec", 0.0) or 0.0)
 
+    # Resolve caller intent (defaults preserved)
+    cfg_mode = getattr(config.stage_b, "transcription_mode", "auto")
+    req_mode = str(requested_mode) if requested_mode is not None else str(cfg_mode)
+
+    meta_profile = str(getattr(getattr(stage_a_out, "meta", None), "instrument", None) or "unknown")
+    req_profile = str(requested_profile) if requested_profile is not None else meta_profile
+
     # ---------------- Routing (Stage B trace only) ----------------
     base_trace = compute_decision_trace(
         stage_a_out,
         config,
-        requested_mode=getattr(config.stage_b, "transcription_mode", "auto"),
-        requested_profile=str(getattr(getattr(stage_a_out, "meta", None), "instrument", None) or "unknown"),
-        requested_separation_mode=None,
+        requested_mode=req_mode,
+        requested_profile=req_profile,
+        requested_separation_mode=requested_separation_mode,
         pipeline_logger=pipeline_logger,
     )
-    routed_mode = str(base_trace.get("resolved", {}).get("transcription_mode", "classic_melody"))
+
+    # If caller forced a specific mode (not auto), respect it for the candidate chain start.
+    if req_mode and req_mode != "auto":
+        routed_mode = req_mode
+    else:
+        routed_mode = str(base_trace.get("resolved", {}).get("transcription_mode", "classic_melody"))
+
     candidate_ids = _candidate_order(routed_mode)
 
     # ---------------- Unified Quality Gate ----------------
@@ -166,7 +201,6 @@ def transcribe(
         if idx >= q_max_candidates:
             break
 
-        cand_reason = ""
         cand_decision = "evaluated"
         cand_score = 0.0
         cand_metrics: Dict[str, Any] = {}
@@ -176,7 +210,7 @@ def transcribe(
         try:
             cand_cfg = copy.deepcopy(config)
 
-            # Force requested mode for consistency (decision trace must reflect it)
+            # Force requested mode for this candidate (decision trace must reflect it)
             cand_cfg.stage_b.transcription_mode = cand_id
 
             if cand_id == "e2e_onsets_frames":
@@ -198,7 +232,8 @@ def transcribe(
                     stage_a_out,
                     cand_cfg,
                     requested_mode="e2e_onsets_frames",
-                    requested_profile=str(getattr(stage_a_out.meta, "instrument", "unknown")),
+                    requested_profile=req_profile,
+                    requested_separation_mode=requested_separation_mode,
                     pipeline_logger=pipeline_logger,
                 )
 
@@ -214,8 +249,14 @@ def transcribe(
 
             else:
                 # Classic + BasicPitch both go through Stage B -> Stage C
-                stage_b_out = extract_features(stage_a_out, config=cand_cfg, pipeline_logger=pipeline_logger, device=device)
-                cand_trace = dict((stage_b_out.diagnostics or {}).get("decision_trace", {})) if hasattr(stage_b_out, "diagnostics") else {}
+                stage_b_out = extract_features(
+                    stage_a_out, config=cand_cfg, pipeline_logger=pipeline_logger, device=device
+                )
+                cand_trace = (
+                    dict((stage_b_out.diagnostics or {}).get("decision_trace", {}))
+                    if hasattr(stage_b_out, "diagnostics")
+                    else {}
+                )
 
                 # Convert StageBOutput to AnalysisData for Stage C
                 cand_analysis = AnalysisData(
@@ -223,7 +264,7 @@ def transcribe(
                     timeline=stage_b_out.timeline,
                     stem_timelines=stage_b_out.stem_timelines,
                     diagnostics=stage_b_out.diagnostics,
-                    precalculated_notes=stage_b_out.precalculated_notes
+                    precalculated_notes=stage_b_out.precalculated_notes,
                 )
 
                 # Stage C (updates cand_analysis.notes in-place)
@@ -242,7 +283,9 @@ def transcribe(
             cand_metrics = _quality_metrics(notes_raw, duration_sec, timeline_source=timeline_src)
             cand_score = _quality_score(cand_metrics)
 
-            accepted = (not q_enabled) or (int(cand_metrics.get("note_count", 0)) > 0 and cand_score >= q_threshold)
+            accepted = (not q_enabled) or (
+                int(cand_metrics.get("note_count", 0)) > 0 and cand_score >= q_threshold
+            )
             cand_decision = "accepted" if accepted else "rejected"
             cand_reason = "ok" if accepted else "below_threshold"
 
@@ -250,28 +293,39 @@ def transcribe(
             if best is None or cand_score > best[1]:
                 best = (cand_id, cand_score, cand_analysis)
 
-            candidates.append({
-                "candidate_id": cand_id,
-                "score": float(cand_score),
-                "metrics": dict(cand_metrics),
-                "decision": cand_decision,
-                "reason": cand_reason,
-            })
+            candidates.append(
+                {
+                    "candidate_id": cand_id,
+                    "score": float(cand_score),
+                    "metrics": dict(cand_metrics),
+                    "decision": cand_decision,
+                    "reason": cand_reason,
+                }
+            )
 
             if accepted:
                 # stop at first accepted (deterministic fallback chain)
                 break
+
             fallbacks_triggered.append(f"fallback_from_{cand_id}")
 
         except Exception as e:
             fallbacks_triggered.append(f"error_{cand_id}")
-            candidates.append({
-                "candidate_id": cand_id,
-                "score": 0.0,
-                "metrics": {"voiced_ratio": 0.0, "note_count": 0, "notes_per_sec": 0.0, "median_note_dur_ms": 0.0, "fragmentation_lt_80ms": 0.0},
-                "decision": "rejected",
-                "reason": f"error:{type(e).__name__}",
-            })
+            candidates.append(
+                {
+                    "candidate_id": cand_id,
+                    "score": 0.0,
+                    "metrics": {
+                        "voiced_ratio": 0.0,
+                        "note_count": 0,
+                        "notes_per_sec": 0.0,
+                        "median_note_dur_ms": 0.0,
+                        "fragmentation_lt_80ms": 0.0,
+                    },
+                    "decision": "rejected",
+                    "reason": f"error:{type(e).__name__}",
+                }
+            )
 
     if best is None:
         # ultimate fallback: empty analysis
