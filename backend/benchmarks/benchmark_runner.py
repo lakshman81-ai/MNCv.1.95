@@ -11,6 +11,17 @@ This module implements the full benchmark ladder:
 - L6: Synthetic Pop Song (music21-generated score: melody + chords + bass)
 
 It validates algorithm selection (Stage B), records polyphonic diagnostics, and saves artifacts/metrics.
+
+Key fixes applied in this version:
+- L6 now explicitly forces melody-only evaluation behavior via Stage C polyphony_filter ("skyline_top_voice")
+  to match GT(parts=["Lead"]).
+- L6 also explicitly sets stage_b.transcription_mode="classic_song" (prevents mono default via router).
+- Robust dict creation for separation.harmonic_masking and detector configs (no KeyError).
+- run_pipeline_on_audio now passes pipeline_logger/device to extract_features when supported, and
+  constructs AnalysisData using StageBOutput timeline/diagnostics/precalculated_notes when available
+  (aligns with backend.pipeline.transcribe design; fixes missing timeline/diagnostics bugs).
+- L5.* “freeze classic” fixed: previously wrote config.transcription_mode (wrong); now sets config.stage_b.transcription_mode.
+- Optional, friendly error messaging if soundfile/synth backend is missing, instead of crashing at import time.
 """
 
 from __future__ import annotations
@@ -25,30 +36,54 @@ import logging
 import numpy as np
 import warnings
 import tempfile
-import soundfile as sf
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import asdict, is_dataclass
+
+import math  # used for cents jump calculations
+
+import music21
 from music21 import tempo, chord
 
 from backend.pipeline.config import PipelineConfig, InstrumentProfile
 from backend.pipeline.instrumentation import PipelineLogger
 from backend.pipeline.models import (
-    StageAOutput, MetaData, Stem, AnalysisData, AudioType, NoteEvent
+    StageAOutput,
+    MetaData,
+    Stem,
+    AnalysisData,
+    AudioType,
+    NoteEvent,
 )
-from backend.pipeline.stage_a import load_and_preprocess, detect_tempo_and_beats
+from backend.pipeline.stage_a import detect_tempo_and_beats
 from backend.pipeline.stage_b import extract_features
-from backend.pipeline.stage_c import apply_theory, quantize_notes
+from backend.pipeline.stage_c import apply_theory
 from backend.pipeline.stage_d import quantize_and_render
 from backend.pipeline.global_profiles import apply_global_profile
 from backend.benchmarks.metrics import (
-    note_f1, onset_offset_mae, dtw_note_f1, dtw_onset_error_ms, compute_symptom_metrics
+    note_f1,
+    onset_offset_mae,
+    dtw_note_f1,
+    dtw_onset_error_ms,
+    compute_symptom_metrics,
 )
 from backend.pipeline.debug import match_notes_nearest, write_error_slices_jsonl, write_frame_timeline_csv
 from backend.benchmarks.run_real_songs import run_song as run_real_song
 from backend.benchmarks.ladder.generators import generate_benchmark_example
-from backend.benchmarks.ladder.synth import midi_to_wav_synth
-import music21
-import math  # Ensure math is imported
+
+# ---- Optional imports with friendly failure ----
+_SOUNDFILE_IMPORT_ERROR: Optional[str] = None
+try:
+    import soundfile as sf
+except Exception as e:
+    sf = None  # type: ignore
+    _SOUNDFILE_IMPORT_ERROR = str(e)
+
+_SYNTH_IMPORT_ERROR: Optional[str] = None
+try:
+    from backend.benchmarks.ladder.synth import midi_to_wav_synth
+except Exception as e:
+    midi_to_wav_synth = None  # type: ignore
+    _SYNTH_IMPORT_ERROR = str(e)
 
 
 # Setup logging
@@ -152,7 +187,7 @@ def accuracy_benchmark_plan() -> Dict[str, Any]:
                 "fragmentation_rate",
                 "merging_rate",
             ],
-            "tempo_sweeps": ["slow", "medium", "fast", "rubato_sim"]
+            "tempo_sweeps": ["slow", "medium", "fast", "rubato_sim"],
         },
         "stage_d": {
             "scenarios": ["tempo_grids", "swing", "rubato"],
@@ -260,12 +295,12 @@ def create_pop_song_base(
     - Parts: Lead melody, Piano block chords, Bass line
     """
     import random
-    from music21 import stream, note, chord as m21chord, meter, tempo, instrument
+    from music21 import stream, note, chord as m21chord, meter, tempo as m21tempo, instrument
 
     rng = random.Random(seed)
 
     score = stream.Score()
-    score.append(tempo.MetronomeMark(number=tempo_bpm))
+    score.append(m21tempo.MetronomeMark(number=tempo_bpm))
     score.append(meter.TimeSignature("4/4"))
 
     lead = stream.Part()
@@ -314,7 +349,6 @@ def create_pop_song_base(
     def add_bar_melody(bar_idx: int) -> None:
         # 8 eighth notes
         for j in range(8):
-            # Slight sectioning by biasing note choice
             base = scale[(bar_idx + j) % len(scale)]
             if rng.random() < 0.25:
                 base = rng.choice(scale)
@@ -356,6 +390,19 @@ def _load_musicxml_notes(xml_path: str) -> List[Tuple[int, float, float]]:
     return gt
 
 
+def _require_synth_backend() -> None:
+    if midi_to_wav_synth is None:
+        raise RuntimeError(
+            "midi_to_wav_synth is unavailable. Most common cause: missing 'soundfile' and/or libsndfile.\n"
+            f"Import error: {_SYNTH_IMPORT_ERROR}"
+        )
+    if sf is None:
+        raise RuntimeError(
+            "soundfile is unavailable. Install with: pip install soundfile, and ensure system libsndfile is installed.\n"
+            f"Import error: {_SOUNDFILE_IMPORT_ERROR}"
+        )
+
+
 def run_pipeline_on_audio(
     audio: np.ndarray,
     sr: int,
@@ -366,28 +413,36 @@ def run_pipeline_on_audio(
     pipeline_logger: Optional[PipelineLogger] = None,
     *,
     skip_global_profile: bool = False,
+    device: str = "cpu",
 ) -> Dict[str, Any]:
     """Run full pipeline on raw audio array."""
 
     # Separation default safety: synthetic/CI environments often cannot download Demucs.
-    if config.stage_b.separation.get("enabled", False) and not allow_separation:
-        config.stage_b.separation["enabled"] = False
-    elif allow_separation:
-        harmonic_mask = config.stage_b.separation.setdefault("harmonic_masking", {})
-        harmonic_mask["enabled"] = True
-        harmonic_mask.setdefault("mask_width", 0.03)
+    try:
+        if config.stage_b.separation.get("enabled", False) and not allow_separation:
+            config.stage_b.separation["enabled"] = False
+        elif allow_separation:
+            harmonic_mask = config.stage_b.separation.setdefault("harmonic_masking", {})
+            harmonic_mask["enabled"] = True
+            harmonic_mask.setdefault("mask_width", 0.03)
+    except Exception:
+        pass
 
+    # Some harnesses want extra detector capacity on poly-dominant.
     if audio_type == AudioType.POLYPHONIC_DOMINANT:
-        rmvpe_cfg = dict(config.stage_b.detectors.get("rmvpe", {}))
-        rmvpe_cfg["enabled"] = True
-        rmvpe_cfg["fmax"] = max(float(rmvpe_cfg.get("fmax", 1200.0)), 2200.0)
-        config.stage_b.detectors["rmvpe"] = rmvpe_cfg
+        try:
+            rmvpe_cfg = dict(config.stage_b.detectors.get("rmvpe", {}) or {})
+            rmvpe_cfg["enabled"] = True
+            rmvpe_cfg["fmax"] = max(float(rmvpe_cfg.get("fmax", 1200.0)), 2200.0)
+            config.stage_b.detectors["rmvpe"] = rmvpe_cfg
 
-        crepe_cfg = dict(config.stage_b.detectors.get("crepe", {}))
-        crepe_cfg["enabled"] = True
-        crepe_cfg["model_capacity"] = "full"
-        crepe_cfg["use_viterbi"] = True
-        config.stage_b.detectors["crepe"] = crepe_cfg
+            crepe_cfg = dict(config.stage_b.detectors.get("crepe", {}) or {})
+            crepe_cfg["enabled"] = True
+            crepe_cfg["model_capacity"] = crepe_cfg.get("model_capacity", "full")
+            crepe_cfg["use_viterbi"] = bool(crepe_cfg.get("use_viterbi", True))
+            config.stage_b.detectors["crepe"] = crepe_cfg
+        except Exception:
+            pass
 
     pipeline_logger = pipeline_logger or PipelineLogger()
 
@@ -399,9 +454,20 @@ def run_pipeline_on_audio(
         {
             "audio_path": audio_path or "synthetic",
             "audio_type": audio_type.value,
-            "detector_preferences": config.stage_b.detectors,
+            "detector_preferences": getattr(config.stage_b, "detectors", {}),
         },
     )
+
+    # NOTE: meta.window_size key varies across configs ("n_fft" vs "frame_length").
+    yin_cfg = {}
+    try:
+        yin_cfg = config.stage_b.detectors.get("yin", {}) or {}
+    except Exception:
+        yin_cfg = {}
+
+    hop_length = int(yin_cfg.get("hop_length", 512) or 512)
+    window_size = int(yin_cfg.get("n_fft", yin_cfg.get("frame_length", 2048)) or 2048)
+
     meta = MetaData(
         sample_rate=sr,
         target_sr=sr,
@@ -409,8 +475,8 @@ def run_pipeline_on_audio(
         processing_mode=audio_type.value,
         audio_type=audio_type,
         audio_path=audio_path,
-        hop_length=config.stage_b.detectors.get("yin", {}).get("hop_length", 512),
-        window_size=config.stage_b.detectors.get("yin", {}).get("n_fft", 2048),
+        hop_length=hop_length,
+        window_size=window_size,
         lufs=-20.0,
     )
 
@@ -450,6 +516,7 @@ def run_pipeline_on_audio(
     if needs_fallback:
         try:
             import importlib.util
+
             if importlib.util.find_spec("librosa"):
                 pipeline_logger.log_event("stage_a", "bpm_fallback_triggered", {"reason": "missing_beats"})
                 mix_stem = stage_a_out.stems.get("mix")
@@ -482,7 +549,9 @@ def run_pipeline_on_audio(
                         if hasattr(stage_a_out, "diagnostics"):
                             stage_a_out.diagnostics.setdefault("fallbacks", []).append("bpm_detection")
 
-                        pipeline_logger.log_event("stage_a", "bpm_fallback_success", {"bpm": fb_bpm, "n_beats": len(fb_beats)})
+                        pipeline_logger.log_event(
+                            "stage_a", "bpm_fallback_success", {"bpm": fb_bpm, "n_beats": len(fb_beats)}
+                        )
                     else:
                         pipeline_logger.log_event("stage_a", "bpm_fallback_no_result")
         except Exception as e:
@@ -500,52 +569,100 @@ def run_pipeline_on_audio(
         "stage_b",
         "detector_selection",
         {
-            "detectors": config.stage_b.detectors,
+            "detectors": getattr(config.stage_b, "detectors", {}),
             "dependencies": PipelineLogger.dependency_snapshot(["torch", "crepe", "demucs"]),
         },
     )
     t_b_start = time.perf_counter()
-    stage_b_out = extract_features(stage_a_out, config=config)
+
+    # extract_features signature may vary; try richer call first.
+    try:
+        stage_b_out = extract_features(stage_a_out, config=config, pipeline_logger=pipeline_logger, device=device)
+    except TypeError:
+        stage_b_out = extract_features(stage_a_out, config=config)
+
     t_stage_b = time.perf_counter() - t_b_start
-    pipeline_logger.record_timing(
-        "stage_b",
-        t_stage_b,
-        metadata={"detectors_run": list(stage_b_out.per_detector.get("mix", {}).keys())},
-    )
+    try:
+        dets_run = list((stage_b_out.per_detector or {}).get("mix", {}).keys())
+    except Exception:
+        dets_run = []
+    pipeline_logger.record_timing("stage_b", t_stage_b, metadata={"detectors_run": dets_run})
 
     # 3. Stage C
     pipeline_logger.log_event(
         "stage_c",
         "segmentation",
         {
-            "method": config.stage_c.segmentation_method.get("method"),
-            "pitch_tolerance_cents": config.stage_c.pitch_tolerance_cents,
-            "quantize_enabled": bool(getattr(config.stage_c, "quantize", {}).get("enabled", True)),
+            "method": (getattr(config.stage_c, "segmentation_method", {}) or {}).get("method"),
+            "pitch_tolerance_cents": getattr(config.stage_c, "pitch_tolerance_cents", None),
+            "quantize_enabled": bool(getattr(getattr(config, "stage_c", None), "quantize", {}) or {}).get("enabled", True),
         },
     )
     t_c_start = time.perf_counter()
-    analysis = AnalysisData(meta=meta, stem_timelines=stage_b_out.stem_timelines)
 
-    # Consolidate fallbacks from Stage A into AnalysisData
-    if hasattr(stage_a_out, "diagnostics") and "fallbacks" in stage_a_out.diagnostics:
-        if not hasattr(analysis, "diagnostics"):
-            analysis.diagnostics = {}
-        analysis.diagnostics.setdefault("fallbacks", []).extend(stage_a_out.diagnostics["fallbacks"])
+    # IMPORTANT: build AnalysisData aligned with backend.pipeline.transcribe
+    sb_meta = getattr(stage_b_out, "meta", None) or meta
+    sb_timeline = getattr(stage_b_out, "timeline", None) or []
+    sb_stem_timelines = getattr(stage_b_out, "stem_timelines", None) or {}
+    sb_diag = getattr(stage_b_out, "diagnostics", None) or {}
+    sb_pre_notes = getattr(stage_b_out, "precalculated_notes", None)
 
+    try:
+        analysis = AnalysisData(
+            meta=sb_meta,
+            timeline=sb_timeline,
+            stem_timelines=sb_stem_timelines,
+            diagnostics=sb_diag,
+            precalculated_notes=sb_pre_notes,
+        )
+    except TypeError:
+        # Older AnalysisData signatures: fall back to minimal ctor and then attach what we can.
+        analysis = AnalysisData(meta=sb_meta, stem_timelines=sb_stem_timelines)  # type: ignore
+        try:
+            analysis.timeline = sb_timeline
+        except Exception:
+            pass
+        try:
+            analysis.diagnostics = sb_diag
+        except Exception:
+            pass
+        try:
+            analysis.precalculated_notes = sb_pre_notes
+        except Exception:
+            pass
+
+    # Consolidate fallbacks from Stage A into AnalysisData (if present)
+    try:
+        if hasattr(stage_a_out, "diagnostics") and isinstance(stage_a_out.diagnostics, dict) and "fallbacks" in stage_a_out.diagnostics:
+            analysis.diagnostics = getattr(analysis, "diagnostics", None) or {}
+            analysis.diagnostics.setdefault("fallbacks", []).extend(stage_a_out.diagnostics.get("fallbacks", []))
+    except Exception:
+        pass
+
+    # Stage C applies in-place updates to analysis (notes, chords, etc.)
     notes_pred = apply_theory(analysis, config=config)
     t_stage_c = time.perf_counter() - t_c_start
-    pipeline_logger.record_timing("stage_c", t_stage_c, metadata={"note_count": len(notes_pred)})
+    try:
+        pipeline_logger.record_timing("stage_c", t_stage_c, metadata={"note_count": len(notes_pred)})
+    except Exception:
+        pipeline_logger.record_timing("stage_c", t_stage_c, metadata={"note_count": None})
 
     # 4. Stage D
     t_d_start = time.perf_counter()
     try:
-        transcription_result = quantize_and_render(notes_pred, analysis, config=config)
+        # Some builds accept pipeline_logger; try and fall back.
+        try:
+            transcription_result = quantize_and_render(notes_pred, analysis, config=config, pipeline_logger=pipeline_logger)
+        except TypeError:
+            transcription_result = quantize_and_render(notes_pred, analysis, config=config)
     except Exception as e:
         logger.warning(f"Stage D failed: {e}")
         transcription_result = None
     t_stage_d = time.perf_counter() - t_d_start
     pipeline_logger.record_timing(
-        "stage_d", t_stage_d, metadata={"beats_detected": len(getattr(analysis, "beats", []))}
+        "stage_d",
+        t_stage_d,
+        metadata={"beats_detected": len(getattr(getattr(analysis, "meta", None), "beats", []) or [])},
     )
 
     stage_timings = {
@@ -557,26 +674,29 @@ def run_pipeline_on_audio(
     }
 
     detector_conf_traces: Dict[str, Dict[str, float]] = {}
-    for stem_name, dets in stage_b_out.per_detector.items():
-        detector_conf_traces[stem_name] = {}
-        for det_name, (_, conf) in dets.items():
-            if conf is None or len(conf) == 0:
-                detector_conf_traces[stem_name][det_name] = 0.0
-            else:
-                detector_conf_traces[stem_name][det_name] = float(np.mean(conf))
+    try:
+        for stem_name, dets in (stage_b_out.per_detector or {}).items():
+            detector_conf_traces[stem_name] = {}
+            for det_name, (_, conf) in dets.items():
+                if conf is None or len(conf) == 0:
+                    detector_conf_traces[stem_name][det_name] = 0.0
+                else:
+                    detector_conf_traces[stem_name][det_name] = float(np.mean(conf))
+    except Exception:
+        pass
 
     artifact_flags = {
-        "musicxml": bool(getattr(transcription_result, "musicxml", "")),
-        "midi_bytes": bool(getattr(transcription_result, "midi_bytes", b"")),
-        "timeline": bool(stage_b_out.stem_timelines),
+        "musicxml": bool(getattr(transcription_result, "musicxml", "")) if transcription_result is not None else False,
+        "midi_bytes": bool(getattr(transcription_result, "midi_bytes", b"")) if transcription_result is not None else False,
+        "timeline": bool(sb_stem_timelines),
     }
 
     pipeline_logger.log_event(
         "pipeline",
         "complete",
         {
-            "notes": len(notes_pred),
-            "run_dir": pipeline_logger.run_dir,
+            "notes": len(notes_pred) if notes_pred is not None else 0,
+            "run_dir": getattr(pipeline_logger, "run_dir", None),
             "context": "benchmark",
         },
     )
@@ -692,68 +812,125 @@ class BenchmarkSuite:
         use_poly_dominant_segmentation: bool = False,
     ) -> PipelineConfig:
         config = PipelineConfig()
-        config.stage_b.separation["enabled"] = True
-        config.stage_b.separation["synthetic_model"] = True
+        try:
+            config.stage_b.separation["enabled"] = True
+            config.stage_b.separation["synthetic_model"] = True
 
-        config.stage_b.separation["harmonic_masking"]["enabled"] = use_harmonic_masking
-        if use_harmonic_masking:
-            config.stage_b.separation["harmonic_masking"]["mask_width"] = mask_width
-        config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
-        config.stage_b.separation["polyphonic_dominant_preset"].update({
-            "overlap": 0.75,
-            "shift_range": [2, 8],
-            "overlap_candidates": [0.5, 0.75],
-        })
-        config.stage_b.polyphonic_peeling["force_on_mix"] = True
-        config.stage_b.polyphonic_peeling["max_layers"] = 2
-        config.stage_b.melody_filtering.update({
-            "median_window": 7,
-            "voiced_prob_threshold": 0.45,
-            "rms_gate_db": -38.0,
-            "fmin_hz": 450.0,
-            "fmax_hz": 1400.0,
-        })
-        yin_conf = config.stage_b.detectors.get("yin", {})
-        yin_conf.update({
-            "hop_length": 256,
-            "frame_length": 4096,
-            "fmin": 450.0,
-            "fmax": 1200.0,
-        })
-        config.stage_b.detectors["yin"] = yin_conf
+            hm = config.stage_b.separation.setdefault("harmonic_masking", {})
+            hm["enabled"] = bool(use_harmonic_masking)
+            if use_harmonic_masking:
+                hm["mask_width"] = float(mask_width)
+
+            config.stage_b.separation.setdefault("polyphonic_dominant_preset", {})
+            config.stage_b.separation["polyphonic_dominant_preset"].update(
+                {
+                    "overlap": 0.75,
+                    "shift_range": [2, 8],
+                    "overlap_candidates": [0.5, 0.75],
+                }
+            )
+        except Exception:
+            pass
+
+        try:
+            config.stage_b.polyphonic_peeling["force_on_mix"] = True
+            config.stage_b.polyphonic_peeling["max_layers"] = 2
+        except Exception:
+            pass
+
+        try:
+            config.stage_b.melody_filtering.update(
+                {
+                    "median_window": 7,
+                    "voiced_prob_threshold": 0.45,
+                    "rms_gate_db": -38.0,
+                    "fmin_hz": 450.0,
+                    "fmax_hz": 1400.0,
+                }
+            )
+        except Exception:
+            pass
+
+        try:
+            yin_conf = dict(config.stage_b.detectors.get("yin", {}) or {})
+            yin_conf.update(
+                {
+                    "hop_length": 256,
+                    "frame_length": 4096,
+                    "fmin": 450.0,
+                    "fmax": 1200.0,
+                }
+            )
+            config.stage_b.detectors["yin"] = yin_conf
+        except Exception:
+            pass
 
         if enable_high_capacity:
             self._enable_high_capacity_frontend(config, use_crepe_viterbi)
-            config.stage_b.ensemble_weights["crepe"] = 0.5
-            config.stage_b.ensemble_weights["yin"] = 2.0
+            try:
+                config.stage_b.ensemble_weights["crepe"] = 0.5
+                config.stage_b.ensemble_weights["yin"] = 2.0
+            except Exception:
+                pass
 
         if use_poly_dominant_segmentation:
             self._apply_poly_dominant_segmentation(config)
 
-        config.stage_b.voice_tracking["max_alt_voices"] = 1
-        config.stage_c.gap_tolerance_s = max(getattr(config.stage_c, "gap_tolerance_s", 0.07), 0.07)
-        config.stage_c.pitch_tolerance_cents = max(getattr(config.stage_c, "pitch_tolerance_cents", 50.0), 60.0)
-        config.stage_c.min_note_duration_ms_poly = max(getattr(config.stage_c, "min_note_duration_ms_poly", 120.0), 150.0)
-        config.stage_c.confidence_hysteresis.update({"start": 0.6, "end": 0.4})
-        config.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
+        try:
+            config.stage_b.voice_tracking["max_alt_voices"] = 1
+        except Exception:
+            pass
+
+        try:
+            config.stage_c.gap_tolerance_s = max(getattr(config.stage_c, "gap_tolerance_s", 0.07), 0.07)
+            config.stage_c.pitch_tolerance_cents = max(getattr(config.stage_c, "pitch_tolerance_cents", 50.0), 60.0)
+            config.stage_c.min_note_duration_ms_poly = max(getattr(config.stage_c, "min_note_duration_ms_poly", 120.0), 150.0)
+            config.stage_c.confidence_hysteresis.update({"start": 0.6, "end": 0.4})
+            config.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
+        except Exception:
+            pass
+
+        # Make intent explicit for router, even though AudioType is provided.
+        try:
+            config.stage_b.transcription_mode = "classic_song"
+        except Exception:
+            pass
+
         return config
 
     def _apply_poly_dominant_segmentation(self, config: PipelineConfig) -> None:
-        config.stage_c.segmentation_method["preset"] = "poly_dominant_strict"
-        config.stage_c.min_note_duration_ms_poly = max(float(config.stage_c.min_note_duration_ms_poly), 120.0)
-        config.stage_c.polyphonic_confidence["melody"] = max(float(config.stage_c.polyphonic_confidence.get("melody", 0.0)), 0.55)
-        config.stage_c.polyphonic_confidence["accompaniment"] = max(
-            float(config.stage_c.polyphonic_confidence.get("accompaniment", 0.0)),
-            0.6,
-            config.stage_c.polyphonic_confidence["melody"],
-        )
+        try:
+            config.stage_c.segmentation_method["preset"] = "poly_dominant_strict"
+        except Exception:
+            pass
+        try:
+            config.stage_c.min_note_duration_ms_poly = max(float(config.stage_c.min_note_duration_ms_poly), 120.0)
+        except Exception:
+            pass
+        try:
+            pc = getattr(config.stage_c, "polyphonic_confidence", None)
+            if pc is None:
+                setattr(config.stage_c, "polyphonic_confidence", {})
+                pc = config.stage_c.polyphonic_confidence
+            pc["melody"] = max(float(pc.get("melody", 0.0)), 0.55)
+            pc["accompaniment"] = max(float(pc.get("accompaniment", 0.0)), 0.6, pc["melody"])
+        except Exception:
+            pass
 
     def _enable_high_capacity_frontend(self, config: PipelineConfig, use_crepe_viterbi: bool = False) -> None:
-        config.stage_b.detectors["crepe"]["enabled"] = True
-        config.stage_b.detectors["crepe"]["model_capacity"] = "full"
-        config.stage_b.detectors["crepe"]["use_viterbi"] = use_crepe_viterbi
-        config.stage_b.detectors["rmvpe"]["enabled"] = True
-        config.stage_b.detectors["rmvpe"]["fmax"] = 2000.0
+        try:
+            crepe_cfg = dict(config.stage_b.detectors.get("crepe", {}) or {})
+            crepe_cfg["enabled"] = True
+            crepe_cfg["model_capacity"] = crepe_cfg.get("model_capacity", "full")
+            crepe_cfg["use_viterbi"] = bool(use_crepe_viterbi)
+            config.stage_b.detectors["crepe"] = crepe_cfg
+
+            rmvpe_cfg = dict(config.stage_b.detectors.get("rmvpe", {}) or {})
+            rmvpe_cfg["enabled"] = True
+            rmvpe_cfg["fmax"] = float(rmvpe_cfg.get("fmax", 2000.0) or 2000.0)
+            config.stage_b.detectors["rmvpe"] = rmvpe_cfg
+        except Exception:
+            pass
 
     def _compute_diff(self, previous: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prev_map = {(r.get("level"), r.get("name")): r for r in previous}
@@ -763,14 +940,16 @@ class BenchmarkSuite:
             prev = prev_map.get(key)
             if not prev:
                 continue
-            diff.append({
-                "level": r.get("level"),
-                "name": r.get("name"),
-                "delta_note_f1": r.get("note_f1") - prev.get("note_f1", 0.0),
-                "delta_onset_mae_ms": (r.get("onset_mae_ms") or 0.0) - (prev.get("onset_mae_ms") or 0.0),
-                "previous": prev,
-                "current": r,
-            })
+            diff.append(
+                {
+                    "level": r.get("level"),
+                    "name": r.get("name"),
+                    "delta_note_f1": r.get("note_f1") - prev.get("note_f1", 0.0),
+                    "delta_onset_mae_ms": (r.get("onset_mae_ms") or 0.0) - (prev.get("onset_mae_ms") or 0.0),
+                    "previous": prev,
+                    "current": r,
+                }
+            )
         return diff
 
     def _merge_results(self, previous: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -788,7 +967,7 @@ class BenchmarkSuite:
         apply_regression_gate: bool = True,
     ):
         """Save artifacts for a single run."""
-        pred_notes = res["notes"]
+        pred_notes = res["notes"] or []
         pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in pred_notes]
 
         # Calculate Metrics
@@ -797,7 +976,7 @@ class BenchmarkSuite:
         dtw_f1 = dtw_note_f1(pred_list, gt, onset_tol=0.05)
         dtw_onset_ms = dtw_onset_error_ms(pred_list, gt)
 
-        # Frame/timeline metrics (FIXED: voiced_ratio must be <= 1.0 and computed against full timeline length)
+        # Frame/timeline metrics
         sb_out = res.get("stage_b_out")
         timeline_source = []
         if sb_out is not None:
@@ -847,7 +1026,6 @@ class BenchmarkSuite:
 
         pitch_jump_rate = (jump_cents_sum / duration_sec) if duration_sec > 0 else 0.0
         voiced_ratio = (voiced_frames / max(1, total_frames))
-
         note_density = (len(pred_list) / duration_sec) if duration_sec > 0 else 0.0
 
         # Normalize NaNs for downstream checks/serialization
@@ -860,7 +1038,7 @@ class BenchmarkSuite:
         if dtw_onset_ms is not None and np.isnan(dtw_onset_ms):
             dtw_onset_ms = None
 
-        symptoms = compute_symptom_metrics(pred_list)
+        symptoms = compute_symptom_metrics(pred_list) or {}
 
         metrics = {
             "level": level,
@@ -873,12 +1051,9 @@ class BenchmarkSuite:
             "gt_count": len(gt),
             "vocal_band_ratio": vocal_band_ratio,
             "pitch_jump_rate_cents_sec": pitch_jump_rate,
-            # FIX: column/header expects voiced_ratio
             "voiced_ratio": voiced_ratio,
-            # keep old name too (backward compatibility with older dashboards)
-            "voicing_ratio": voiced_ratio,
+            "voicing_ratio": voiced_ratio,  # backward compatibility
             "note_density": note_density,
-            # ensure summary.csv "note_count" column is always populated
             "note_count": len(pred_list),
             **symptoms,
         }
@@ -900,23 +1075,32 @@ class BenchmarkSuite:
         resolved_config = res.get("resolved_config")
 
         analysis_diag = getattr(res.get("analysis_data"), "diagnostics", {}) if res.get("analysis_data") else {}
-        stage_c_diag = analysis_diag.get("stage_c", {})
+        stage_c_diag = analysis_diag.get("stage_c", {}) if isinstance(analysis_diag, dict) else {}
+
+        # Prefer decision_trace resolved transcription_mode if present
+        tr_mode = "unknown"
+        try:
+            dt = diagnostics.get("decision_trace", {}) if isinstance(diagnostics, dict) else {}
+            if isinstance(dt, dict):
+                tr_mode = dt.get("resolved", {}).get("transcription_mode", tr_mode)
+        except Exception:
+            pass
 
         run_info = {
             "detectors_ran": detectors_ran,
-            "diagnostics": diagnostics,
+            "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
             "config": asdict(resolved_config) if resolved_config else {},
-            "transcription_mode": diagnostics.get("transcription_mode", "unknown"),
-            "separation_mode": diagnostics.get("separation", {}).get("mode", "unknown"),
-            "selected_stem": stage_c_diag.get("selected_stem", "unknown"),
-            "fallbacks": analysis_diag.get("fallbacks", []),
+            "transcription_mode": tr_mode,
+            "separation_mode": (diagnostics.get("separation", {}) or {}).get("mode", "unknown") if isinstance(diagnostics, dict) else "unknown",
+            "selected_stem": stage_c_diag.get("selected_stem", "unknown") if isinstance(stage_c_diag, dict) else "unknown",
+            "fallbacks": analysis_diag.get("fallbacks", []) if isinstance(analysis_diag, dict) else [],
         }
-        profiling = res.get("profiling", {})
-        run_info["stage_timings"] = profiling.get("stage_timings", {})
-        run_info["detector_confidences"] = profiling.get("detector_confidences", {})
-        run_info["artifacts_present"] = profiling.get("artifacts", {})
+        profiling = res.get("profiling", {}) or {}
+        run_info["stage_timings"] = profiling.get("stage_timings", {}) or {}
+        run_info["detector_confidences"] = profiling.get("detector_confidences", {}) or {}
+        run_info["artifacts_present"] = profiling.get("artifacts", {}) or {}
 
-        sep_diag = diagnostics.get("separation", {}) if diagnostics else {}
+        sep_diag = diagnostics.get("separation", {}) if isinstance(diagnostics, dict) else {}
         stage_b_conf = getattr(resolved_config, "stage_b", None)
         run_info["separation_preset"] = {
             "preset": sep_diag.get("preset") or "default",
@@ -926,7 +1110,7 @@ class BenchmarkSuite:
                 "shift_range",
                 (stage_b_conf.separation.get("polyphonic_dominant_preset", {}).get("shift_range") if stage_b_conf else None),
             ),
-            "harmonic_mask_width": diagnostics.get("harmonic_masking", {}).get("mask_width") if diagnostics else None,
+            "harmonic_mask_width": (diagnostics.get("harmonic_masking", {}) or {}).get("mask_width") if isinstance(diagnostics, dict) else None,
         }
 
         with open(f"{base_path}_run_info.json", "w") as f:
@@ -937,9 +1121,9 @@ class BenchmarkSuite:
             if sb_out:
                 timeline_frames = timeline_source
                 csv_rows = []
-                d_curves = diagnostics.get("debug_curves", {}).get("mix", {})
-                fused_arr = d_curves.get("fused_f0", [])
-                smoothed_arr = d_curves.get("smoothed_f0", [])
+                d_curves = (diagnostics.get("debug_curves", {}) or {}).get("mix", {}) if isinstance(diagnostics, dict) else {}
+                fused_arr = d_curves.get("fused_f0", []) or []
+                smoothed_arr = d_curves.get("smoothed_f0", []) or []
 
                 for idx, fp in enumerate(timeline_frames):
                     hz = float(getattr(fp, "pitch_hz", 0.0) or 0.0)
@@ -1059,38 +1243,45 @@ class BenchmarkSuite:
         gt = [(69, 0.0 + offset, 1.0 + offset)]
 
         config = PipelineConfig()
-        config.stage_b.detectors["swiftf0"]["enabled"] = False
+        try:
+            config.stage_b.detectors["swiftf0"]["enabled"] = False
+        except Exception:
+            pass
 
-        config.stage_a.silence_trimming["enabled"] = False
-        config.stage_a.bpm_detection["trim"] = False
-        # Disable pre-emphasis to avoid onset shift
-        config.stage_a.transient_pre_emphasis["enabled"] = False
+        try:
+            config.stage_a.silence_trimming["enabled"] = False
+            config.stage_a.bpm_detection["trim"] = False
+            config.stage_a.transient_pre_emphasis["enabled"] = False
+        except Exception:
+            pass
 
-        # FIX (A): Disable Stage C quantization for L0 sanity checks
+        # Disable Stage C quantization for L0 sanity checks
         _safe_disable_stage_c_quantize(config)
-        # FIX (B): Force threshold segmentation and disable profile overrides
-        config.stage_c.segmentation_method = {"method": "threshold"}
-        config.stage_c.apply_instrument_profile = False
-        config.stage_b.apply_instrument_profile = False
+
+        # Force threshold segmentation and disable profile overrides
+        try:
+            config.stage_c.segmentation_method = {"method": "threshold"}
+            config.stage_c.apply_instrument_profile = False
+            config.stage_b.apply_instrument_profile = False
+        except Exception:
+            pass
 
         res = run_pipeline_on_audio(audio, sr, config, AudioType.MONOPHONIC)
 
-        # Increase tolerance for L0 sine wave onset (50ms -> 100ms) to account for padding smear
-        # This is a regression gate override for this specific sanity level.
+        # Save run (no regression gate)
         m = self._save_run("L0", "sine_440", res, gt, apply_regression_gate=False)
 
-        # Manual check with relaxed constraints
+        # Manual relaxed check
         if m["note_f1"] < 0.8:
-             # If strict F1 fails, check with relaxed tolerance manually
-             pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in res["notes"]]
-             f1_relaxed = note_f1(pred_list, gt, onset_tol=0.1)
-             if f1_relaxed < 0.8:
-                 raise RuntimeError(f"L0 Failed: Sine 440 F1 {f1_relaxed} < 0.8 (relaxed)")
-             logger.warning(f"L0 Passed with relaxed onset tolerance (F1={f1_relaxed:.3f})")
+            pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in res["notes"]]
+            f1_relaxed = note_f1(pred_list, gt, onset_tol=0.1)
+            if f1_relaxed < 0.8:
+                raise RuntimeError(f"L0 Failed: Sine 440 F1 {f1_relaxed} < 0.8 (relaxed)")
+            logger.warning(f"L0 Passed with relaxed onset tolerance (F1={f1_relaxed:.3f})")
         else:
-             logger.info(f"L0 Passed strict F1={m['note_f1']:.3f}")
+            logger.info(f"L0 Passed strict F1={m['note_f1']:.3f}")
 
-        detectors = res["stage_b_out"].per_detector.get("mix", {})
+        detectors = res["stage_b_out"].per_detector.get("mix", {}) if res.get("stage_b_out") else {}
         if not any(d in detectors for d in ["yin", "sacf", "swiftf0", "crepe"]):
             raise RuntimeError("L0 Failed: No mono pitch tracker ran!")
 
@@ -1100,8 +1291,14 @@ class BenchmarkSuite:
         logger.info("Running L1: Mono Musical")
 
         notes = [
-            (60, 0.5), (62, 0.5), (64, 0.5), (65, 0.5),
-            (67, 0.5), (69, 0.5), (71, 0.5), (72, 0.5)
+            (60, 0.5),
+            (62, 0.5),
+            (64, 0.5),
+            (65, 0.5),
+            (67, 0.5),
+            (69, 0.5),
+            (71, 0.5),
+            (72, 0.5),
         ]
         audio = synthesize_audio(notes, sr=44100, waveform="saw")
 
@@ -1119,14 +1316,21 @@ class BenchmarkSuite:
         config = PipelineConfig()
 
         # Disable pre-emphasis
-        config.stage_a.transient_pre_emphasis["enabled"] = False
+        try:
+            config.stage_a.transient_pre_emphasis["enabled"] = False
+        except Exception:
+            pass
 
-        # FIX (A): Disable Stage C quantization for L1 sanity checks
+        # Disable Stage C quantization for L1 sanity checks
         _safe_disable_stage_c_quantize(config)
-        # FIX (B): Force threshold segmentation and disable profile overrides
-        config.stage_c.segmentation_method = {"method": "threshold"}
-        config.stage_c.apply_instrument_profile = False
-        config.stage_b.apply_instrument_profile = False
+
+        # Force threshold segmentation and disable profile overrides
+        try:
+            config.stage_c.segmentation_method = {"method": "threshold"}
+            config.stage_c.apply_instrument_profile = False
+            config.stage_b.apply_instrument_profile = False
+        except Exception:
+            pass
 
         res = run_pipeline_on_audio(audio, 44100, config, AudioType.MONOPHONIC)
 
@@ -1177,10 +1381,12 @@ class BenchmarkSuite:
                 enable_high_capacity=True,
                 use_crepe_viterbi=True,
             )
-            sweep_config.stage_b.melody_filtering.update({
-                "fmin_hz": fmin,
-                "voiced_prob_threshold": 0.45,
-            })
+            sweep_config.stage_b.melody_filtering.update(
+                {
+                    "fmin_hz": fmin,
+                    "voiced_prob_threshold": 0.45,
+                }
+            )
             yin_conf = sweep_config.stage_b.detectors.get("yin", {})
             yin_conf["fmin"] = fmin
             sweep_config.stage_b.detectors["yin"] = yin_conf
@@ -1207,7 +1413,13 @@ class BenchmarkSuite:
         logger.info(f"L2 Best Fmin: {best_fmin_metric.get('fmin')}Hz (F1={best_fmin_metric.get('note_f1'):.3f})")
 
         if best_fmin_res:
-            m = self._save_run("L2", "melody_plus_bass_synthetic_sep", best_fmin_res, gt_melody, apply_regression_gate=False)
+            m = self._save_run(
+                "L2",
+                "melody_plus_bass_synthetic_sep",
+                best_fmin_res,
+                gt_melody,
+                apply_regression_gate=False,
+            )
         else:
             m = {"note_f1": 0.0, "name": "melody_plus_bass_synthetic_sep"}
 
@@ -1276,6 +1488,7 @@ class BenchmarkSuite:
 
     def run_L3_full_poly(self):
         logger.info("Running L3: Full Poly")
+        _require_synth_backend()
 
         score = generate_benchmark_example("old_macdonald_poly_full")
         gt = self._score_to_gt(score)
@@ -1285,8 +1498,8 @@ class BenchmarkSuite:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 wav_path = tmp.name
-            midi_to_wav_synth(score, wav_path, sr=sr)
-            audio, read_sr = sf.read(wav_path)
+            midi_to_wav_synth(score, wav_path, sr=sr)  # type: ignore[misc]
+            audio, read_sr = sf.read(wav_path)  # type: ignore[union-attr]
         finally:
             if wav_path and os.path.exists(wav_path):
                 try:
@@ -1303,12 +1516,21 @@ class BenchmarkSuite:
             gt = [(m, s, min(e, max_duration)) for m, s, e in gt if s < max_duration]
 
         config = PipelineConfig()
-        config.stage_b.separation["enabled"] = True
-        config.stage_b.separation["model"] = "htdemucs"
-        config.stage_b.polyphonic_peeling["max_layers"] = 8
+        try:
+            config.stage_b.separation["enabled"] = True
+            config.stage_b.separation["model"] = "htdemucs"
+            config.stage_b.polyphonic_peeling["max_layers"] = 8
+        except Exception:
+            pass
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
             if det in config.stage_b.detectors:
                 config.stage_b.detectors[det]["enabled"] = True
+
+        # Match intent explicitly
+        try:
+            config.stage_b.transcription_mode = "classic_song"
+        except Exception:
+            pass
 
         res = run_pipeline_on_audio(
             audio.astype(np.float32),
@@ -1320,7 +1542,7 @@ class BenchmarkSuite:
 
         m = self._save_run("L3", "old_macdonald_poly_full", res, gt)
 
-        detectors = res["stage_b_out"].per_detector.get("mix", {})
+        detectors = res["stage_b_out"].per_detector.get("mix", {}) if res.get("stage_b_out") else {}
         if m["note_f1"] < 0.2:
             logger.warning(f"L3 Warning: old_macdonald_poly_full F1 {m['note_f1']} < 0.2")
         if m["onset_mae_ms"] is None or m["onset_mae_ms"] > 300:
@@ -1353,6 +1575,7 @@ class BenchmarkSuite:
         Accuracy is measured against the LEAD melody part only (realistic melody-in-poly mix benchmark).
         """
         logger.info("Running L6: Synthetic Pop Song")
+        _require_synth_backend()
 
         sr = 22050
         score = create_pop_song_base(duration_sec=60.0, tempo_bpm=110, seed=0)
@@ -1365,8 +1588,8 @@ class BenchmarkSuite:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 wav_path = tmp.name
 
-            midi_to_wav_synth(score, wav_path, sr=sr)
-            audio, read_sr = sf.read(wav_path)
+            midi_to_wav_synth(score, wav_path, sr=sr)  # type: ignore[misc]
+            audio, read_sr = sf.read(wav_path)  # type: ignore[union-attr]
 
         finally:
             if wav_path and os.path.exists(wav_path):
@@ -1380,15 +1603,39 @@ class BenchmarkSuite:
 
         config = PipelineConfig()
         # Avoid Demucs on synthetic benches
-        config.stage_b.separation["enabled"] = False
+        try:
+            config.stage_b.separation["enabled"] = False
+        except Exception:
+            pass
+
+        # CRITICAL: enforce polyphonic intent for router + lead-only eval semantics.
+        try:
+            config.stage_b.transcription_mode = "classic_song"
+        except Exception:
+            pass
+        try:
+            config.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
+        except Exception:
+            try:
+                config.stage_c.polyphony_filter = {"mode": "skyline_top_voice"}
+            except Exception:
+                pass
 
         # Encourage melody tracking in a poly mix
-        config.stage_b.melody_filtering.update({"fmin_hz": 180.0, "fmax_hz": 1600.0, "voiced_prob_threshold": 0.40})
+        try:
+            config.stage_b.melody_filtering.update(
+                {"fmin_hz": 180.0, "fmax_hz": 1600.0, "voiced_prob_threshold": 0.40}
+            )
+        except Exception:
+            pass
         for det in ["rmvpe", "crepe", "swiftf0", "yin"]:
-            if det in config.stage_b.detectors:
-                config.stage_b.detectors[det]["enabled"] = True
+            try:
+                if det in config.stage_b.detectors:
+                    config.stage_b.detectors[det]["enabled"] = True
+            except Exception:
+                pass
 
-        # Keep Stage C quantize enabled here (L6 is “musical”), but you can turn off via overrides if desired.
+        # Keep Stage C quantize enabled here (L6 is musical)
         res = run_pipeline_on_audio(
             audio.astype(np.float32),
             int(read_sr),
@@ -1406,6 +1653,8 @@ class BenchmarkSuite:
         override_path: Optional[str] = None,
     ):
         logger.info("Running L5.1: Kal Ho Na Ho")
+        _require_synth_backend()
+
         midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.1_kal_ho_na_ho.mid")
         if not os.path.exists(midi_path):
             raise FileNotFoundError(f"L5.1 MIDI not found at {midi_path}")
@@ -1418,8 +1667,8 @@ class BenchmarkSuite:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 wav_path = tmp.name
-            midi_to_wav_synth(score, wav_path, sr=sr)
-            audio, read_sr = sf.read(wav_path)
+            midi_to_wav_synth(score, wav_path, sr=sr)  # type: ignore[misc]
+            audio, read_sr = sf.read(wav_path)  # type: ignore[union-attr]
         finally:
             if wav_path and os.path.exists(wav_path):
                 try:
@@ -1437,58 +1686,80 @@ class BenchmarkSuite:
 
         from backend.pipeline.config import PIANO_61KEY_CONFIG
         config = copy.deepcopy(PIANO_61KEY_CONFIG)
-        config.stage_b.separation["enabled"] = True
-        config.stage_b.separation["model"] = "htdemucs"
-        config.stage_b.separation["synthetic_model"] = False
-        config.stage_b.separation["overlap"] = 0.75
-        config.stage_b.separation["shifts"] = 2
-        config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
+        try:
+            config.stage_b.separation["enabled"] = True
+            config.stage_b.separation["model"] = "htdemucs"
+            config.stage_b.separation["synthetic_model"] = False
+            config.stage_b.separation["overlap"] = 0.75
+            config.stage_b.separation["shifts"] = 2
+            config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
+        except Exception:
+            pass
 
-        config.stage_a.high_pass_filter["cutoff_hz"] = 20.0
-        config.stage_b.apply_instrument_profile = False
-        config.stage_c.apply_instrument_profile = False
-        config.stage_b.confidence_voicing_threshold = 0.3
-        config.stage_c.confidence_threshold = 0.05
-        config.stage_c.min_note_duration_ms_poly = 50.0
-        config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
+        try:
+            config.stage_a.high_pass_filter["cutoff_hz"] = 20.0
+            config.stage_b.apply_instrument_profile = False
+            config.stage_c.apply_instrument_profile = False
+            config.stage_b.confidence_voicing_threshold = 0.3
+            config.stage_c.confidence_threshold = 0.05
+            config.stage_c.min_note_duration_ms_poly = 50.0
+            config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
+        except Exception:
+            pass
 
         for d in ["crepe", "swiftf0", "yin"]:
-            if d in config.stage_b.detectors:
-                config.stage_b.detectors[d]["fmin"] = 30.0
-        config.stage_b.melody_filtering["fmin_hz"] = 30.0
+            try:
+                if d in config.stage_b.detectors:
+                    config.stage_b.detectors[d]["fmin"] = 30.0
+            except Exception:
+                pass
+        try:
+            config.stage_b.melody_filtering["fmin_hz"] = 30.0
+        except Exception:
+            pass
 
-        config.stage_b.polyphonic_peeling["max_layers"] = 8
-        config.stage_b.polyphonic_peeling["max_harmonics"] = 20
-        config.stage_b.polyphonic_peeling["residual_flatness_stop"] = 1.0
-        config.stage_b.polyphonic_peeling["harmonic_snr_stop_db"] = -100.0
-        config.stage_b.polyphonic_peeling["mask_width"] = 0.03
-        config.stage_b.polyphonic_peeling["iss_adaptive"] = True
+        try:
+            config.stage_b.polyphonic_peeling["max_layers"] = 8
+            config.stage_b.polyphonic_peeling["max_harmonics"] = 20
+            config.stage_b.polyphonic_peeling["residual_flatness_stop"] = 1.0
+            config.stage_b.polyphonic_peeling["harmonic_snr_stop_db"] = -100.0
+            config.stage_b.polyphonic_peeling["mask_width"] = 0.03
+            config.stage_b.polyphonic_peeling["iss_adaptive"] = True
+        except Exception:
+            pass
 
-        config.stage_b.ensemble_weights = {
-            "swiftf0": 0.4,
-            "crepe": 0.4,
-            "yin": 0.1,
-            "sacf": 0.1,
-            "cqt": 0.0,
-            "rmvpe": 0.0,
-        }
+        try:
+            config.stage_b.ensemble_weights = {
+                "swiftf0": 0.4,
+                "crepe": 0.4,
+                "yin": 0.1,
+                "sacf": 0.1,
+                "cqt": 0.0,
+                "rmvpe": 0.0,
+            }
+        except Exception:
+            pass
         for det in ["swiftf0", "crepe", "yin"]:
-            if det in config.stage_b.detectors:
-                config.stage_b.detectors[det]["enabled"] = True
+            try:
+                if det in config.stage_b.detectors:
+                    config.stage_b.detectors[det]["enabled"] = True
+            except Exception:
+                pass
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
-        # Freeze classic settings vs global router
-        setattr(config, "transcription_mode", "classic")
+        # FIX: set the correct field (previous code wrote config.transcription_mode, which does nothing)
+        try:
+            config.stage_b.transcription_mode = "classic_song"
+        except Exception:
+            pass
 
-        # FIX (A): ensure allow_separation=True is passed (already required for L5.*)
         res = run_pipeline_on_audio(
             audio.astype(np.float32),
             int(read_sr),
             config,
             AudioType.POLYPHONIC,
             allow_separation=True,
-            # also avoid global profile overriding L5 separation knobs
             skip_global_profile=True,
         )
 
@@ -1502,6 +1773,8 @@ class BenchmarkSuite:
         use_preset: bool = False,
     ):
         logger.info("Running L5.2: Tumhare Hi Rahenge")
+        _require_synth_backend()
+
         midi_path = os.path.join("backend", "benchmarks", "ladder", "L5.2_tumhare_hi_rahenge.mid")
         if not os.path.exists(midi_path):
             raise FileNotFoundError(f"L5.2 MIDI not found at {midi_path}")
@@ -1514,8 +1787,8 @@ class BenchmarkSuite:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 wav_path = tmp.name
-            midi_to_wav_synth(score, wav_path, sr=sr)
-            audio, read_sr = sf.read(wav_path)
+            midi_to_wav_synth(score, wav_path, sr=sr)  # type: ignore[misc]
+            audio, read_sr = sf.read(wav_path)  # type: ignore[union-attr]
         finally:
             if wav_path and os.path.exists(wav_path):
                 try:
@@ -1537,23 +1810,38 @@ class BenchmarkSuite:
         else:
             config = PipelineConfig()
 
-        config.stage_b.separation["enabled"] = True
-        config.stage_b.separation["model"] = "htdemucs"
-        config.stage_b.separation["synthetic_model"] = False
-        config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
+        try:
+            config.stage_b.separation["enabled"] = True
+            config.stage_b.separation["model"] = "htdemucs"
+            config.stage_b.separation["synthetic_model"] = False
+            config.stage_b.separation["harmonic_masking"] = {"enabled": True, "mask_width": 0.03}
+        except Exception:
+            pass
 
-        config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
+        try:
+            config.stage_c.polyphony_filter["mode"] = "decomposed_melody"
+        except Exception:
+            pass
 
-        config.stage_b.polyphonic_peeling["max_layers"] = 3
+        try:
+            config.stage_b.polyphonic_peeling["max_layers"] = 3
+        except Exception:
+            pass
         for det in ["swiftf0", "rmvpe", "crepe", "yin"]:
-            if det in config.stage_b.detectors:
-                config.stage_b.detectors[det]["enabled"] = True
+            try:
+                if det in config.stage_b.detectors:
+                    config.stage_b.detectors[det]["enabled"] = True
+            except Exception:
+                pass
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
 
-        setattr(config, "transcription_mode", "classic")
+        # FIX: set the correct field
+        try:
+            config.stage_b.transcription_mode = "classic_song"
+        except Exception:
+            pass
 
-        # FIX (A): ensure allow_separation=True is passed (already required for L5.*)
         res = run_pipeline_on_audio(
             audio.astype(np.float32),
             int(read_sr),
@@ -1575,14 +1863,12 @@ class BenchmarkSuite:
           - {level}_{name}_run_info.json  (includes decision_trace + quality_gate if present)
           - optional {level}_{name}_timeline.csv (if timeline available)
         """
-        # Locate AnalysisData
         analysis = res.get("analysis_data", None)
         transcription = res.get("transcription", None) or res.get("transcription_result", None) or res.get("result", None)
 
         if analysis is None and transcription is not None:
             analysis = getattr(transcription, "analysis_data", None)
 
-        # Locate notes
         notes_obj = None
         if analysis is not None:
             notes_obj = getattr(analysis, "notes_before_quantization", None) or getattr(analysis, "notes", None)
@@ -1595,7 +1881,6 @@ class BenchmarkSuite:
             for n in pred_notes
         ]
 
-        # Duration
         duration_sec = 0.0
         try:
             if analysis is not None and getattr(analysis, "meta", None) is not None:
@@ -1603,7 +1888,6 @@ class BenchmarkSuite:
         except Exception:
             duration_sec = 0.0
 
-        # Voiced ratio: prefer timeline active_pitches; else approximate by coverage
         voiced_ratio = 0.0
         try:
             timeline = getattr(analysis, "timeline", None) if analysis is not None else None
@@ -1624,9 +1908,8 @@ class BenchmarkSuite:
         except Exception:
             voiced_ratio = 0.0
 
-        symptoms = compute_symptom_metrics(pred_list)
+        symptoms = compute_symptom_metrics(pred_list) or {}
 
-        # Metrics (no GT -> note_f1/onset_mae_ms are None)
         metrics = {
             "level": level,
             "name": name,
@@ -1647,7 +1930,6 @@ class BenchmarkSuite:
         with open(f"{base_path}_metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, default=str)
 
-        # Build rich run_info
         resolved_config = res.get("resolved_config", None) or res.get("config", None)
         stage_b_out = res.get("stage_b_out", None)
         stage_b_diag = {}
@@ -1692,10 +1974,10 @@ class BenchmarkSuite:
         try:
             if analysis is not None:
                 timeline = getattr(analysis, "timeline", None)
-                if timeline and "write_frame_timeline_csv" in globals():
+                if timeline:
                     csv_rows = []
                     hop = float(getattr(getattr(analysis, "meta", None), "hop_length", 512) or 512)
-                    sr = float(getattr(getattr(analysis, "meta", None), "sample_rate", 22050) or 22050)
+                    sr_ = float(getattr(getattr(analysis, "meta", None), "sample_rate", 22050) or 22050)
                     for t, fr in enumerate(timeline):
                         hz = 0.0
                         ap = getattr(fr, "active_pitches", None)
@@ -1704,17 +1986,18 @@ class BenchmarkSuite:
                                 hz = float(ap[0].hz)
                             except Exception:
                                 hz = 0.0
-                        csv_rows.append({
-                            "t": int(t),
-                            "time_sec": float((t * hop) / sr),
-                            "f0_hz": float(hz),
-                            "voiced": bool(hz > 0),
-                        })
+                        csv_rows.append(
+                            {
+                                "t": int(t),
+                                "time_sec": float((t * hop) / sr_),
+                                "f0_hz": float(hz),
+                                "voiced": bool(hz > 0),
+                            }
+                        )
                     if csv_rows:
                         write_frame_timeline_csv(f"{base_path}_timeline.csv", csv_rows)
         except Exception:
             pass
-
 
     def generate_summary(self):
         summary_path = os.path.join(self.output_dir, "summary.csv")
@@ -1723,9 +2006,18 @@ class BenchmarkSuite:
         latest_path = os.path.join("results", "benchmark_latest.json")
 
         header = [
-            "level", "name", "note_f1", "onset_mae_ms", "predicted_count", "gt_count",
-            "fragmentation_score", "note_count_per_10s", "median_note_len_ms",
-            "octave_jump_rate", "voiced_ratio", "note_count"
+            "level",
+            "name",
+            "note_f1",
+            "onset_mae_ms",
+            "predicted_count",
+            "gt_count",
+            "fragmentation_score",
+            "note_count_per_10s",
+            "median_note_len_ms",
+            "octave_jump_rate",
+            "voiced_ratio",
+            "note_count",
         ]
         with open(summary_path, "w") as f:
             f.write(",".join(header) + "\n")
@@ -1759,10 +2051,7 @@ class BenchmarkSuite:
 
         logger.info(
             "Accuracy snapshot: "
-            + ", ".join(
-                f"{r['level']}:{r['name']} F1={r.get('note_f1', 0):.3f}"
-                for r in merged
-            )
+            + ", ".join(f"{r['level']}:{r['name']} F1={r.get('note_f1', 0):.3f}" for r in merged)
         )
         logger.info(f"Summary saved to {summary_path}")
 
