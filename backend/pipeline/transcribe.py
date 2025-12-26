@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 import time
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .config import PipelineConfig
 from .instrumentation import PipelineLogger
-from .models import AnalysisData, NoteEvent, TranscriptionResult
+from .models import AnalysisData, NoteEvent, TranscriptionResult, FramePitch
 from .stage_a import load_and_preprocess
 from .stage_b import compute_decision_trace, extract_features
 from .stage_c import apply_theory
@@ -168,6 +169,20 @@ def transcribe(
 
     req_mode = str(requested_mode) if requested_mode is not None else str(cfg_mode)
 
+    # B1: Preserve Stage A texture if caller passed "quality"/"fast"
+    requested_quality_mode = None
+    meta_processing_mode_preserved = False
+    meta_processing_mode_val = None
+
+    if requested_mode in ("quality", "fast"):
+        requested_quality_mode = requested_mode
+        # Ensure we don't clobber meta.processing_mode
+        meta_processing_mode_preserved = True
+        try:
+            meta_processing_mode_val = stage_a_out.meta.processing_mode
+        except Exception:
+            pass
+
     meta_profile = str(getattr(getattr(stage_a_out, "meta", None), "instrument", None) or "unknown")
     req_profile = str(requested_profile) if requested_profile is not None else meta_profile
 
@@ -268,13 +283,88 @@ def transcribe(
                 sb_diag = getattr(stage_b_out, "diagnostics", None) or {}
                 cand_trace = _safe_trace(sb_diag.get("decision_trace", {}))
 
+                # B2: Timeline fallback logic
+                sb_timeline = getattr(stage_b_out, "timeline", None) or []
+                sb_stem_timelines = getattr(stage_b_out, "stem_timelines", None) or {}
+
+                timeline_source = "empty"
+                final_timeline = []
+                timeline_synth_diag = {}
+
+                if sb_stem_timelines:
+                    timeline_source = "stems"
+                    final_timeline = sb_timeline # Use existing if present, or let AnalysisData handle
+                elif sb_timeline:
+                    timeline_source = "stage_b_timeline"
+                    final_timeline = sb_timeline
+                else:
+                    # Fallback synthesis
+                    time_grid = getattr(stage_b_out, "time_grid", None)
+                    f0_main = getattr(stage_b_out, "f0_main", None)
+                    if time_grid is not None and f0_main is not None and len(time_grid) == len(f0_main):
+                        timeline_source = "synth_from_time_grid"
+                        timeline_synth_diag = {"used_time_grid": True, "used_f0_main": True, "confidence": "assumed_1.0"}
+
+                        synths = []
+                        for t_idx, t_val in enumerate(time_grid):
+                            f0 = float(f0_main[t_idx])
+                            voiced = f0 > 0.0
+
+                            midi_val = None
+                            if voiced:
+                                try:
+                                    midi_val = int(round(69.0 + 12.0 * math.log2(f0 / 440.0)))
+                                except Exception:
+                                    pass
+
+                            synths.append(FramePitch(
+                                time=float(t_val),
+                                pitch_hz=f0,
+                                midi=midi_val,
+                                confidence=1.0 if voiced else 0.0,
+                                rms=0.0,
+                                active_pitches=[(f0, 1.0)] if voiced else []
+                            ))
+                        final_timeline = synths
+
+                # B3: Frame hop seconds calculation
+                frame_hop_seconds = 0.0
+                frame_hop_source = "unknown"
+
+                time_grid_ref = getattr(stage_b_out, "time_grid", None)
+                if time_grid_ref is not None and len(time_grid_ref) >= 2:
+                    frame_hop_seconds = float(np.median(np.diff(time_grid_ref)))
+                    frame_hop_source = "stage_b_time_grid"
+                else:
+                    try:
+                        frame_hop_seconds = float(stage_b_out.meta.hop_length) / float(stage_b_out.meta.sample_rate)
+                        frame_hop_source = "meta"
+                    except Exception:
+                        pass
+
                 cand_analysis = AnalysisData(
                     meta=stage_b_out.meta,
-                    timeline=getattr(stage_b_out, "timeline", None) or [],
-                    stem_timelines=getattr(stage_b_out, "stem_timelines", None) or {},
+                    timeline=final_timeline,
+                    stem_timelines=sb_stem_timelines,
                     diagnostics=sb_diag,
                     precalculated_notes=getattr(stage_b_out, "precalculated_notes", None),
+                    n_frames=len(final_timeline),
+                    frame_hop_seconds=frame_hop_seconds
                 )
+
+                # Restore processing_mode if needed (B1 fix)
+                if requested_quality_mode and meta_processing_mode_val is not None:
+                    try:
+                        cand_analysis.meta.processing_mode = meta_processing_mode_val
+                    except Exception:
+                        pass
+
+                cand_analysis.diagnostics = cand_analysis.diagnostics or {}
+                cand_analysis.diagnostics["timeline_source"] = timeline_source
+                cand_analysis.diagnostics["timeline_frames"] = len(final_timeline)
+                if timeline_synth_diag:
+                    cand_analysis.diagnostics["timeline_synth"] = timeline_synth_diag
+                cand_analysis.diagnostics["frame_hop_seconds_source"] = frame_hop_source
 
                 # Stage C — IMPORTANT: capture returned notes
                 notes_pred = apply_theory(cand_analysis, cand_cfg)
@@ -376,6 +466,16 @@ def transcribe(
         "selected_candidate_id": str(selected_id),
         "fallbacks_triggered": list(fallbacks_triggered),
     }
+
+    if requested_quality_mode:
+        analysis_data.diagnostics["requested_quality_mode"] = requested_quality_mode
+        analysis_data.diagnostics["meta_processing_mode_preserved"] = meta_processing_mode_preserved
+        if meta_processing_mode_val is not None:
+            analysis_data.diagnostics["meta_processing_mode_value"] = meta_processing_mode_val
+
+    # B4: Persist beat grid
+    if hasattr(analysis_data.meta, "beats") and analysis_data.meta.beats:
+        analysis_data.diagnostics["beats"] = list(analysis_data.meta.beats)
 
     if "decision_trace" not in analysis_data.diagnostics:
         analysis_data.diagnostics["decision_trace"] = _safe_trace(base_trace)

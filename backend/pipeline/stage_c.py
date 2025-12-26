@@ -24,6 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from copy import deepcopy
 import numpy as np
 import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Support both package and top-level imports for models
 try:
@@ -952,190 +955,195 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     poly_used = False
 
     for vidx, (_vname, timeline) in enumerate(timelines_to_process):
-        if not timeline or len(timeline) < 2:
-            continue
-
-        if poly_filter_mode == "skyline_top_voice":
-            new_tl: List[FramePitch] = []
-            skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
-            for fp in timeline:
-                ap = getattr(fp, "active_pitches", []) or []
-                cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
-                if cand:
-                    cand.sort(key=lambda x: x[1], reverse=True)
-                    top_conf = cand[0][1]
-                    contestants = [x for x in cand if x[1] >= top_conf * 0.9]
-                    best_cand = contestants[0]
-                    prev_pitch = new_tl[-1].pitch_hz if new_tl else 0.0
-
-                    if len(contestants) > 1:
-                        scored_candidates = []
-                        for p, c in contestants:
-                            score = c
-                            if 80.0 <= p <= 1400.0:
-                                score += 0.05
-                            if prev_pitch > 0.0:
-                                cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
-                                if cents_diff < 100:
-                                    score += 0.1
-                                elif cents_diff < 1200:
-                                    score += 0.05
-                                else:
-                                    score -= 0.05
-                            scored_candidates.append(((p, c), score))
-                        best_cand = max(scored_candidates, key=lambda x: x[1])[0]
-
-                    p_best, c_best = best_cand
-                    midi_new = int(round(69 + 12 * math.log2(p_best / 440.0)))
-                    fp2 = FramePitch(
-                        time=fp.time,
-                        pitch_hz=p_best,
-                        midi=midi_new,
-                        confidence=c_best,
-                        rms=fp.rms,
-                        active_pitches=getattr(fp, "active_pitches", None),
-                    )
-                    new_tl.append(fp2)
-                else:
-                    new_tl.append(fp)
-            timeline = new_tl
-
-        poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
-        enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
-        if enable_polyphony:
-            poly_used = True
-
-        if enable_polyphony:
-            voice_timelines = _decompose_polyphonic_timeline(
-                timeline,
-                pitch_tolerance_cents=poly_pitch_tolerance,
-                max_tracks=max_tracks,
-            )
-
-            if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
-                best_idx = 0
-                best_score = -1.0
-                for i, tl in enumerate(voice_timelines):
-                    score = 0.0
-                    for fp in tl:
-                        if fp.pitch_hz > 0:
-                            s = fp.confidence
-                            if 80.0 <= fp.pitch_hz <= 1400.0:
-                                s *= 1.2
-                            score += s
-                    if score > best_score:
-                        best_score = score
-                        best_idx = i
-                voice_timelines = [voice_timelines[best_idx]]
-        else:
-            voice_timelines = [timeline]
-
-        voice_conf_gate = conf_thr
-        voice_min_dur_s = min_note_dur_s
-        has_distinct_poly = _has_distinct_poly_layers(timeline)
-
-        if poly_frames or enable_polyphony:
-            voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
-            try:
-                if min_note_dur_ms_poly is not None:
-                    voice_min_dur_s = max(voice_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
-            except Exception:
-                pass
-
-            if vidx > 0 and not has_distinct_poly:
-                voice_conf_gate = max(voice_conf_gate, accomp_conf)
-        elif vidx > 0:
-            voice_conf_gate = max(voice_conf_gate, accomp_conf)
-
-        hop_s = _estimate_hop_seconds(timeline)
-
-        for sub_idx, sub_tl in enumerate(voice_timelines):
-            if not any(fp.pitch_hz > 0 for fp in sub_tl):
+        try:
+            if not timeline or len(timeline) < 2:
                 continue
 
-            use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
             if poly_filter_mode == "skyline_top_voice":
-                use_viterbi = False
+                new_tl: List[FramePitch] = []
+                skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
+                for fp in timeline:
+                    ap = getattr(fp, "active_pitches", []) or []
+                    cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
+                    if cand:
+                        cand.sort(key=lambda x: x[1], reverse=True)
+                        top_conf = cand[0][1]
+                        contestants = [x for x in cand if x[1] >= top_conf * 0.9]
+                        best_cand = contestants[0]
+                        prev_pitch = new_tl[-1].pitch_hz if new_tl else 0.0
 
-            if use_viterbi:
-                mask = _viterbi_voicing_mask(
-                    sub_tl,
-                    conf_weight=conf_weight,
-                    energy_weight=energy_weight,
-                    transition_penalty=transition_penalty,
-                    stay_bonus=stay_bonus,
-                    silence_bias=silence_bias,
+                        if len(contestants) > 1:
+                            scored_candidates = []
+                            for p, c in contestants:
+                                score = c
+                                if 80.0 <= p <= 1400.0:
+                                    score += 0.05
+                                if prev_pitch > 0.0:
+                                    cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
+                                    if cents_diff < 100:
+                                        score += 0.1
+                                    elif cents_diff < 1200:
+                                        score += 0.05
+                                    else:
+                                        score -= 0.05
+                                scored_candidates.append(((p, c), score))
+                            best_cand = max(scored_candidates, key=lambda x: x[1])[0]
+
+                        p_best, c_best = best_cand
+                        midi_new = int(round(69 + 12 * math.log2(p_best / 440.0)))
+                        fp2 = FramePitch(
+                            time=fp.time,
+                            pitch_hz=p_best,
+                            midi=midi_new,
+                            confidence=c_best,
+                            rms=fp.rms,
+                            active_pitches=getattr(fp, "active_pitches", None),
+                        )
+                        new_tl.append(fp2)
+                    else:
+                        new_tl.append(fp)
+                timeline = new_tl
+
+            poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
+            enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
+            if enable_polyphony:
+                poly_used = True
+
+            if enable_polyphony:
+                voice_timelines = _decompose_polyphonic_timeline(
+                    timeline,
+                    pitch_tolerance_cents=poly_pitch_tolerance,
+                    max_tracks=max_tracks,
                 )
-                segs = _segments_from_mask(
-                    timeline=sub_tl,
-                    mask=mask,
-                    hop_s=hop_s,
-                    min_note_dur_s=voice_min_dur_s,
-                    min_conf=voice_conf_gate,
-                    min_rms=min_rms,
-                )
+
+                if poly_filter_mode == "decomposed_melody" and len(voice_timelines) > 1:
+                    best_idx = 0
+                    best_score = -1.0
+                    for i, tl in enumerate(voice_timelines):
+                        score = 0.0
+                        for fp in tl:
+                            if fp.pitch_hz > 0:
+                                s = fp.confidence
+                                if 80.0 <= fp.pitch_hz <= 1400.0:
+                                    s *= 1.2
+                                score += s
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+                    voice_timelines = [voice_timelines[best_idx]]
             else:
-                seg_cfg_local = dict(seg_cfg)
-                if enable_polyphony and sub_idx > 0:
-                    seg_cfg_local["use_repeated_note_splitter"] = False
+                voice_timelines = [timeline]
 
-                segs = _segment_monophonic(
-                    timeline=sub_tl,
-                    conf_thr=voice_conf_gate,
-                    min_note_dur_s=voice_min_dur_s,
-                    gap_tolerance_s=gap_tolerance_s,
-                    min_rms=min_rms,
-                    conf_start=max(start_conf, voice_conf_gate),
-                    conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
-                    seg_cfg=seg_cfg_local,
-                    hop_s=hop_s,
-                )
+            voice_conf_gate = conf_thr
+            voice_min_dur_s = min_note_dur_s
+            has_distinct_poly = _has_distinct_poly_layers(timeline)
 
-            for (s, e) in segs:
-                mids = [
-                    sub_tl[i].midi
-                    for i in range(s, e + 1)
-                    if sub_tl[i].midi is not None and sub_tl[i].midi > 0
-                ]
-                hzs = [sub_tl[i].pitch_hz for i in range(s, e + 1) if sub_tl[i].pitch_hz > 0]
-                confs = [sub_tl[i].confidence for i in range(s, e + 1)]
-                rmss = [sub_tl[i].rms for i in range(s, e + 1)]
+            if poly_frames or enable_polyphony:
+                voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
+                try:
+                    if min_note_dur_ms_poly is not None:
+                        voice_min_dur_s = max(voice_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
+                except Exception:
+                    pass
 
-                if not mids:
-                    continue
-                if rmss and float(np.mean(rmss)) < min_rms:
+                if vidx > 0 and not has_distinct_poly:
+                    voice_conf_gate = max(voice_conf_gate, accomp_conf)
+            elif vidx > 0:
+                voice_conf_gate = max(voice_conf_gate, accomp_conf)
+
+            hop_s = _estimate_hop_seconds(timeline)
+
+            for sub_idx, sub_tl in enumerate(voice_timelines):
+                if not any(fp.pitch_hz > 0 for fp in sub_tl):
                     continue
 
-                midi_note = int(round(float(np.median(mids))))
-                pitch_hz = float(np.median(hzs)) if hzs else 0.0
-                confidence = float(np.mean(confs)) if confs else 0.0
+                use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
+                if poly_filter_mode == "skyline_top_voice":
+                    use_viterbi = False
 
-                midi_vel = _velocity_from_rms(rmss)
-                velocity_norm = float(midi_vel) / 127.0
-                rms_val = float(np.mean(rmss)) if rmss else 0.0
-                dynamic_label = _velocity_to_dynamic(midi_vel)
-
-                start_sec = float(sub_tl[s].time)
-                end_sec = float(sub_tl[e].time + hop_s)
-                if end_sec <= start_sec:
-                    end_sec = start_sec + hop_s
-
-                voice_id = (vidx * 16) + (sub_idx + 1)
-
-                notes.append(
-                    NoteEvent(
-                        start_sec=start_sec,
-                        end_sec=end_sec,
-                        midi_note=midi_note,
-                        pitch_hz=pitch_hz,
-                        confidence=confidence,
-                        velocity=velocity_norm,
-                        rms_value=rms_val,
-                        dynamic=dynamic_label,
-                        voice=voice_id,
+                if use_viterbi:
+                    mask = _viterbi_voicing_mask(
+                        sub_tl,
+                        conf_weight=conf_weight,
+                        energy_weight=energy_weight,
+                        transition_penalty=transition_penalty,
+                        stay_bonus=stay_bonus,
+                        silence_bias=silence_bias,
                     )
-                )
+                    segs = _segments_from_mask(
+                        timeline=sub_tl,
+                        mask=mask,
+                        hop_s=hop_s,
+                        min_note_dur_s=voice_min_dur_s,
+                        min_conf=voice_conf_gate,
+                        min_rms=min_rms,
+                    )
+                else:
+                    seg_cfg_local = dict(seg_cfg)
+                    if enable_polyphony and sub_idx > 0:
+                        seg_cfg_local["use_repeated_note_splitter"] = False
 
+                    segs = _segment_monophonic(
+                        timeline=sub_tl,
+                        conf_thr=voice_conf_gate,
+                        min_note_dur_s=voice_min_dur_s,
+                        gap_tolerance_s=gap_tolerance_s,
+                        min_rms=min_rms,
+                        conf_start=max(start_conf, voice_conf_gate),
+                        conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+                        seg_cfg=seg_cfg_local,
+                        hop_s=hop_s,
+                    )
+
+                for (s, e) in segs:
+                    mids = [
+                        sub_tl[i].midi
+                        for i in range(s, e + 1)
+                        if sub_tl[i].midi is not None and sub_tl[i].midi > 0
+                    ]
+                    hzs = [sub_tl[i].pitch_hz for i in range(s, e + 1) if sub_tl[i].pitch_hz > 0]
+                    confs = [sub_tl[i].confidence for i in range(s, e + 1)]
+                    rmss = [sub_tl[i].rms for i in range(s, e + 1)]
+
+                    if not mids:
+                        continue
+                    if rmss and float(np.mean(rmss)) < min_rms:
+                        continue
+
+                    midi_note = int(round(float(np.median(mids))))
+                    pitch_hz = float(np.median(hzs)) if hzs else 0.0
+                    confidence = float(np.mean(confs)) if confs else 0.0
+
+                    midi_vel = _velocity_from_rms(rmss)
+                    velocity_norm = float(midi_vel) / 127.0
+                    rms_val = float(np.mean(rmss)) if rmss else 0.0
+                    dynamic_label = _velocity_to_dynamic(midi_vel)
+
+                    start_sec = float(sub_tl[s].time)
+                    end_sec = float(sub_tl[e].time + hop_s)
+                    if end_sec <= start_sec:
+                        end_sec = start_sec + hop_s
+
+                    voice_id = (vidx * 16) + (sub_idx + 1)
+
+                    notes.append(
+                        NoteEvent(
+                            start_sec=start_sec,
+                            end_sec=end_sec,
+                            midi_note=midi_note,
+                            pitch_hz=pitch_hz,
+                            confidence=confidence,
+                            velocity=velocity_norm,
+                            rms_value=rms_val,
+                            dynamic=dynamic_label,
+                            voice=voice_id,
+                        )
+                    )
+
+        except Exception as e:
+            logger.warning(f"Onset/Theory error for stem {_vname}: {e}")
+            if hasattr(analysis_data, 'diagnostics'):
+                analysis_data.diagnostics.setdefault("onset_errors", {})[_vname] = repr(e)
     # Bass backtracking (optional)
     bass_backtrack_ms = float(
         profile_special.get("stage_c_backtrack_ms", 0.0) or profile_special.get("bass_backtrack_ms", 0.0)
