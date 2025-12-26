@@ -11,7 +11,7 @@ from .pipeline.stage_a import load_and_preprocess
 from .pipeline.stage_b import extract_features
 from .pipeline.stage_c import apply_theory
 from .pipeline.stage_d import quantize_and_render
-from .pipeline.models import AnalysisData, TranscriptionResult, MetaData, AudioType
+from .pipeline.models import AnalysisData, TranscriptionResult, MetaData, AudioType, FramePitch
 from .pipeline.validation import validate_invariants, dump_resolved_config
 
 def transcribe_audio_pipeline(
@@ -84,8 +84,7 @@ def transcribe_audio_pipeline(
     )
     validate_invariants(stage_a_out, pipeline_conf)
 
-    meta = stage_a_out.meta
-    meta.processing_mode = mode
+    meta = stage_a_out.meta  # Preserve Stage A texture classification (mono/poly)
 
     # 2. Stage B: Extract Features (Segmentation)
     # Pitch tracking (SwiftF0/SACF) and Hysteresis segmentation
@@ -106,7 +105,7 @@ def transcribe_audio_pipeline(
     timeline = [] # Global timeline computed from main f0?
     # StageBOutput has f0_main, but timeline expects FramePitch objects.
     # stem_timelines is available.
-    stem_timelines = stage_b_out.stem_timelines
+    stem_timelines = stage_b_out.stem_timelines or {}
 
     # We need a global timeline for AnalysisData.
     # In my previous implementation, I aggregated it.
@@ -117,6 +116,18 @@ def transcribe_audio_pipeline(
         timeline = stem_timelines["mix"]
     elif "other" in stem_timelines:
         timeline = stem_timelines["other"]
+    elif getattr(stage_b_out, "timeline", None):
+        timeline = stage_b_out.timeline
+    elif getattr(stage_b_out, "time_grid", None) is not None and getattr(stage_b_out, "f0_main", None) is not None:
+        timeline = [
+            FramePitch(
+                time=float(t),
+                pitch_hz=float(p),
+                midi=None if p <= 0 else int(round(librosa.hz_to_midi(p))),
+                confidence=1.0,
+            )
+            for t, p in zip(stage_b_out.time_grid, stage_b_out.f0_main)
+        ]
 
     notes = [] # Stage B doesn't produce notes yet (Stage C does)
     chords = [] # Stage B doesn't produce chords yet
@@ -134,6 +145,8 @@ def transcribe_audio_pipeline(
         beat_stem_audio = stage_a_out.stems["other"].audio
     elif "vocals" in stage_a_out.stems: # Mono mix
         beat_stem_audio = stage_a_out.stems["vocals"].audio
+    elif "mix" in stage_a_out.stems:
+        beat_stem_audio = stage_a_out.stems["mix"].audio
 
     onsets = [] # Global fallback
     beats = [] # Global beats
@@ -151,10 +164,13 @@ def transcribe_audio_pipeline(
         # Global Onset Detect (fallback)
         try:
             onsets = sorted(list(librosa.onset.onset_detect(y=beat_stem_audio, sr=stage_a_out.meta.target_sr, units='time')))
-        except:
-            pass
+        except Exception as e:
+            print(f"Onset detection failed: {e}")
 
     meta.tempo_bpm = tempo
+    if beats:
+        meta.beats = beats
+        meta.beat_times = beats
 
     # Populate stem_onsets
     stem_onsets = {}
@@ -167,10 +183,23 @@ def transcribe_audio_pipeline(
                      stem_onsets[s_name] = sorted(list(ons))
                  else:
                      stem_onsets[s_name] = []
-             except:
+             except Exception as e:
+                 print(f"Onset detection failed for stem {s_name}: {e}")
                  stem_onsets[s_name] = []
 
     # 3. Build AnalysisData
+    frame_count = len(timeline)
+
+    # Normalize frame-sized arrays to the chosen timeline length
+    if getattr(stage_b_out, "time_grid", None) is not None:
+        stage_b_out.time_grid = np.asarray(stage_b_out.time_grid)[:frame_count]
+    if getattr(stage_b_out, "f0_main", None) is not None:
+        stage_b_out.f0_main = np.asarray(stage_b_out.f0_main)[:frame_count]
+
+    frame_hop_seconds = float(meta.hop_length) / float(meta.target_sr)
+    if getattr(stage_b_out, "time_grid", None) is not None and len(stage_b_out.time_grid) > 1:
+        frame_hop_seconds = float(stage_b_out.time_grid[1] - stage_b_out.time_grid[0])
+
     analysis_data = AnalysisData(
         meta=meta,
         timeline=timeline,
@@ -180,8 +209,8 @@ def transcribe_audio_pipeline(
         chords=chords,
         notes=notes,
         pitch_tracker=tracker_name,
-        n_frames=len(timeline),
-        frame_hop_seconds=float(meta.hop_length) / float(meta.target_sr),
+        n_frames=frame_count,
+        frame_hop_seconds=frame_hop_seconds,
         onsets=onsets,
         beats=beats # Add beats
     )
