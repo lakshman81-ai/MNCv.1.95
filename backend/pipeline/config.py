@@ -310,6 +310,17 @@ class StageCConfig:
         default_factory=lambda: {"max_gap_ms": 100.0}
     )
 
+    # --- CONSOLIDATED FIX (L6 runner + stage_c.py dotted-path knobs) ---
+    # stage_c.py reads:
+    #   stage_c.chord_onset_snap_ms (default 25ms)
+    #   stage_c.post_merge.max_gap_ms (preferred) else stage_c.gap_filling.max_gap_ms
+    #
+    # To preserve existing behavior, default post_merge to None
+    # so merge_gap_ms continues to come from gap_filling.max_gap_ms unless overridden.
+    chord_onset_snap_ms: float = 25.0
+    post_merge: Optional[Dict[str, Any]] = None
+    # ---------------------------------------------------------------
+
     # Confidence gates for polyphonic timelines (melody vs accompaniment)
     # Relaxed accompaniment threshold to 0.40 to capture quiet inner voices
     polyphonic_confidence: Dict[str, float] = field(
@@ -660,6 +671,8 @@ PIANO_61KEY_CONFIG = PipelineConfig(
             "split_semitone": 0.7,
         },
         pitch_tolerance_cents=50.0,
+        # NOTE: leaving chord_onset_snap_ms/post_merge at defaults here preserves existing behavior.
+        # You can override in L6 runner or profiles if desired.
     ),
     stage_d=StageDConfig(
         quantization_grid=16,
