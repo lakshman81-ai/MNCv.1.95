@@ -74,8 +74,6 @@ def score_to_gt(score, parts: Optional[List[str]] = None) -> List[Tuple[int, flo
             stream_to_read = music21.stream.Stream(selected_parts)
         else:
             stream_to_read = score
-    else:
-        stream_to_read = score
 
     gt: List[Tuple[int, float, float]] = []
     for el in stream_to_read.flatten().notes:
@@ -92,13 +90,12 @@ def score_to_gt(score, parts: Optional[List[str]] = None) -> List[Tuple[int, flo
     return gt
 
 
-def generate_l6_audio_and_gt() -> Tuple[np.ndarray, int, List[Tuple[int, float, float]]]:
+def generate_l6_audio_and_gt(duration_sec: float = 15.0) -> Tuple[np.ndarray, int, List[Tuple[int, float, float]]]:
     """Generates the synthetic pop song audio and ground truth."""
     sr = 22050
-    duration_sec = 60.0
     tempo_bpm = 110
 
-    logger.info("Generating L6 synthetic pop song score...")
+    logger.info(f"Generating L6 synthetic pop song score ({duration_sec}s)...")
     score = create_pop_song_base(duration_sec=duration_sec, tempo_bpm=tempo_bpm, seed=0)
 
     # Ground truth (Lead melody only for L6)
@@ -169,7 +166,8 @@ def run_sweep(
     sr: int,
     gt: List[Tuple[int, float, float]],
     base_config: PipelineConfig,
-    reports_dir: str
+    reports_dir: str,
+    duration_sec: float
 ) -> List[Dict[str, Any]]:
 
     logger.info("Starting Mini Threshold Sweep (Optimized)...")
@@ -223,7 +221,7 @@ def run_sweep(
                 audio, sr, cfg, AudioType.POLYPHONIC_DOMINANT, allow_separation=False
             )
 
-            metrics = calculate_metrics(res["notes"], gt, 60.0)
+            metrics = calculate_metrics(res["notes"], gt, duration_sec)
 
             analysis_diag = getattr(res.get("analysis_data"), "diagnostics", {}) or {}
             qgate = analysis_diag.get("quality_gate", {})
@@ -428,16 +426,13 @@ def main():
     logger.info(f"Reports directory: {reports_dir}")
     logger.info(f"Snapshot directory: {snapshot_dir}")
 
-    # 1. Generate L6 Data
-    audio, sr, gt = generate_l6_audio_and_gt()
+    # 1. Generate L6 Data (Reduced to 15s to fit in CPU timeout)
+    duration_sec = 15.0
+    audio, sr, gt = generate_l6_audio_and_gt(duration_sec=duration_sec)
 
     # 2. Baseline Run
     logger.info("Running L6 Baseline...")
     config = get_l6_baseline_config()
-
-    # Check if we can reuse previous run (Optimization for interactive session)
-    # If baseline artifacts exist and are valid, we could skip.
-    # But since we are debugging F1=0, we run it.
 
     # Execute Pipeline
     res = run_pipeline_on_audio(
@@ -445,7 +440,7 @@ def main():
     )
 
     # Calculate Metrics
-    metrics = calculate_metrics(res["notes"], gt, 60.0)
+    metrics = calculate_metrics(res["notes"], gt, duration_sec)
     metrics["level"] = "L6"
     metrics["name"] = "synthetic_pop_song"
 
@@ -498,7 +493,7 @@ def main():
 
     # 5. Run Sweep (Requirement D) - Only if F1 > 0 or forced
     if metrics["note_f1"] > 0.0:
-        run_sweep(audio, sr, gt, config, reports_dir)
+        run_sweep(audio, sr, gt, config, reports_dir, duration_sec)
     else:
         logger.warning("Skipping sweep because baseline F1 is 0.0.")
         # Write empty sweep file so process doesn't look like it crashed
