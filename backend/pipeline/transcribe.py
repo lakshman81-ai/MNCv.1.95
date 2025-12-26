@@ -123,13 +123,21 @@ def _candidate_order(routed_mode: str) -> List[str]:
     return [routed_mode] + rest
 
 
+def _safe_trace(x: Any) -> Dict[str, Any]:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    return {"raw": x}
+
+
 def transcribe(
     audio_path: str,
     config: Optional[PipelineConfig] = None,
     pipeline_logger: Optional[PipelineLogger] = None,
     device: str = "cpu",
     *,
-    # ---- NEW: explicit caller overrides (fixes L6 debug runner relying on "auto") ----
+    # explicit caller overrides
     requested_mode: Optional[str] = None,
     requested_profile: Optional[str] = None,
     requested_separation_mode: Optional[str] = None,
@@ -137,10 +145,7 @@ def transcribe(
     """
     High-level transcription entry point with unified quality gate.
 
-    Why the new args:
-    - Some benchmarks/debug runners generate synthetic audio with weak/unknown metadata.
-      In those cases, auto-routing can pick a mono-biased mode and tank L6 results.
-    - Callers (like tools/l6_debug_runner.py) can now force the intended mode explicitly:
+    Callers can force intended mode explicitly:
         transcribe(..., requested_mode="classic_song")
     """
     if config is None:
@@ -154,8 +159,13 @@ def transcribe(
     stage_a_out = load_and_preprocess(audio_path, config, pipeline_logger=pipeline_logger)
     duration_sec = float(getattr(getattr(stage_a_out, "meta", None), "duration_sec", 0.0) or 0.0)
 
-    # Resolve caller intent (defaults preserved)
-    cfg_mode = getattr(config.stage_b, "transcription_mode", "auto")
+    # Resolve caller intent (robust)
+    cfg_mode = "auto"
+    try:
+        cfg_mode = getattr(config.stage_b, "transcription_mode", "auto")
+    except Exception:
+        cfg_mode = "auto"
+
     req_mode = str(requested_mode) if requested_mode is not None else str(cfg_mode)
 
     meta_profile = str(getattr(getattr(stage_a_out, "meta", None), "instrument", None) or "unknown")
@@ -171,11 +181,10 @@ def transcribe(
         pipeline_logger=pipeline_logger,
     )
 
-    # If caller forced a specific mode (not auto), respect it for the candidate chain start.
     if req_mode and req_mode != "auto":
         routed_mode = req_mode
     else:
-        routed_mode = str(base_trace.get("resolved", {}).get("transcription_mode", "classic_melody"))
+        routed_mode = str(_safe_trace(base_trace).get("resolved", {}).get("transcription_mode", "classic_melody"))
 
     candidate_ids = _candidate_order(routed_mode)
 
@@ -188,7 +197,7 @@ def transcribe(
     candidates: List[Dict[str, Any]] = []
     fallbacks_triggered: List[str] = []
 
-    best: Optional[Tuple[str, float, AnalysisData]] = None
+    best: Optional[Tuple[str, float, AnalysisData, PipelineConfig]] = None
 
     # Mix audio for E2E paths
     mix_audio = None
@@ -201,7 +210,6 @@ def transcribe(
         if idx >= q_max_candidates:
             break
 
-        cand_decision = "evaluated"
         cand_score = 0.0
         cand_metrics: Dict[str, Any] = {}
         cand_analysis: Optional[AnalysisData] = None
@@ -210,14 +218,16 @@ def transcribe(
         try:
             cand_cfg = copy.deepcopy(config)
 
-            # Force requested mode for this candidate (decision trace must reflect it)
-            cand_cfg.stage_b.transcription_mode = cand_id
+            # Force candidate mode
+            try:
+                cand_cfg.stage_b.transcription_mode = cand_id
+            except Exception:
+                pass
 
             if cand_id == "e2e_onsets_frames":
                 enabled = bool(getattr(cand_cfg.stage_b, "onsets_and_frames", {}).get("enabled", False))
                 if not enabled:
                     raise RuntimeError("onsets_frames_disabled")
-
                 if mix_audio is None:
                     raise RuntimeError("missing_mix_audio")
 
@@ -228,13 +238,15 @@ def transcribe(
                     device=device,
                 )
 
-                cand_trace = compute_decision_trace(
-                    stage_a_out,
-                    cand_cfg,
-                    requested_mode="e2e_onsets_frames",
-                    requested_profile=req_profile,
-                    requested_separation_mode=requested_separation_mode,
-                    pipeline_logger=pipeline_logger,
+                cand_trace = _safe_trace(
+                    compute_decision_trace(
+                        stage_a_out,
+                        cand_cfg,
+                        requested_mode="e2e_onsets_frames",
+                        requested_profile=req_profile,
+                        requested_separation_mode=requested_separation_mode,
+                        pipeline_logger=pipeline_logger,
+                    )
                 )
 
                 cand_analysis = AnalysisData(
@@ -248,29 +260,39 @@ def transcribe(
                 )
 
             else:
-                # Classic + BasicPitch both go through Stage B -> Stage C
+                # Classic + BasicPitch go through Stage B -> Stage C
                 stage_b_out = extract_features(
                     stage_a_out, config=cand_cfg, pipeline_logger=pipeline_logger, device=device
                 )
-                cand_trace = (
-                    dict((stage_b_out.diagnostics or {}).get("decision_trace", {}))
-                    if hasattr(stage_b_out, "diagnostics")
-                    else {}
-                )
 
-                # Convert StageBOutput to AnalysisData for Stage C
+                sb_diag = getattr(stage_b_out, "diagnostics", None) or {}
+                cand_trace = _safe_trace(sb_diag.get("decision_trace", {}))
+
                 cand_analysis = AnalysisData(
                     meta=stage_b_out.meta,
-                    timeline=stage_b_out.timeline,
-                    stem_timelines=stage_b_out.stem_timelines,
-                    diagnostics=stage_b_out.diagnostics,
-                    precalculated_notes=stage_b_out.precalculated_notes,
+                    timeline=getattr(stage_b_out, "timeline", None) or [],
+                    stem_timelines=getattr(stage_b_out, "stem_timelines", None) or {},
+                    diagnostics=sb_diag,
+                    precalculated_notes=getattr(stage_b_out, "precalculated_notes", None),
                 )
 
-                # Stage C (updates cand_analysis.notes in-place)
-                apply_theory(cand_analysis, cand_cfg)
+                # Stage C — IMPORTANT: capture returned notes
+                notes_pred = apply_theory(cand_analysis, cand_cfg)
 
-                # Ensure decision trace is visible at top-level too
+                # Ensure notes are actually attached (handles both “returns list” and “mutates in place” implementations)
+                if notes_pred is not None:
+                    try:
+                        cand_analysis.notes = list(notes_pred)
+                    except Exception:
+                        pass
+
+                if not getattr(cand_analysis, "notes_before_quantization", None):
+                    try:
+                        cand_analysis.notes_before_quantization = list(getattr(cand_analysis, "notes", []) or [])
+                    except Exception:
+                        pass
+
+                # Ensure decision trace visible at top-level
                 try:
                     cand_analysis.diagnostics = cand_analysis.diagnostics or {}
                     cand_analysis.diagnostics["decision_trace"] = cand_trace
@@ -289,9 +311,8 @@ def transcribe(
             cand_decision = "accepted" if accepted else "rejected"
             cand_reason = "ok" if accepted else "below_threshold"
 
-            # Track best even if rejected
             if best is None or cand_score > best[1]:
-                best = (cand_id, cand_score, cand_analysis)
+                best = (cand_id, cand_score, cand_analysis, cand_cfg)
 
             candidates.append(
                 {
@@ -304,7 +325,6 @@ def transcribe(
             )
 
             if accepted:
-                # stop at first accepted (deterministic fallback chain)
                 break
 
             fallbacks_triggered.append(f"fallback_from_{cand_id}")
@@ -328,7 +348,6 @@ def transcribe(
             )
 
     if best is None:
-        # ultimate fallback: empty analysis
         analysis_data = AnalysisData(
             meta=stage_a_out.meta,
             timeline=[],
@@ -340,10 +359,11 @@ def transcribe(
         )
         selected_id = "none"
         selected_score = 0.0
+        selected_cfg = config
     else:
-        selected_id, selected_score, analysis_data = best
+        selected_id, selected_score, analysis_data, selected_cfg = best
 
-    # Mark selected in candidate trace
+    # Mark selected
     for c in candidates:
         if c.get("candidate_id") == selected_id:
             c["decision"] = "selected"
@@ -357,18 +377,16 @@ def transcribe(
         "fallbacks_triggered": list(fallbacks_triggered),
     }
 
-    # If Stage B trace wasn’t set (E2E path), keep base_trace
     if "decision_trace" not in analysis_data.diagnostics:
-        analysis_data.diagnostics["decision_trace"] = base_trace
-
-    # ---------------- Stage D ----------------
-    tr = quantize_and_render(analysis_data.notes, analysis_data, config, pipeline_logger=pipeline_logger)
-    musicxml_str = tr.musicxml
-    midi_bytes = tr.midi_bytes
+        analysis_data.diagnostics["decision_trace"] = _safe_trace(base_trace)
 
     analysis_data.diagnostics["timing"] = {
         "total_sec": float(time.time() - t0),
         "selected_candidate_score": float(selected_score),
+        "selected_candidate_id": str(selected_id),
     }
 
-    return TranscriptionResult(musicxml=musicxml_str, analysis_data=analysis_data, midi_bytes=midi_bytes)
+    # ---------------- Stage D ----------------
+    # IMPORTANT: render using the selected candidate config (mode-specific quantize/render knobs may differ later)
+    tr = quantize_and_render(analysis_data.notes, analysis_data, selected_cfg, pipeline_logger=pipeline_logger)
+    return TranscriptionResult(musicxml=tr.musicxml, analysis_data=analysis_data, midi_bytes=tr.midi_bytes)
