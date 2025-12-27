@@ -197,12 +197,10 @@ def _decompose_polyphonic_timeline(
     track_heads: List[float] = [0.0] * max_tracks
     track_age: List[int] = [10**9] * max_tracks
 
-    LOG2_1200 = 1200.0 / math.log(2.0)
-
     def cents(a: float, b: float) -> float:
         if a <= 0.0 or b <= 0.0:
             return 1e9
-        return abs(LOG2_1200 * math.log((a + 1e-9) / (b + 1e-9)))
+        return abs(1200.0 * math.log2(a / b))
 
     def assign_cost(track_i: int, p: float) -> float:
         head = track_heads[track_i]
